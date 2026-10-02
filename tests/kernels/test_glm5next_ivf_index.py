@@ -409,6 +409,7 @@ def test_prefill_select_matches_reference(num_probes, num_clusters, monkeypatch)
         ref, scores = _reference(setup, b, t, qb, r, LENGTHS[b], decode=False)
         assert int(counts[r]) == max(ref.total, 1), (b, t)
         got = out[r][out[r] >= 0].long()
+        assert torch.all(out[r, : got.numel()] >= 0), (b, t)
         assert got.numel() == ref.selected.numel(), (b, t)
         assert int(got.max()) <= t
         assert tie_aware_recall(got, ref.selected, scores) > 0.999, (b, t)
@@ -465,6 +466,9 @@ def test_probing_every_cluster_is_exact():
         )
         exact = exact_topk_reference(scores, t, TOPK)
         got = out[r][out[r] >= 0].long()
+        assert got.numel() == min(t + 1, TOPK), (b, t)
+        assert torch.all(out[r, : got.numel()] >= 0), (b, t)
+        assert int(got.max()) <= t and got.unique().numel() == got.numel()
         assert tie_aware_recall(got, exact, scores) > 0.999, (b, t)
 
 

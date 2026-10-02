@@ -259,3 +259,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 profile/
 ivf_runs/
 IVF_DSA_KMEANS_HANDOFF.md
+IVF_CODE_GUIDE.md
