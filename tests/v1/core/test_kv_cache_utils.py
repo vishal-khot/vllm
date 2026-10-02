@@ -68,6 +68,8 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     HiSparseHotSpec,
     HiSparseResidentSpec,
+    IvfCentroidSpec,
+    IvfClusterIdSpec,
     KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -3037,6 +3039,122 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
         kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
         == blocks_per_request * bytes_per_block
     )
+
+
+def _glm5_like_kv_cache_spec_with_ivf(
+    num_clusters: int = 256,
+) -> dict[str, KVCacheSpec]:
+    """GLM-5.3-Flash with the IVF indexer: per-token indexer keys plus the
+    per-request cluster-id and centroid state that aliases the indexer page."""
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    for i in range(3, 45, 4):
+        idx = replace(
+            cast(MLAAttentionSpec, kv_cache_spec[f"layers.{i}.indexer"]),
+            tokens_per_state=1,
+            cache_role=SparseCacheRole.INDEXER,
+        )
+        kv_cache_spec[f"layers.{i}.indexer"] = idx
+        idx_page = idx.page_size_bytes
+        kv_cache_spec[f"layers.{i}.ivf_cid"] = IvfClusterIdSpec(
+            block_size=idx_page // 2,
+            num_kv_heads=1,
+            head_size=1,
+            head_size_v=0,
+            dtype=torch.int16,
+        )
+        records = idx_page // 136
+        kv_cache_spec[f"layers.{i}.ivf_centroids"] = IvfCentroidSpec(
+            block_size=records,
+            num_kv_heads=1,
+            head_size=136,
+            head_size_v=0,
+            dtype=torch.uint8,
+            num_state_blocks=(num_clusters + records - 1) // records,
+        )
+    return kv_cache_spec
+
+
+def test_get_kv_cache_config_glm5_ivf_state_aliases_indexer():
+    """IVF state rides the indexer tensors like the kpool tail: non-cacheable
+    groups padded to the indexer page, views at the sibling indexer offset,
+    per-request accounting, and no effect on the scheduler block size."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_ivf()
+    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    def group_of(spec_type):
+        return next(
+            group
+            for group in groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            and all(
+                isinstance(spec, spec_type)
+                for spec in group.kv_cache_spec.kv_cache_specs.values()
+            )
+        )
+
+    cid_group = group_of(IvfClusterIdSpec)
+    cen_group = group_of(IvfCentroidSpec)
+    for group, suffix in ((cid_group, "ivf_cid"), (cen_group, "ivf_centroids")):
+        assert not group.kv_cache_spec.prefix_cacheable
+        assert group.layer_names == [f"layers.{4 * i + 3}.{suffix}" for i in range(11)]
+        for spec in group.kv_cache_spec.kv_cache_specs.values():
+            assert spec.page_size_bytes == idx_page
+
+    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+    assert bytes_per_block == 11 * mla_page + 11 * idx_page
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * 100 + 1
+    )
+    assert kv_cache_config.num_blocks == 100
+    tensors = _tensor_by_layer(kv_cache_config)
+    for i in range(11):
+        idx_offset = tensors[f"layers.{4 * i + 3}.indexer"].offset
+        assert tensors[f"layers.{4 * i + 3}.ivf_cid"].offset == idx_offset
+        assert tensors[f"layers.{4 * i + 3}.ivf_centroids"].offset == idx_offset
+    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+
+    layout = kv_cache_utils._glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+    assert layout is not None
+    assert layout[3] == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
+    assert layout[6] == []
+    assert layout[8] == [cid_group, cen_group]
+
+    attn_group = next(
+        group
+        for group in groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        and group not in (cid_group, cen_group)
+    )
+    attn_blocks = attn_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+    mamba_blocks = 4 * (1 + new_mamba_spec().num_speculative_blocks)
+    records = idx_page // 136
+    ivf_blocks = -(-8192 // (idx_page // 2)) + -(-256 // records)
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == (attn_blocks + mamba_blocks + ivf_blocks) * bytes_per_block
+    )
+
+    sched_vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16, enable_prefix_caching=False, prefix_match_unit=None
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+
+    def sched_block_size(kv_cache_groups):
+        config = KVCacheConfig(
+            num_blocks=1, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        )
+        return kv_cache_utils.resolve_kv_cache_block_sizes(config, sched_vllm_config)
+
+    without_ivf = [g for g in groups if g not in (cid_group, cen_group)]
+    assert sched_block_size(groups) == sched_block_size(without_ivf)
 
 
 def test_glm5_kpool_tail_does_not_drag_hash_block_size():

@@ -89,6 +89,7 @@ class KVCacheCoordinator(ABC):
         assert scheduler_block_size % hash_block_size == 0 and all(
             scheduler_block_size % g.kv_cache_spec.block_size == 0
             for g in kv_cache_config.kv_cache_groups
+            if g.kv_cache_spec.constrains_token_alignment
         )
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)

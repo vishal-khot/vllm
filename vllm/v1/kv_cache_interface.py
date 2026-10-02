@@ -174,6 +174,13 @@ class KVCacheSpec:
         return True
 
     @property
+    def constrains_token_alignment(self) -> bool:
+        """Whether the scheduler block size must be a multiple of this block
+        size. False for groups whose blocks hold per-request records rather
+        than token slots."""
+        return True
+
+    @property
     def prefix_replay_tokens(self) -> int:
         """DeepSeek-V4.1 only: bounded replay. Currently only for DSV41 SWA."""
         return 0
@@ -1038,6 +1045,80 @@ class KpoolTailSpec(SlidingWindowSpec):
         return False
 
 
+@dataclass(frozen=True, kw_only=True)
+class IvfClusterIdSpec(FullAttentionSpec):
+    """Cluster id of every position of a request, for the GLM-5.3-Flash IVF
+    indexer. Not prefix-cacheable: each request clusters its own keys, so two
+    requests sharing a cached prefix must not share these blocks."""
+
+    @property
+    def block_table_token_alignment(self) -> int | None:
+        return None
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, IvfClusterIdSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+    @property
+    def constrains_token_alignment(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
+class IvfCentroidSpec(AttentionSpec):
+    """Fixed per-request centroid records for the GLM-5.3-Flash IVF indexer:
+    ``num_state_blocks`` blocks held for the request's whole lifetime."""
+
+    num_state_blocks: int
+
+    @property
+    def block_table_token_alignment(self) -> int | None:
+        return None
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        return self.num_state_blocks
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return self.num_state_blocks * self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return self.num_state_blocks
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, IvfCentroidSpec)
+            and spec.num_state_blocks == self.num_state_blocks
+            for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+    @property
+    def constrains_token_alignment(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -1243,6 +1324,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def prefix_cacheable(self) -> bool:
         return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
+    def constrains_token_alignment(self) -> bool:
+        return any(
+            spec.constrains_token_alignment for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def prefix_replay_tokens(self) -> int:

@@ -50,6 +50,20 @@ class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
         )
 
 
+class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        import vllm.envs as envs
+
+        # The IVF indexer keeps per-request cluster state that a later prefill
+        # chunk reuses; a prefix-cache hit would start a request with earlier
+        # keys but no state, and would share its per-token cluster ids.
+        cache_config = vllm_config.cache_config
+        if envs.VLLM_ENABLE_DSA_IVF_INDEXER and cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+            logger.info("GLM-5.3 IVF indexer: disabling prefix caching.")
+
+
 class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -1020,6 +1034,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
+    "Glm5NextForCausalLM": Glm5NextForCausalLMConfig,
+    "Glm5NextForConditionalGeneration": Glm5NextForCausalLMConfig,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,

@@ -254,3 +254,8 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# GLM-5.3 IVF indexer work: profiles, run scripts and notes
+profile/
+ivf_runs/
+IVF_DSA_KMEANS_HANDOFF.md
