@@ -430,7 +430,8 @@ def select_ivf_topk(
     of batch row row_batch[r]. Prefill passes ``layout``; decode passes
     ``seq_lens`` (rows are its batch rows).
 
-    Candidates are every visible key of the probed clusters, uncapped. Prefill
+    Candidates are every visible key of the probed clusters, uncapped (at
+    prefill, only the probed runs are searched for their visible prefix). Prefill
     sizes its score buffer by reading back the largest count (its one
     host sync; prefill runs eagerly) and, only if [rows, width] scratch would
     exceed ``max_scratch_bytes``, splits rows into passes that fit. Decode
@@ -491,6 +492,8 @@ def select_ivf_topk(
     )
     ivf_probe_select_kernel[(num_rows,)](
         query_pos,
+        row_batch,
+        *run_args[:2],
         score_ws,
         vis_ws,
         sel,

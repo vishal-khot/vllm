@@ -698,8 +698,9 @@ def ivf_probe_score_kernel(
     query heads ``q`` [rows, H, 128] and head weights ``w`` [rows, H]. Rows of
     one request share the centroid tile; fp8 is exact in bf16, so all
     ``BLOCK_R * H`` heads take one bf16 MMA with fp32 sums. Visible counts: the
-    cluster size at decode, the run prefix at or before the row's position at
-    prefill. -1 marks a disabled cluster.
+    cluster size at decode; at prefill the run size if the run has a key at or
+    before the row's position, else 0 (``ivf_probe_select_kernel`` makes it
+    exact for the probed runs). -1 marks a disabled cluster.
     """
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -736,27 +737,16 @@ def ivf_probe_score_kernel(
             # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
             vis = tl.where((t >= 0)[:, None], size[None, :], 0)
         else:
-            # Runs hold positions ascending, so the visible part is a prefix;
-            # fully visible and fully hidden runs skip the search.
+            # Runs hold positions ascending: a run has a visible key iff its
+            # first key is. The probe select counts the probed runs' visible
+            # prefixes.
             size = tl.load(run_size_ptr + b * C + offs_c, mask=live, other=0)
             run_start = tl.load(run_start_ptr + b * C + offs_c, mask=live, other=0)
             has = size > 0
             first = tl.load(run_pos_ptr + run_start, mask=has, other=0)
-            last = tl.load(run_pos_ptr + run_start + size - 1, mask=has, other=0)
-            tt = t[:, None]
-            partial = has[None, :] & (first[None, :] <= tt) & (last[None, :] > tt)
-            full = has[None, :] & (last[None, :] <= tt)
-            lo = tl.where(full, size[None, :], tl.where(partial, 1, 0))
-            hi = tl.where(partial, size[None, :] - 1, lo)
-            while tl.max(tl.max((lo < hi).to(tl.int32), axis=1), axis=0) > 0:
-                active = lo < hi
-                mid = (lo + hi) // 2
-                p = tl.load(
-                    run_pos_ptr + run_start[None, :] + mid, mask=active, other=0
-                )
-                lo = tl.where(active & (p <= tt), mid + 1, lo)
-                hi = tl.where(active & (p > tt), mid, hi)
-            vis = lo
+            vis = tl.where(
+                has[None, :] & (first[None, :] <= t[:, None]), size[None, :], 0
+            )
         m = mine[:, None] & in_c[None, :]
         tl.store(score_ws_ptr + out, score, mask=m)
         tl.store(vis_ws_ptr + out, tl.where(live[None, :], vis, -1), mask=m)
@@ -766,6 +756,9 @@ def ivf_probe_score_kernel(
 @triton.jit
 def ivf_probe_select_kernel(
     pos_ptr,
+    row_batch_ptr,
+    run_start_ptr,
+    run_pos_ptr,
     score_ws_ptr,
     vis_ws_ptr,
     sel_out_ptr,
@@ -788,7 +781,9 @@ def ivf_probe_select_kernel(
     lower cluster id. Writes which clusters are probed, the
     inclusive candidate end of every cluster (cluster-id order), the candidate
     count (every visible key of the probed clusters) and the top-k length (0
-    when the row keeps every candidate).
+    when the row keeps every candidate). At prefill, ``vis_ws`` holds run sizes
+    on entry; the probed runs' visible prefixes are searched here and written
+    back for the grouped score.
     """
     row = tl.program_id(0)
     offs_all = tl.arange(0, C_PAD)
@@ -806,6 +801,24 @@ def ivf_probe_select_kernel(
     tau = _kth_largest(tl.sort(keys, descending=True), tl.maximum(k, 1), C_PAD)
     selected = eligible & (keys >= tau) & (k > 0)
     take = tl.where(selected, vis, 0)
+    if not IS_DECODE:
+        # Positions ascend within a run and its first key is visible: search
+        # the visible prefix of each probed run, unless the whole run is.
+        b = tl.load(row_batch_ptr + row)
+        t = tl.load(pos_ptr + row).to(tl.int32)
+        start = tl.load(run_start_ptr + b * C + offs_all, mask=selected, other=0)
+        last = tl.load(run_pos_ptr + start + take - 1, mask=selected, other=0)
+        partial = selected & (last > t)
+        lo = tl.where(partial, 1, take)
+        hi = tl.where(partial, take - 1, take)
+        while tl.max((lo < hi).to(tl.int32), axis=0) > 0:
+            active = lo < hi
+            mid = (lo + hi) // 2
+            p = tl.load(run_pos_ptr + start + mid, mask=active, other=0)
+            lo = tl.where(active & (p <= t), mid + 1, lo)
+            hi = tl.where(active & (p > t), mid, hi)
+        take = lo
+        tl.store(vis_ws_ptr + row * C + offs_all, take, mask=selected)
     ends = tl.cumsum(take, axis=0)
     total = tl.sum(take, axis=0)
     tl.store(sel_out_ptr + row * C + offs_all, selected.to(tl.int8), mask=in_range)
