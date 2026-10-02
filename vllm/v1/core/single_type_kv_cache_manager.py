@@ -4,7 +4,7 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.utils.math_utils import cdiv
@@ -27,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     HiSparseHotSpec,
     HiSparseResidentSpec,
+    IvfCentroidSpec,
+    IvfClusterIdSpec,
     KVCacheGroupRole,
     KVCacheSpec,
     MambaSpec,
@@ -1258,6 +1260,37 @@ class CircularBufferManager(FullAttentionManager):
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         return 0
+
+
+class IvfCentroidManager(CircularBufferManager):
+    """Claims a request's fixed ``IvfCentroidSpec`` blocks on first allocation."""
+
+    def _claim_ring_block(
+        self, request_id: str, record_for_zeroing: bool = True
+    ) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks:
+            return []
+        spec = cast(IvfCentroidSpec, self.kv_cache_spec)
+        new_blocks = self.block_pool.get_new_blocks(spec.num_state_blocks)
+        req_blocks.extend(new_blocks)
+        if self._record_new_block_ids and record_for_zeroing:
+            self.new_block_ids.extend(block.block_id for block in new_blocks)
+        return new_blocks
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        if self.req_to_blocks.get(request_id):
+            return 0
+        return cast(IvfCentroidSpec, self.kv_cache_spec).num_state_blocks
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
@@ -2665,6 +2698,16 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        IvfClusterIdSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=IvfClusterIdSpec,
+    )
+    KVCacheSpecRegistry.register(
+        IvfCentroidSpec,
+        IvfCentroidManager,
+        uniform_type_base_spec=IvfCentroidSpec,
     )
 
     KVCacheSpecRegistry.register(

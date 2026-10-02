@@ -848,7 +848,13 @@ def resolve_kv_cache_block_sizes(
     group_block_sizes = [
         resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
-    scheduler_block_size = math.lcm(*group_block_sizes)
+    scheduler_block_size = math.lcm(
+        *(
+            block_size
+            for group, block_size in zip(groups, group_block_sizes)
+            if group.kv_cache_spec.constrains_token_alignment
+        )
+    )
 
     logger.info_once("kv cache group sizes %s", tuple(group_block_sizes))
     logger.info_once("kv lcm block sizes %s", scheduler_block_size)

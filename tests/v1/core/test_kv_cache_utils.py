@@ -68,6 +68,8 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     HiSparseHotSpec,
     HiSparseResidentSpec,
+    IvfCentroidSpec,
+    IvfClusterIdSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -2974,6 +2976,114 @@ def test_packed_groups_glm5_like_hybrid():
     # apart so both caches can be re-paged for their kernels.
     assert block_stride % (32 * 576 * 2) == 0
     assert block_stride % (64 * 132) == 0
+
+
+def _glm5_like_kv_cache_spec_with_ivf(
+    with_ivf: bool = True, num_clusters: int = 256
+) -> dict[str, KVCacheSpec]:
+    """GLM-5.3-Flash with the IVF indexer: per-token indexer keys plus the
+    per-request cluster-id and centroid state sized to the indexer page."""
+    block_size = 1024
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    for i in range(11):
+        kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        )
+        idx = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+        )
+        kv_cache_spec[f"layers.{i}.indexer"] = idx
+        if not with_ivf:
+            continue
+        idx_page = idx.page_size_bytes
+        kv_cache_spec[f"layers.{i}.ivf_cid"] = IvfClusterIdSpec(
+            block_size=idx_page // 2,
+            num_kv_heads=1,
+            head_size=1,
+            head_size_v=0,
+            dtype=torch.int16,
+        )
+        records = idx_page // 136
+        kv_cache_spec[f"layers.{i}.ivf_centroids"] = IvfCentroidSpec(
+            block_size=records,
+            num_kv_heads=1,
+            head_size=136,
+            head_size_v=0,
+            dtype=torch.uint8,
+            num_state_blocks=-(-num_clusters // records),
+        )
+    for i in range(34):
+        kv_cache_spec[f"layers.{i}.kda"] = MambaSpec(
+            shapes=((3, 6144), (16, 128, 128)),
+            dtypes=(torch.bfloat16, torch.float32),
+            block_size=block_size,
+        )
+    return kv_cache_spec
+
+
+def test_packed_groups_glm5_ivf_state():
+    """IVF state packs into the existing block: non-cacheable groups, no extra
+    bytes per block, per-request accounting, and no effect on the scheduler
+    block size."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_ivf()
+    idx_page = kv_cache_spec["layers.0.indexer"].page_size_bytes
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    base_groups = kv_cache_utils.get_kv_cache_groups(
+        vllm_config, _glm5_like_kv_cache_spec_with_ivf(with_ivf=False)
+    )
+
+    def group_of(spec_type):
+        return next(
+            group
+            for group in groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            and isinstance(group.kv_cache_spec.first_spec, spec_type)
+        )
+
+    cid_group = group_of(IvfClusterIdSpec)
+    cen_group = group_of(IvfCentroidSpec)
+    for group, suffix in ((cid_group, "ivf_cid"), (cen_group, "ivf_centroids")):
+        assert not group.kv_cache_spec.prefix_cacheable
+        assert group.layer_names == [f"layers.{i}.{suffix}" for i in range(11)]
+
+    bytes_per_block = kv_cache_utils._pool_bytes_per_block(vllm_config, groups)
+    assert bytes_per_block == kv_cache_utils._pool_bytes_per_block(
+        vllm_config, base_groups
+    )
+
+    records = idx_page // 136
+    ivf_blocks = -(-8192 // (idx_page // 2)) + -(-256 // records)
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, groups
+    ) == kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, base_groups
+    ) + ivf_blocks * bytes_per_block
+
+    sched_vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16, enable_prefix_caching=False, prefix_match_unit=None
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+
+    def sched_block_size(kv_cache_groups):
+        config = KVCacheConfig(
+            num_blocks=1, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        )
+        return kv_cache_utils.resolve_kv_cache_block_sizes(config, sched_vllm_config)
+
+    without_ivf = [g for g in groups if g not in (cid_group, cen_group)]
+    assert sched_block_size(groups) == sched_block_size(without_ivf)
 
 
 def new_mla_spec(cache_dtype_str=None, block_size: int = 16):
