@@ -94,6 +94,7 @@ def make_impl(qk_rope, kv_dtype="fp8_e4m3", num_heads=2, topk_width=TOPK):
     impl.qk_rope_head_dim = qk_rope
     impl.kv_cache_dtype = kv_dtype
     impl.use_fp8_kv_cache = kv_dtype in ("fp8", "fp8_e4m3")
+    impl.clamp_to_valid_counts = False
     rows = 4
     impl.topk_indices_buffer = torch.full((rows, topk_width), -1, dtype=torch.int32)
     return impl, rows
@@ -533,6 +534,39 @@ def test_upper_bound_plan_reused_across_steps(monkeypatch):
             state.pack_indices(slots)
             outs.append(state.wrapper.run(q, q[..., :0], kv, kv[..., :0]))
         torch.testing.assert_close(outs[0], outs[1], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not _sm90_flashinfer_available(), reason="Requires SM90 FlashInfer MLA"
+)
+@pytest.mark.parametrize("upper_bound", [False, True])
+def test_clamp_to_valid_counts_matches_exact(upper_bound):
+    """Rows selecting fewer keys than the formula count (IVF) must attend
+    only their valid prefix, not the -1 tail packed as slot 0."""
+    torch.manual_seed(0)
+    heads, topk, kpool, width = SM90_HEADS, SM90_TOPK, SM90_KPOOL, SM90_WIDTH
+    ctx, formula, cam, req_id, _ = _clamp_batch(64, 1, 1, 6000, topk, kpool, width)
+    rows = ctx.numel()
+    valid = torch.minimum(formula, torch.randint(1, topk, (rows,), dtype=torch.int32))
+    slots = torch.randint(1, 1 << 16, (rows, width), dtype=torch.int32)
+    slots[torch.arange(width) >= valid[:, None]] = -1
+    slots = slots.cuda()
+
+    kv = torch.randn(1 << 16, 1, HEAD, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(rows, heads, HEAD, device="cuda", dtype=torch.bfloat16)
+    exact, state = _real_state(rows), _real_state(rows)
+    exact.plan(rows, valid, None, None)
+    if upper_bound:
+        state.plan(rows, torch.clamp(ctx, max=state.max_valid), cam, req_id)
+    else:
+        state.plan(rows, formula, None, None)
+    outs = []
+    for s in (state, exact):
+        s.pack_indices(slots)
+        if s is state:
+            s.clamp_to_valid_counts(valid.cuda())
+        outs.append(s.wrapper.run(q, q[..., :0], kv, kv[..., :0]))
+    torch.testing.assert_close(outs[0], outs[1], atol=1e-2, rtol=1e-2)
 
 
 def test_supports_combination_gates(monkeypatch, default_vllm_config):

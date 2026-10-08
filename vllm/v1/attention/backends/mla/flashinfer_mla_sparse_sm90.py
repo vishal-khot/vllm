@@ -37,6 +37,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -127,6 +128,31 @@ def _clamp_work_kv_end(
     query_end = tl.load(query_start_loc + req + 1, mask=mask, other=0)
     ctx = seq_len - query_end + row + 1
     valid = tl.where(ctx <= TOPK, ctx, TOPK + ctx % KPOOL)
+    start = tl.load(int_ws + kv_start_off + works, mask=mask, other=0)
+    end = tl.load(saved_kv_end + works, mask=mask, other=0)
+    tl.store(
+        int_ws + kv_end_off + works,
+        tl.maximum(tl.minimum(end, valid), start),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _clamp_work_kv_end_to_counts(
+    int_ws,
+    saved_kv_end,
+    valid_counts,
+    num_works_idx,
+    q_indptr_off,
+    kv_start_off,
+    kv_end_off,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Clamp each planned work item to its row's converted valid count.
+    works = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = works < tl.load(int_ws + num_works_idx)
+    row = tl.load(int_ws + q_indptr_off + works, mask=mask, other=0)
+    valid = tl.load(valid_counts + row, mask=mask, other=0)
     start = tl.load(int_ws + kv_start_off + works, mask=mask, other=0)
     end = tl.load(saved_kv_end + works, mask=mask, other=0)
     tl.store(
@@ -404,6 +430,22 @@ class _SM90State:
             BLOCK_SIZE=block,
         )
 
+    def clamp_to_valid_counts(self, valid_counts: torch.Tensor) -> None:
+        """Clamp the planned work items to per-row valid counts ([rows]).
+
+        For indexers that may select fewer keys than the planned formula
+        count, so the -1 tail (packed as slot 0) is never attended.
+        """
+        assert self._int_ws is not None and self._plan_offsets is not None
+        block = 1024
+        _clamp_work_kv_end_to_counts[(triton.cdiv(self._saved_kv_end.numel(), block),)](
+            self._int_ws,
+            self._saved_kv_end,
+            valid_counts,
+            *self._plan_offsets,
+            BLOCK_SIZE=block,
+        )
+
     def pack_indices(self, topk_slots: torch.Tensor) -> None:
         num_tokens, width = topk_slots.shape
         _pack_topk_indices[(num_tokens, triton.cdiv(width, 256))](
@@ -582,6 +624,9 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         assert self.topk_indices_buffer is not None
         self.supports_quant_query_input = False
         self.use_fp8_kv_cache = self.kv_cache_dtype in _FP8_KV_DTYPES
+        # The IVF indexer can select fewer than the planned formula count
+        # (rows whose probed clusters hold < index_topk visible keys).
+        self.clamp_to_valid_counts = envs.VLLM_ENABLE_DSA_IVF_INDEXER
 
     def forward_mqa(
         self,
@@ -603,9 +648,9 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
         # return_valid_counts=True keeps the compacted-prefix layout: valid
-        # entries at [0, valid_count), -1 past it — exactly the prefix the
-        # planned per-row lengths address.
-        topk_slots, _ = triton_convert_req_index_to_global_index(
+        # entries at [0, valid_count), -1 past it — the prefix the planned
+        # per-row lengths address (clamped to valid_count for IVF).
+        topk_slots, valid_counts = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token[:num_tokens],
             attn_metadata.block_table,
             topk_indices,
@@ -617,6 +662,8 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         assert state is not None
         # Pack valid prefixes at the offsets refreshed by plan() before replay.
         state.pack_indices(topk_slots)
+        if self.clamp_to_valid_counts:
+            state.clamp_to_valid_counts(valid_counts)
 
         flat = (
             kv_c_and_k_pe_cache.view(torch.float8_e4m3fn)
