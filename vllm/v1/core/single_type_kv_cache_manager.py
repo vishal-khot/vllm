@@ -1287,6 +1287,7 @@ class IvfCentroidManager(CircularBufferManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         if self.req_to_blocks.get(request_id):
             return 0

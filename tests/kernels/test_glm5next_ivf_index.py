@@ -28,6 +28,7 @@ from vllm.models.glm5next.common.ivf_reference import (  # noqa: E402
     exact_topk_reference,
     ivf_select_one_reference,
     key_scores_reference,
+    kmeans_append_reference,
     kmeans_reference,
     quantize_rows_fp8,
     tie_aware_recall,
@@ -133,6 +134,7 @@ class Setup:
         cen, cen_bt = self.cen.cpu(), self.cen_bt.cpu()
         recs = torch.stack([cen[cen_bt[b, c // CPB], c % CPB] for c in range(C)])
         size = recs[:, 256:260].contiguous().view(torch.int32).flatten()
+        lengths = recs[:, 260:264].contiguous().view(torch.float32).flatten()
         cid, cid_bt = self.cid.cpu(), self.cid_bt.cpu()
         pos = torch.arange(n_keys)
         cids = cid[cid_bt[b, pos // CID_BS].long(), pos % CID_BS, 0]
@@ -141,6 +143,7 @@ class Setup:
             cluster_of_pos=cids.long(),
             sizes=size.clamp(min=0).long(),
             n_clusters=int((size >= 0).sum()),
+            lengths=lengths,
         )
 
 
@@ -268,6 +271,76 @@ def test_prefill_chunk_resumes_from_previous_centroids():
         assert (sim.max(dim=1).values - chosen).max().item() <= 1e-4, b
 
 
+def test_prefill_chunk_appends_without_crossing_a_power_of_two():
+    """A chunk whose key count stays below the next power of two appends: the
+    earlier keys keep their clusters, the chunk's keys join their nearest
+    stored centroid, and each centroid absorbs its new members' sum. Covers
+    no new keys (n = 1), pages split between old and new keys, and a long
+    append; the result is deterministic."""
+    setup = Setup(_config())
+    first = [1, 65, 2050, 8200]
+    setup.build(n_keys=first)
+    before = [setup.kmeans_from_state(b, n) for b, n in enumerate(first)]
+    saved = (setup.cid.clone(), setup.cen.clone())
+    layout = setup.build(n_prev=first)
+    once = (setup.cid.clone(), setup.cen.clone())
+    setup.cid.copy_(saved[0])
+    setup.cen.copy_(saved[1])
+    setup.build(n_prev=first)
+    assert torch.equal(once[0], setup.cid) and torch.equal(once[1], setup.cen)
+
+    run_size = layout.run_size.cpu()
+    for b, n in enumerate(LENGTHS):
+        k, k_scale = setup.fp8_vals[b][:n], setup.scales[b][:n]
+        got = setup.kmeans_from_state(b, n)
+        ref = kmeans_append_reference(k, k_scale, before[b])
+        assert got.n_clusters == before[b].n_clusters
+        assert torch.equal(got.cluster_of_pos[: first[b]], before[b].cluster_of_pos)
+        assert torch.equal(got.sizes, torch.bincount(got.cluster_of_pos, minlength=C))
+        assert torch.equal(run_size[b].long(), got.sizes), b
+        # New keys sit in their nearest pre-append centroid, up to near-ties.
+        sim = _cosines(k[first[b] :], before[b])
+        chosen = sim.gather(1, got.cluster_of_pos[first[b] :, None]).squeeze(1)
+        if chosen.numel():
+            gap = (sim.max(dim=1).values - chosen).max().item()
+            assert gap <= 1e-4, (b, gap)
+        live = slice(0, got.n_clusters)
+        cos = torch.nn.functional.cosine_similarity(
+            got.centroids[live], ref.centroids[live], dim=1
+        )
+        assert cos.min().item() > 0.9999, (b, cos.min().item())
+        torch.testing.assert_close(
+            got.lengths[live], ref.lengths[live], rtol=1e-3, atol=1e-3
+        )
+
+
+def test_final_prefill_chunk_reclusters_every_key():
+    """A request's final prefill chunk always runs k-means over all its keys
+    (warm, from the stored centroids), even where it would otherwise append.
+    With no warm iterations that keeps the centroids and moves every key, old
+    ones included, to its nearest one."""
+    setup = Setup(_config(kmeans_warm_iters=0))
+    first = [1, 65, 2050, 8200]
+    setup.build(n_keys=first)
+    before = [setup.kmeans_from_state(b, n) for b, n in enumerate(first)]
+    build_ivf_index(
+        key=setup.key,
+        state=setup.state,
+        batch_rows_cpu=list(range(len(LENGTHS))),
+        n_keys_cpu=LENGTHS,
+        num_batch_rows=len(LENGTHS),
+        config=setup.config,
+        n_prev_keys_cpu=first,
+        final_cpu=[True] * len(LENGTHS),
+    )
+    for b, n in enumerate(LENGTHS):
+        got = setup.kmeans_from_state(b, n)
+        assert torch.equal(got.centroids, before[b].centroids), b
+        sim = _cosines(setup.fp8_vals[b][:n], got)
+        chosen = sim.gather(1, got.cluster_of_pos[:, None]).squeeze(1)
+        assert (sim.max(dim=1).values - chosen).max().item() <= 1e-4, b
+
+
 def test_kmeans_stops_at_a_fixed_point():
     """With iterations to spare, k-means stops once an assignment moves no key:
     every centroid is then the normalized mean of its members."""
@@ -368,6 +441,52 @@ def _run_prefill_select(setup, layout, rows_per_req, seed=0):
     return out.cpu(), row_batch, query_pos, qb
 
 
+def test_prefill_build_and_select_never_sync_with_a_host_width_bound():
+    """Given a host-known width bound (the longest prefix), a prefill chunk's
+    build and select run without one host sync, as the serving op calls them,
+    and select the same keys as sizing by the exact read-back width."""
+    setup = Setup(_config())
+    first = [1, 65, 2050, 8200]
+    setup.build(n_keys=first)
+    saved = (setup.cid.clone(), setup.cen.clone())
+    row_batch = [b for b, n in enumerate(LENGTHS) for _ in range(min(n, 40))]
+    query_pos = [t for n in LENGTHS for t in range(n - min(n, 40), n)]
+    qb = _queries(len(row_batch))
+    rb = torch.tensor(row_batch, dtype=torch.int32, device=DEV)
+    qp = torch.tensor(query_pos, dtype=torch.int32, device=DEV)
+
+    def step(max_width):
+        out = torch.full(
+            (len(row_batch), TOPK + 128), -7, dtype=torch.int32, device=DEV
+        )
+        layout = setup.build(n_prev=first)
+        select_ivf_topk(
+            key=setup.key,
+            state=setup.state,
+            q_fp8=qb.fp8,
+            weights=qb.w,
+            row_batch=rb,
+            query_pos=qp,
+            config=setup.config,
+            out=out,
+            topk_backend="auto",
+            layout=layout,
+            max_width=max_width,
+        )
+        return out
+
+    want = step(None).cpu()
+    setup.cid.copy_(saved[0])
+    setup.cen.copy_(saved[1])
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = step(max(LENGTHS))
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(got.cpu().sort(dim=1).values, want.sort(dim=1).values)
+
+
 def _reference(setup, b, t, qb: Queries, r, n, decode):
     km = setup.kmeans_from_state(b, n)
     k_fp8, k_scale = setup.fp8_vals[b][:n], setup.scales[b][:n]
@@ -416,21 +535,43 @@ def test_prefill_select_matches_reference(num_probes, num_clusters, monkeypatch)
         assert torch.all(out[r, TOPK:] == -1)
 
 
-def test_grouped_gemm_scores_every_probed_key(monkeypatch):
+@pytest.mark.parametrize(
+    "tuning",
+    [
+        {},
+        {"select_rows_per_pass": 37},
+        {"gemm_key_tiles": 1, "gemm_grab_units": 1},
+        {"gemm_mma_cols": 64},
+        {"gemm_block_n": 128, "gemm_num_warps": 8},
+    ],
+)
+def test_grouped_gemm_scores_every_probed_key(tuning, monkeypatch):
     """The prefill grouped GEMM writes the DSA score sum_h w_h ReLU(q_h . k) of
-    every visible key of every probed cluster into the row's candidate slots."""
+    every visible key of every probed cluster into the row's candidate slots,
+    in one or many row passes, with clusters split across many units or few.
+    A group's rows span several row tiles, so the units that stop at their
+    rows' last visible key, or skip every key, are exercised."""
     captured = {}
     real = ivf_sparse_indexer._score_grouped_gemm
 
     def spy(**kw):
         real(**kw)
-        captured.update(kw)
+        captured.setdefault("passes", []).append(kw)
 
     monkeypatch.setattr(ivf_sparse_indexer, "_score_grouped_gemm", spy)
+    monkeypatch.setattr(
+        ivf_sparse_indexer,
+        "TUNING",
+        dataclasses.replace(ivf_sparse_indexer.TUNING, **tuning),
+    )
     # Half the clusters: late rows of the 9000-key request exceed top-k.
     setup = Setup(_config(num_probes=C // 2))
     layout = setup.build()
-    _run_prefill_select(setup, layout, rows_per_req=6)
+    _run_prefill_select(setup, layout, rows_per_req=40)
+    assert sum(_check_grouped_scores(kw, layout) for kw in captured["passes"]) > 0
+
+
+def _check_grouped_scores(captured, layout):
     q, w = captured["q_fp8"].float(), captured["weights"]
     scores = captured["scores"]
     sel, vis, ends = captured["sel"], captured["vis_ws"], captured["ends"]
@@ -452,7 +593,7 @@ def test_grouped_gemm_scores_every_probed_key(monkeypatch):
             tol = 2e-3 * bound.max().item() + 1e-6
             torch.testing.assert_close(got, want, rtol=2e-3, atol=tol)
             checked += n
-    assert checked > 0
+    return checked
 
 
 def test_probing_every_cluster_is_exact():

@@ -458,6 +458,11 @@ class CommonAttentionMetadata:
     where bidirectional attention should apply. None for text-only
     batches or non-PrefixLM models. A request's ranges must not overlap."""
 
+    prefill_lens_cpu: torch.Tensor | None = None
+    """(batch_size,) CPU int32 tokens each request prefills (its prompt), so a
+    builder can tell a request's final prefill chunk (seq_len >= prefill_len).
+    None when the model state does not provide it."""
+
     rswa_prefix_lens: torch.Tensor | None = None
     """(batch_size,) per-request prefix length (prompt/image token count) for
     Reference Sliding Window Attention (R-SWA). Tokens with logical index below
