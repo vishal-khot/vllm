@@ -10,12 +10,15 @@ Per-request IVF state lives in two KV cache groups addressed by block table:
   cluster ids: int16 per position, ``cid_bs`` positions per block.
   centroids:   ``cpb`` records per block; a 272-byte record is the unit
                centroid in bf16 (256 bytes), the int32 cluster size (-1 marks
-               a disabled cluster) and padding to 16-byte alignment.
+               a disabled cluster), the fp32 length of the members' key sum
+               (the centroid is that sum normalized) and padding to 16-byte
+               alignment.
 
 Pipeline per DSA layer:
   key write:  FWHT + fp8 quant + scatter for every token of the step
   build:      one persistent kernel: seed -> iters x (assign + accumulate,
-              update) -> final assign
+              update) -> final assign; or, for a later prefill chunk, append
+              (assign the chunk's keys, update the centroids from the sums)
   decode:     append (assign the new key to its nearest fixed centroid)
   select:     probe (score, select) -> [decode: collect by scan] -> score
               -> radix top-k -> emit (prefill maps slots through the runs)
@@ -24,7 +27,7 @@ Pipeline per DSA layer:
 from vllm.triton_utils import tl, triton
 
 HEAD_DIM = 128
-REC_BYTES = 272  # 128 bf16 + int32 size + padding
+REC_BYTES = 272  # 128 bf16 + int32 size + fp32 sum length + padding
 FP8_MAX = 448.0
 
 
@@ -285,8 +288,9 @@ def ivf_kmeans_kernel(
     Seeding reuses the request's centroids from its previous prefill chunk
     (``n_prev`` keys clustered, same cluster count C_r); otherwise it draws
     centroid c from the c-th of C_r position strata. Clusters past C_r are
-    disabled (size -1). An update sets each centroid to the
-    normalized sum of its members; an empty cluster keeps its centroid. The
+    disabled (size -1). An update sets each centroid to the normalized sum
+    of its members and records the sum's length (0 before the first update);
+    an empty cluster keeps its centroid with length 0. The
     final assign writes every position's cluster id, the cluster sizes and
     each page's per-cluster key counts (``tile_counts [tiles, C]``) for the
     run layout.
@@ -459,6 +463,7 @@ def ivf_kmeans_kernel(
                         tl.where(u_live, 0, -1),
                         mask=u_mask,
                     )
+                    u_len = tl.zeros([BLOCK_U], tl.float32)
                 else:
                     # Centroid = normalized sum of its members; an empty
                     # cluster (zero sum) keeps its centroid.
@@ -491,8 +496,14 @@ def ivf_kmeans_kernel(
                         cache_modifier=".cg",
                     )
                     new = tl.where((norm == 0)[:, None], old, unit)
+                    u_len = norm
                 new = tl.where(u_live[:, None], new, 0.0)
                 _store_centroid(new, c_f32_ptr, u_row, cen_ptr, u_rec, u_mask)
+                tl.store(
+                    cen_i32_ptr + (u_rec + 260) // 4,
+                    tl.where(u_live, u_len, 0.0).to(tl.int32, bitcast=True),
+                    mask=u_mask,
+                )
                 _phase_done(sync)
                 u = tl.atomic_add(sync + 1, 1, sem="relaxed")
             target = num_units
@@ -506,6 +517,177 @@ def ivf_kmeans_kernel(
 
 
 @triton.jit
+def ivf_kmeans_append_kernel(
+    k_u8_ptr,
+    k_f32_ptr,
+    k_page_stride,
+    k_bt_ptr,
+    k_bt_stride,
+    cen_ptr,
+    cen_i32_ptr,
+    cen_stride,
+    cen_bt_ptr,
+    cen_bt_stride,
+    cpb,
+    cid_ptr,
+    cid_stride,
+    cid_bt_ptr,
+    cid_bt_stride,
+    cid_bs,
+    tile_item_ptr,
+    tile_start_ptr,
+    req_ptr,
+    n_keys_ptr,
+    n_prev_ptr,
+    cu_keys_ptr,
+    new_tile_first_ptr,
+    packed_cid_ptr,
+    tile_counts_ptr,
+    part_ptr,
+    tile0,
+    num_clusters,
+    C: tl.constexpr,
+    C_PAD: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """One key page of an appending request: the first ``n_prev`` keys keep
+    their clusters, the chunk's keys join their nearest current centroid.
+
+    Writes the page's cluster ids (cache for new keys, ``packed_cid`` for all)
+    and per-cluster key counts (``tile_counts``) for the run layout, adds the
+    new keys to the cluster sizes, and stores the new keys' per-cluster sums
+    as row ``new_tile_first[i] + j`` of ``part [rows, C, 128]`` for the j-th
+    page holding new keys, which ``ivf_kmeans_append_update_kernel`` adds.
+    """
+    HALF: tl.constexpr = C_PAD // 2
+    t = tile0 + tl.program_id(0)
+    i = tl.load(tile_item_ptr + t)
+    start = tl.load(tile_start_ptr + t)
+    b = tl.load(req_ptr + i)
+    n_keys = tl.load(n_keys_ptr + i)
+    n_prev = tl.load(n_prev_ptr + i)
+    cu = tl.load(cu_keys_ptr + i)
+    offs_cp = tl.arange(0, C_PAD)
+    pos = start + tl.arange(0, PAGE)
+    valid = pos < n_keys
+    new = valid & (pos >= n_prev)
+    cblk = tl.load(
+        cid_bt_ptr + b * cid_bt_stride + pos // cid_bs, mask=valid, other=0
+    ).to(tl.int64)
+    cl = tl.load(
+        cid_ptr + cblk * cid_stride + pos % cid_bs, mask=valid & ~new, other=0
+    ).to(tl.int32)
+    if (start + PAGE > n_prev) & (n_prev < n_keys):
+        c_eff = _cluster_count(n_keys, num_clusters, C)
+        offs_h = tl.arange(0, HALF)
+        live_lo = offs_h < c_eff
+        live_hi = HALF + offs_h < c_eff
+        rec_lo = _rec(cen_bt_ptr, cen_bt_stride, b, offs_h, cpb, cen_stride, live_lo)
+        rec_hi = _rec(
+            cen_bt_ptr, cen_bt_stride, b, HALF + offs_h, cpb, cen_stride, live_hi
+        )
+        cf_lo = _load_centroids(cen_ptr, rec_lo, live_lo)
+        cf_hi = _load_centroids(cen_ptr, rec_hi, live_hi)
+        page = tl.load(k_bt_ptr + b * k_bt_stride + start // PAGE).to(tl.int64)
+        kb = _load_keys(k_u8_ptr, k_page_stride, page, pos, PAGE, new).to(tl.bfloat16)
+        best = _nearest_centroid(kb, cf_lo, cf_hi, live_lo, live_hi, HALF)
+        tl.store(
+            cid_ptr + cblk * cid_stride + pos % cid_bs, best.to(tl.int16), mask=new
+        )
+        cl = tl.where(new, best, cl)
+        hit_new = (best[:, None] == offs_cp[None, :]) & new[:, None]
+        live_c = offs_cp < c_eff
+        rec_all = _rec(cen_bt_ptr, cen_bt_stride, b, offs_cp, cpb, cen_stride, live_c)
+        new_count = tl.sum(hit_new.to(tl.int32), axis=0)
+        tl.atomic_add(
+            cen_i32_ptr + (rec_all + 256) // 4,
+            new_count,
+            mask=live_c & (new_count > 0),
+            sem="relaxed",
+        )
+        # ue8m0 scales are powers of two: the bf16 one-hot weights and every
+        # product are exact, as in the full k-means accumulation.
+        k_scale = _load_key_scales(k_f32_ptr, k_page_stride, page, pos, PAGE, new)
+        onehot = tl.where(hit_new, k_scale[:, None], 0.0).to(tl.bfloat16)
+        acc = tl.dot(tl.trans(onehot), kb)
+        row = tl.load(new_tile_first_ptr + i) + (start - n_prev // PAGE * PAGE) // PAGE
+        offs_d = tl.arange(0, 128)
+        dst = (row * C + offs_cp).to(tl.int64)[:, None] * 128 + offs_d[None, :]
+        tl.store(part_ptr + dst, acc, mask=(offs_cp < C)[:, None])
+    hit = (cl[:, None] == offs_cp[None, :]) & valid[:, None]
+    tl.store(
+        tile_counts_ptr + t * C + offs_cp,
+        tl.sum(hit.to(tl.int32), axis=0),
+        mask=offs_cp < C,
+    )
+    tl.store(packed_cid_ptr + cu + pos, cl, mask=valid)
+
+
+@triton.jit
+def ivf_kmeans_append_update_kernel(
+    cen_ptr,
+    cen_i32_ptr,
+    cen_stride,
+    cen_bt_ptr,
+    cen_bt_stride,
+    cpb,
+    req_ptr,
+    n_keys_ptr,
+    new_tile_first_ptr,
+    part_ptr,
+    item0,
+    num_clusters,
+    C: tl.constexpr,
+    BLOCK_U: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """Fold an appending request's new-key sums into one block of centroids.
+
+    A centroid's member sum is its stored length times its unit direction;
+    the new sum is that plus the chunk's per-page partials (added in page
+    order), stored normalized with its length. A cluster that gained nothing
+    is unchanged; a zero sum keeps the centroid.
+    """
+    NB: tl.constexpr = (C + BLOCK_U - 1) // BLOCK_U
+    u = tl.program_id(0)
+    i = item0 + u // NB
+    c = (u % NB) * BLOCK_U + tl.arange(0, BLOCK_U)
+    b = tl.load(req_ptr + i)
+    live = c < _cluster_count(tl.load(n_keys_ptr + i), num_clusters, C)
+    rec = _rec(cen_bt_ptr, cen_bt_stride, b, c, cpb, cen_stride, live)
+    offs_d = tl.arange(0, 128)
+    j0 = tl.load(new_tile_first_ptr + i)
+    j1 = tl.load(new_tile_first_ptr + i + 1)
+    total = tl.zeros([BLOCK_U, 128], tl.float32)
+    for g0 in range(j0, j1, BLOCK_S):
+        g = g0 + tl.arange(0, BLOCK_S)
+        g_row = (g[:, None] * C + c[None, :]).to(tl.int64)
+        g_mask = (g < j1)[:, None] & live[None, :]
+        total += tl.sum(
+            tl.load(
+                part_ptr + g_row[:, :, None] * 128 + offs_d[None, None, :],
+                mask=g_mask[:, :, None],
+                other=0.0,
+            ),
+            axis=0,
+        )
+    old = _load_centroids(cen_ptr, rec, live).to(tl.float32)
+    old_len = tl.load(cen_i32_ptr + (rec + 260) // 4, mask=live, other=0).to(
+        tl.float32, bitcast=True
+    )
+    total += old * old_len[:, None]
+    norm = tl.sqrt(tl.sum(total * total, axis=1))
+    unit = total / tl.maximum(norm, 1e-30)[:, None]
+    new = tl.where((norm == 0)[:, None], old, unit)
+    tl.store(
+        cen_ptr + (rec // 2)[:, None] + offs_d[None, :],
+        new.to(tl.bfloat16),
+        mask=live[:, None],
+    )
+    tl.store(cen_i32_ptr + (rec + 260) // 4, norm.to(tl.int32, bitcast=True), mask=live)
+
+
+@triton.jit
 def ivf_run_scan_kernel(
     tile_counts_ptr,
     tile_first_ptr,
@@ -514,18 +696,22 @@ def ivf_run_scan_kernel(
     tile_off_ptr,
     run_start_ptr,
     run_size_ptr,
+    done_ptr,
     C: tl.constexpr,
     C_PAD: tl.constexpr,
+    BLOCK_C: tl.constexpr,
     TILES: tl.constexpr,
 ):
-    """Per request: where each tile's keys of a cluster start inside the
-    cluster's run, the run sizes, and the run starts in packed key order."""
+    """Per (request, block of clusters): where each tile's keys of a cluster
+    start inside the cluster's run, and the run sizes. The request's last
+    program to finish (counted in the zeroed ``done``) writes the run starts
+    in packed key order, a prefix over every cluster."""
     i = tl.program_id(0)
     t0 = tl.load(tile_first_ptr + i)
     t1 = tl.load(tile_first_ptr + i + 1)
-    offs_c = tl.arange(0, C_PAD)
+    offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_c = offs_c < C
-    carry = tl.zeros([C_PAD], tl.int32)
+    carry = tl.zeros([BLOCK_C], tl.int32)
     for t in range(t0, t1, TILES):
         offs_t = t + tl.arange(0, TILES)
         m = (offs_t < t1)[:, None] & mask_c[None, :]
@@ -534,9 +720,20 @@ def ivf_run_scan_kernel(
         tl.store(tile_off_ptr + off, carry[None, :] + tl.cumsum(cnt, axis=0) - cnt, m)
         carry += tl.sum(cnt, axis=0)
     b = tl.load(req_ptr + i)
-    start = tl.load(cu_keys_ptr + i) + tl.cumsum(carry, axis=0) - carry
     tl.store(run_size_ptr + b * C + offs_c, carry, mask=mask_c)
-    tl.store(run_start_ptr + b * C + offs_c, start, mask=mask_c)
+    # Every thread's sizes land before the counter publishes them.
+    tl.debug_barrier()
+    if tl.atomic_add(done_ptr + i, 1, sem="acq_rel") == tl.num_programs(1) - 1:
+        offs_all = tl.arange(0, C_PAD)
+        mask_all = offs_all < C
+        size = tl.load(
+            run_size_ptr + b * C + offs_all,
+            mask=mask_all,
+            other=0,
+            cache_modifier=".cg",
+        )
+        start = tl.load(cu_keys_ptr + i) + tl.cumsum(size, axis=0) - size
+        tl.store(run_start_ptr + b * C + offs_all, start, mask=mask_all)
 
 
 @triton.jit
@@ -686,70 +883,77 @@ def ivf_probe_score_kernel(
     score_ws_ptr,
     vis_ws_ptr,
     num_rows,
+    c_per_program,
     C: tl.constexpr,
     H: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
     IS_DECODE: tl.constexpr,
 ):
-    """Centroid scores and visible key counts of a rows x clusters tile.
+    """Centroid scores and visible key counts of BLOCK_R rows against
+    ``c_per_program`` clusters (``program_id(1)``-th share), BLOCK_C at a time.
 
-    A row's score of cluster c is sum_h w_h ReLU(cos(q_h, c)) over its H fp8
-    query heads ``q`` [rows, H, 128] and head weights ``w`` [rows, H]. Rows of
-    one request share the centroid tile; fp8 is exact in bf16, so all
-    ``BLOCK_R * H`` heads take one bf16 MMA with fp32 sums. Visible counts: the
+    A row's score of cluster c is the key score with the unit centroid as the
+    key, sum_h w_h ReLU(q_h . c), over its H fp8 query heads ``q``
+    [rows, H, 128] and head weights ``w`` [rows, H] (query scales folded in).
+    Rows of one request share the centroid tile; fp8 is exact in bf16, so all
+    ``BLOCK_R * H`` heads, gathered once and head-major (column h * BLOCK_R +
+    r), take one ``[BLOCK_C, 128] x [128, BLOCK_R * H]`` bf16 MMA with fp32
+    sums per centroid tile. Visible counts: the
     cluster size at decode; at prefill the run size if the run has a key at or
     before the row's position, else 0 (``ivf_probe_select_kernel`` makes it
     exact for the probed runs). -1 marks a disabled cluster.
     """
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
-    offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_begin = tl.program_id(1) * c_per_program
+    c_end = tl.minimum(C, c_begin + c_per_program)
     offs_d = tl.arange(0, 128)
     mask_r = offs_r < num_rows
-    in_c = offs_c < C
     rows_b = tl.load(row_batch_ptr + offs_r, mask=mask_r, other=0)
     t = tl.load(pos_ptr + offs_r, mask=mask_r, other=-1).to(tl.int32)
     RH: tl.constexpr = BLOCK_R * H
-    heads = tl.reshape(offs_r[:, None] * H + tl.arange(0, H)[None, :], (RH,))
+    heads = tl.reshape(offs_r[None, :] * H + tl.arange(0, H)[:, None], (RH,))
     mask_rh = heads < num_rows * H
     q = tl.load(
         q_fp8_ptr + heads.to(tl.int64)[:, None] * 128 + offs_d[None, :],
         mask=mask_rh[:, None],
         other=0.0,
-    ).to(tl.float32)
-    inv_norm = 1.0 / tl.maximum(tl.sqrt(tl.sum(q * q, axis=1)), 1e-12)
-    q = q.to(tl.bfloat16)
+    ).to(tl.bfloat16)
     w = tl.load(w_ptr + heads, mask=mask_rh, other=0.0)
-    out = offs_r[:, None] * C + offs_c[None, :]
 
     pending = mask_r
     while tl.max(pending.to(tl.int32), axis=0) > 0:
         b = tl.min(tl.where(pending, rows_b, 2147483647), axis=0)
         mine = pending & (rows_b == b)
-        rec = _rec(cen_bt_ptr, cen_bt_stride, b, offs_c, cpb, cen_stride, in_c)
-        size = tl.load(cen_i32_ptr + (rec + 256) // 4, mask=in_c, other=-1)
-        live = in_c & (size >= 0)
-        cf = _load_centroids(cen_ptr, rec, live)
-        cos = tl.dot(q, tl.trans(cf)) * inv_norm[:, None]
-        per_head = tl.maximum(cos, 0.0) * w[:, None]
-        score = tl.sum(tl.reshape(per_head, (BLOCK_R, H, BLOCK_C)), axis=1)
-        if IS_DECODE:
-            # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
-            vis = tl.where((t >= 0)[:, None], size[None, :], 0)
-        else:
-            # Runs hold positions ascending: a run has a visible key iff its
-            # first key is. The probe select counts the probed runs' visible
-            # prefixes.
-            size = tl.load(run_size_ptr + b * C + offs_c, mask=live, other=0)
-            run_start = tl.load(run_start_ptr + b * C + offs_c, mask=live, other=0)
-            has = size > 0
-            first = tl.load(run_pos_ptr + run_start, mask=has, other=0)
-            vis = tl.where(
-                has[None, :] & (first[None, :] <= t[:, None]), size[None, :], 0
+        for c0 in range(c_begin, c_end, BLOCK_C):
+            offs_c = c0 + tl.arange(0, BLOCK_C)
+            in_c = offs_c < c_end
+            rec = _rec(cen_bt_ptr, cen_bt_stride, b, offs_c, cpb, cen_stride, in_c)
+            size = tl.load(cen_i32_ptr + (rec + 256) // 4, mask=in_c, other=-1)
+            live = in_c & (size >= 0)
+            cf = _load_centroids(cen_ptr, rec, live)
+            per_head = tl.maximum(tl.dot(cf, tl.trans(q)), 0.0) * w[None, :]
+            score = tl.trans(
+                tl.sum(tl.reshape(per_head, (BLOCK_C, H, BLOCK_R)), axis=1)
             )
-        m = mine[:, None] & in_c[None, :]
-        tl.store(score_ws_ptr + out, score, mask=m)
-        tl.store(vis_ws_ptr + out, tl.where(live[None, :], vis, -1), mask=m)
+            if IS_DECODE:
+                # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
+                vis = tl.where((t >= 0)[:, None], size[None, :], 0)
+            else:
+                # Runs hold positions ascending: a run has a visible key iff
+                # its first key is. The probe select counts the probed runs'
+                # visible prefixes.
+                size = tl.load(run_size_ptr + b * C + offs_c, mask=live, other=0)
+                run_start = tl.load(run_start_ptr + b * C + offs_c, mask=live, other=0)
+                has = size > 0
+                first = tl.load(run_pos_ptr + run_start, mask=has, other=0)
+                vis = tl.where(
+                    has[None, :] & (first[None, :] <= t[:, None]), size[None, :], 0
+                )
+            out = offs_r[:, None] * C + offs_c[None, :]
+            m = mine[:, None] & in_c[None, :]
+            tl.store(score_ws_ptr + out, score, mask=m)
+            tl.store(vis_ws_ptr + out, tl.where(live[None, :], vis, -1), mask=m)
         pending = pending & ~mine
 
 
@@ -768,10 +972,13 @@ def ivf_probe_select_kernel(
     topk_len_out_ptr,
     cand_ptr,
     cand_width,
+    probe_end_ptr,
+    probe_base_ptr,
     num_probes,
     TOPK: tl.constexpr,
     C: tl.constexpr,
     C_PAD: tl.constexpr,
+    P_PAD: tl.constexpr,
     IS_DECODE: tl.constexpr,
 ):
     """Probe a fixed number of clusters per row and lay out its candidates.
@@ -783,7 +990,10 @@ def ivf_probe_select_kernel(
     count (every visible key of the probed clusters) and the top-k length (0
     when the row keeps every candidate). At prefill, ``vis_ws`` holds run sizes
     on entry; the probed runs' visible prefixes are searched here and written
-    back for the grouped score.
+    back for the grouped score, and the probed clusters are listed in cluster
+    order for the emit, P_PAD per row: each one's exclusive candidate end
+    (``probe_end``, padded with int32 max) and the run-layout offset of its
+    slots (``probe_base``: slot j maps to ``run_pos[probe_base + j]``).
     """
     row = tl.program_id(0)
     offs_all = tl.arange(0, C_PAD)
@@ -821,6 +1031,14 @@ def ivf_probe_select_kernel(
         tl.store(vis_ws_ptr + row * C + offs_all, take, mask=selected)
     ends = tl.cumsum(take, axis=0)
     total = tl.sum(take, axis=0)
+    if not IS_DECODE:
+        rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+        dst = row * P_PAD + rank
+        tl.store(probe_end_ptr + dst, ends, mask=selected)
+        tl.store(probe_base_ptr + dst, start - (ends - take), mask=selected)
+        offs_p = tl.arange(0, P_PAD)
+        pad = offs_p >= tl.sum(selected.to(tl.int32), axis=0)
+        tl.store(probe_end_ptr + row * P_PAD + offs_p, 2147483647, mask=pad)
     tl.store(sel_out_ptr + row * C + offs_all, selected.to(tl.int8), mask=in_range)
     tl.store(ends_out_ptr + row * C + offs_all, ends, mask=in_range)
     tl.store(total_out_ptr + row, total)
@@ -971,22 +1189,30 @@ def ivf_group_count_kernel(
     row_batch_ptr,
     group_m_ptr,
     group_vis_ptr,
+    tile_cnt_ptr,
     num_rows,
     C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
     """Per (batch row, cluster) group: how many over-budget query rows probed
-    the cluster, and the most keys of it any of them sees."""
+    the cluster, and the most keys of it any of them sees. Also each row
+    tile's probing rows per cluster (``tile_cnt [row tiles, C]``)."""
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_r = offs_r < num_rows
+    in_c = offs_c < C
     need = tl.load(topk_len_ptr + offs_r, mask=mask_r, other=0) > 0
     b = tl.load(row_batch_ptr + offs_r, mask=mask_r, other=0)
-    m = (need & mask_r)[:, None] & (offs_c < C)[None, :]
+    m = (need & mask_r)[:, None] & in_c[None, :]
     off = offs_r[:, None] * C + offs_c[None, :]
     hit = m & (tl.load(sel_ptr + off, mask=m, other=0) != 0)
     vis = tl.load(vis_ws_ptr + off, mask=hit, other=0)
+    tl.store(
+        tile_cnt_ptr + tl.program_id(0) * C + offs_c,
+        tl.sum(hit.to(tl.int32), axis=0),
+        mask=in_c,
+    )
     # Rows of the tile's first request reduce first: one atomic per cluster.
     b0 = tl.load(row_batch_ptr + tl.program_id(0) * BLOCK_R)
     same = hit & (b == b0)[:, None]
@@ -1003,37 +1229,68 @@ def ivf_group_count_kernel(
 
 
 @triton.jit
+def ivf_group_scan_kernel(
+    tile_cnt_ptr,
+    tile_base_ptr,
+    cluster_total_ptr,
+    num_tiles,
+    C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Per cluster: probing rows before each row tile (exclusive scan of
+    ``tile_cnt`` over tiles) and the cluster's total."""
+    offs_c = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
+    in_c = offs_c < C
+    carry = tl.zeros([BLOCK_C], tl.int32)
+    for t0 in range(0, num_tiles, BLOCK_T):
+        offs_t = t0 + tl.arange(0, BLOCK_T)
+        m = (offs_t < num_tiles)[:, None] & in_c[None, :]
+        off = offs_t[:, None] * C + offs_c[None, :]
+        cnt = tl.load(tile_cnt_ptr + off, mask=m, other=0)
+        tl.store(tile_base_ptr + off, carry[None, :] + tl.cumsum(cnt, axis=0) - cnt, m)
+        carry += tl.sum(cnt, axis=0)
+    tl.store(cluster_total_ptr + offs_c, carry, mask=in_c)
+
+
+@triton.jit
 def ivf_group_offsets_kernel(
     group_m_ptr,
     group_vis_ptr,
-    group_off_ptr,
-    cursor_ptr,
+    cluster_total_ptr,
+    cluster_base_ptr,
     unit_off_ptr,
     num_groups,
-    BLOCK_M: tl.constexpr,
+    C: tl.constexpr,
+    UNIT_KEYS: tl.constexpr,
     UNIT_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One program: each group's first row-list slot (also its fill cursor)
-    and first work unit; unit_off[G] is the unit total.
+    """One program: each group's first work unit (unit_off[G] is the unit
+    total, unit_off[G + 1] the grouped score's work counter, zeroed here) and
+    each cluster's first row-list slot.
 
-    A unit is one BLOCK_M-key tile of a group against UNIT_ROWS of its rows.
+    A unit is up to UNIT_KEYS keys of a group against UNIT_ROWS of its rows.
+    The row list is cluster-major, each cluster's rows ascending.
     """
-    rows_carry = tl.full([], 0, tl.int32)
     unit_carry = tl.full([], 0, tl.int32)
     tl.store(unit_off_ptr, 0)
+    tl.store(unit_off_ptr + num_groups + 1, 0)
     for g0 in range(0, num_groups, BLOCK):
         g = g0 + tl.arange(0, BLOCK)
         mask = g < num_groups
         m = tl.load(group_m_ptr + g, mask=mask, other=0)
         vis = tl.load(group_vis_ptr + g, mask=mask, other=0)
-        units = tl.cdiv(vis, BLOCK_M) * tl.cdiv(m, UNIT_ROWS)
-        start = rows_carry + tl.cumsum(m, axis=0) - m
-        tl.store(group_off_ptr + g, start, mask=mask)
-        tl.store(cursor_ptr + g, start, mask=mask)
+        units = tl.cdiv(vis, UNIT_KEYS) * tl.cdiv(m, UNIT_ROWS)
         tl.store(unit_off_ptr + 1 + g, unit_carry + tl.cumsum(units, axis=0), mask)
-        rows_carry += tl.sum(m, axis=0)
         unit_carry += tl.sum(units, axis=0)
+    rows_carry = tl.full([], 0, tl.int32)
+    for c0 in range(0, C, BLOCK):
+        c = c0 + tl.arange(0, BLOCK)
+        mask = c < C
+        n = tl.load(cluster_total_ptr + c, mask=mask, other=0)
+        tl.store(cluster_base_ptr + c, rows_carry + tl.cumsum(n, axis=0) - n, mask)
+        rows_carry += tl.sum(n, axis=0)
 
 
 @triton.jit
@@ -1041,46 +1298,50 @@ def ivf_group_fill_kernel(
     sel_ptr,
     topk_len_ptr,
     row_batch_ptr,
-    cursor_ptr,
+    tile_base_ptr,
+    cluster_base_ptr,
     row_list_ptr,
+    group_off_ptr,
     num_rows,
     C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Append every over-budget row to the row list of each group it probed.
+    """Place every over-budget row in the row list of each group it probed.
 
-    Order inside a group is arbitrary; each score depends only on its own
-    query row and key, so results do not.
+    Each cluster's rows are in ascending row order, so a group's rows ascend
+    by query position and their visible key counts ascend too (the grouped
+    score skips key tiles none of a tile's rows sees). A request's first row
+    writes its groups' first slots (``group_off``).
     """
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_r = offs_r < num_rows
+    in_c = offs_c < C
     need = tl.load(topk_len_ptr + offs_r, mask=mask_r, other=0) > 0
     b = tl.load(row_batch_ptr + offs_r, mask=mask_r, other=0)
-    m = (need & mask_r)[:, None] & (offs_c < C)[None, :]
+    m = (need & mask_r)[:, None] & in_c[None, :]
     hit = m & (tl.load(sel_ptr + offs_r[:, None] * C + offs_c[None, :], m, 0) != 0)
-    # As in group_count: the first request's rows take one cursor bump per
-    # cluster and number themselves by rank.
-    b0 = tl.load(row_batch_ptr + tl.program_id(0) * BLOCK_R)
-    same = hit & (b == b0)[:, None]
-    n0 = tl.sum(same.to(tl.int32), axis=0)
-    base = tl.atomic_add(cursor_ptr + b0 * C + offs_c, n0, mask=n0 > 0, sem="relaxed")
-    rank = tl.cumsum(same.to(tl.int32), axis=0) - 1
-    other = hit & ~same
-    g = b[:, None] * C + offs_c[None, :]
-    one = tl.full([BLOCK_R, BLOCK_C], 1, tl.int32)
-    slot = tl.atomic_add(cursor_ptr + g, one, other, sem="relaxed")
-    slot = tl.where(same, base[None, :] + rank, slot)
+    hit_i = hit.to(tl.int32)
+    base = tl.load(tile_base_ptr + tl.program_id(0) * C + offs_c, mask=in_c, other=0)
+    base += tl.load(cluster_base_ptr + offs_c, mask=in_c, other=0)
+    slot = base[None, :] + tl.cumsum(hit_i, axis=0) - hit_i
     rows = tl.broadcast_to(offs_r[:, None], [BLOCK_R, BLOCK_C])
     tl.store(row_list_ptr + slot, rows, mask=hit)
+    prev = tl.load(row_batch_ptr + offs_r - 1, mask=mask_r & (offs_r > 0), other=-1)
+    first = mask_r & (b != prev)
+    tl.store(
+        group_off_ptr + b[:, None] * C + offs_c[None, :],
+        slot,
+        mask=first[:, None] & in_c[None, :],
+    )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["cand_cap", "num_groups", "log_g"])
 def ivf_grouped_score_kernel(
     q_fp8_ptr,
     w_ptr,
-    run_keys_ptr,
+    key_desc,
     run_scales_ptr,
     run_start_ptr,
     group_m_ptr,
@@ -1093,86 +1354,105 @@ def ivf_grouped_score_kernel(
     score_ptr,
     cand_cap,
     num_groups,
+    log_g,
     C: tl.constexpr,
     H: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     ROWS: tl.constexpr,
-    TILES: tl.constexpr,
-    LOG_G: tl.constexpr,
+    KEY_TILES: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    GRAB: tl.constexpr,
 ):
     """Persistent grouped GEMM: per (batch row, cluster) group, the cluster's
     keys times the query heads of every row that probed it.
 
-    A work unit holds one BLOCK_M-key tile and streams TILES tiles of ROWS
-    rows, each with H fp8 query heads (gathered from ``q_fp8`` [rows, H, 128]).
-    Each step is one ``[BLOCK_M, 128] x [128, ROWS * H]`` fp8 product (wgmma);
-    the DSA score sum_h w_h ReLU(q_h . k) times the key scale goes to the
-    row's candidate slot.
+    A work unit is one tile of ROWS rows of a group against up to KEY_TILES
+    BLOCK_N-key tiles of its cluster. The unit gathers its rows' H fp8 query
+    heads (from ``q_fp8`` [rows, H, 128]) once, head-major so that most of the
+    head sum stays in each thread's accumulator registers, and streams the
+    cluster's keys (contiguous in the run layout) through the TMA descriptor
+    ``key_desc``. Each step is one ``[BLOCK_N, 128] x [128, H * ROWS]`` fp8
+    product (wgmma); the DSA score sum_h w_h ReLU(q_h . k) times the key scale
+    goes, transposed to rows of consecutive keys, to the row's candidate slots.
+
+    A group's rows ascend by position, so their visible key counts ascend: a
+    unit stops at the last key its last row sees, and is skipped when that
+    is before its first key. A large cluster splits into several units, so
+    no unit outgrows KEY_TILES tiles. Programs take GRAB consecutive units at
+    a time from the work counter ``unit_off[G + 1]``. The key loop pipelines
+    its TMA loads over NUM_STAGES buffers.
     """
     RH: tl.constexpr = ROWS * H
+    UNIT_KEYS: tl.constexpr = BLOCK_N * KEY_TILES
     offs_d = tl.arange(0, 128)
     total = tl.load(unit_off_ptr + num_groups)
-    for u in range(tl.program_id(0), total, tl.num_programs(0)):
+    u = tl.atomic_add(unit_off_ptr + num_groups + 1, GRAB, sem="relaxed")
+    while u < total:
+        u_end = tl.minimum(total, u + GRAB)
         # The group holding unit u: the first g with unit_off[g + 1] > u.
         lo = tl.full([], 0, tl.int32)
         hi = tl.full([], 0, tl.int32) + num_groups
-        for _ in range(LOG_G):
+        for _ in range(log_g):
             active = lo < hi
             mid = (lo + hi) // 2
             right = tl.load(unit_off_ptr + mid + 1, mask=active, other=0) <= u
-            new_lo = tl.where(active & right, mid + 1, lo)
+            lo = tl.where(active & right, mid + 1, lo)
             hi = tl.where(active & ~right, mid, hi)
-            lo = new_lo
         g = lo
-        rel = u - tl.load(unit_off_ptr + g)
-        vis_max = tl.load(group_vis_ptr + g)
-        n_key_tiles = tl.cdiv(vis_max, BLOCK_M)
-        m0 = (rel % n_key_tiles) * BLOCK_M
-        r0 = (rel // n_key_tiles) * (ROWS * TILES)
-        m_g = tl.load(group_m_ptr + g)
-        c = g % C
-        row_base = tl.load(group_off_ptr + g)
-
-        offs_m = m0 + tl.arange(0, BLOCK_M)
-        mask_m = offs_m < vis_max
-        key0 = tl.load(run_start_ptr + g).to(tl.int64)
-        k = tl.load(
-            run_keys_ptr + (key0 + offs_m)[:, None] * 128 + offs_d[None, :],
-            mask=mask_m[:, None],
-            other=0.0,
-        )
-        k_scale = tl.load(run_scales_ptr + key0 + offs_m, mask=mask_m, other=0.0)
-        # Row indices run one tile ahead, so a tile's gather never waits on an
-        # index load of the same iteration.
-        offs_n = r0 + tl.arange(0, ROWS)
-        rows_next = tl.load(
-            row_list_ptr + row_base + offs_n, mask=offs_n < m_g, other=0
-        )
-        for t in tl.range(0, TILES, num_stages=NUM_STAGES):
-            offs_r = r0 + t * ROWS + tl.arange(0, ROWS)
+        g_end = tl.load(unit_off_ptr + g + 1)
+        while u < u_end:
+            while g_end <= u:
+                g += 1
+                g_end = tl.load(unit_off_ptr + g + 1)
+            rel = u - tl.load(unit_off_ptr + g)
+            vis_max = tl.load(group_vis_ptr + g)
+            n_chunks = tl.cdiv(vis_max, UNIT_KEYS)
+            kt0 = (rel % n_chunks) * KEY_TILES
+            r0 = (rel // n_chunks) * ROWS
+            m_g = tl.load(group_m_ptr + g)
+            c = g % C
+            row_base = tl.load(group_off_ptr + g)
+            offs_r = r0 + tl.arange(0, ROWS)
             mask_r = offs_r < m_g
-            rows = rows_next
-            offs_n = offs_r + ROWS
-            rows_next = tl.load(
-                row_list_ptr + row_base + offs_n, mask=offs_n < m_g, other=0
-            )
-            heads = tl.reshape(
-                rows.to(tl.int64)[:, None] * H + tl.arange(0, H)[None, :], (RH,)
-            )
-            q = tl.load(q_fp8_ptr + heads[:, None] * 128 + offs_d[None, :])
-            w = tl.load(w_ptr + heads)
-            per_head = tl.maximum(tl.dot(k, tl.trans(q)), 0.0) * w[None, :]
-            score = tl.sum(tl.reshape(per_head, (BLOCK_M, ROWS, H)), axis=2)
-            score = score * k_scale[:, None]
+            rows = tl.load(row_list_ptr + row_base + offs_r, mask=mask_r, other=0)
             vis = tl.load(vis_ws_ptr + rows * C + c, mask=mask_r, other=0)
             first = tl.load(ends_ptr + rows * C + c, mask=mask_r, other=0) - vis
-            slot = first[None, :] + offs_m[:, None]
-            keep = (
-                mask_r[None, :] & (offs_m[:, None] < vis[None, :]) & (slot < cand_cap)
-            )
-            dst = rows.to(tl.int64)[None, :] * cand_cap + slot
-            tl.store(score_ptr + dst, score, mask=keep, eviction_policy="evict_first")
+            kt1 = tl.minimum(kt0 + KEY_TILES, tl.cdiv(tl.max(vis, axis=0), BLOCK_N))
+            if kt0 < kt1:
+                # Column h * ROWS + r is head h of row r.
+                heads = tl.reshape(
+                    rows.to(tl.int64)[None, :] * H + tl.arange(0, H)[:, None], (RH,)
+                )
+                q = tl.load(q_fp8_ptr + heads[:, None] * 128 + offs_d[None, :])
+                w = tl.load(w_ptr + heads)
+                key0 = tl.load(run_start_ptr + g)
+                dst_row = rows.to(tl.int64) * cand_cap
+                for kt in tl.range(kt0, kt1, num_stages=NUM_STAGES):
+                    m0 = kt * BLOCK_N
+                    # Rows past the cluster are other runs' keys (or zeros past the
+                    # end): their slots are masked below.
+                    k = key_desc.load([key0 + m0, 0])
+                    offs_m = m0 + tl.arange(0, BLOCK_N)
+                    k_scale = tl.load(
+                        run_scales_ptr + key0 + offs_m, mask=offs_m < vis_max, other=0.0
+                    )
+                    per_head = tl.maximum(tl.dot(k, tl.trans(q)), 0.0) * w[None, :]
+                    score = tl.sum(tl.reshape(per_head, (BLOCK_N, H, ROWS)), axis=1)
+                    score = tl.trans(score * k_scale[:, None])
+                    slot = first[:, None] + offs_m[None, :]
+                    keep = (
+                        mask_r[:, None]
+                        & (offs_m[None, :] < vis[:, None])
+                        & (slot < cand_cap)
+                    )
+                    tl.store(
+                        score_ptr + dst_row[:, None] + slot,
+                        score,
+                        mask=keep,
+                        eviction_policy="evict_first",
+                    )
+            u += 1
+        u = tl.atomic_add(unit_off_ptr + num_groups + 1, GRAB, sem="relaxed")
 
 
 @triton.jit
@@ -1208,25 +1488,25 @@ def ivf_emit_runs_kernel(
     count_ptr,
     total_ptr,
     selected_ptr,
-    row_batch_ptr,
     pos_ptr,
-    ends_ptr,
-    run_start_ptr,
+    probe_end_ptr,
+    probe_base_ptr,
     run_pos_ptr,
     out_ptr,
     out_stride,
     out_width,
     TOPK: tl.constexpr,
-    C: tl.constexpr,
-    LOG_C: tl.constexpr,
+    P_PAD: tl.constexpr,
+    LOG_P: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Prefill emit: map selected candidate slots straight to positions.
 
-    Slots run cluster after cluster (``ends``), each the visible prefix of the
-    cluster's run, so slot j is entry j - start of the first cluster whose end
-    > j. Only the selected slots are mapped; a row without candidates emits
-    its own position.
+    Slots run probed cluster after probed cluster, each the visible prefix of
+    the cluster's run, so slot j belongs to the first probed cluster whose
+    end (``probe_end``) > j and maps to ``run_pos[probe_base + j]``. Only the
+    selected slots are mapped; a row without candidates emits its own
+    position.
     """
     row = tl.program_id(0)
     j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -1240,16 +1520,14 @@ def ivf_emit_runs_kernel(
     live = (slot >= 0) & (j < TOPK)
     found = live & (total > 0)
     lo = tl.zeros([BLOCK], tl.int32)
-    hi = tl.where(found, C, 0)
-    for _ in range(LOG_C):
+    hi = tl.where(found, P_PAD, 0)
+    for _ in range(LOG_P):
         active = lo < hi
         mid = (lo + hi) // 2
-        end = tl.load(ends_ptr + row * C + mid, mask=active, other=0)
+        end = tl.load(probe_end_ptr + row * P_PAD + mid, mask=active, other=0)
         lo = tl.where(active & (end <= slot), mid + 1, lo)
         hi = tl.where(active & (end > slot), mid, hi)
-    start = tl.load(ends_ptr + row * C + lo - 1, mask=found & (lo > 0), other=0)
-    b = tl.load(row_batch_ptr + row)
-    run_start = tl.load(run_start_ptr + b * C + lo, mask=found, other=0)
-    p = tl.load(run_pos_ptr + run_start + (slot - start), mask=found, other=0)
+    base = tl.load(probe_base_ptr + row * P_PAD + lo, mask=found, other=0)
+    p = tl.load(run_pos_ptr + base + slot, mask=found, other=0)
     p = tl.where(total > 0, p, tl.load(pos_ptr + row).to(tl.int32))
     tl.store(out_ptr + row * out_stride + j, tl.where(live, p, -1), mask=j < out_width)

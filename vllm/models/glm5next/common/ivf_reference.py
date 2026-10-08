@@ -10,8 +10,8 @@ time. It is the oracle for the kernel tests and runs on CPU.
   and one ue8m0 scale per key. k-means clusters them by cosine.
 - A query is the stock indexer's input: H rotated fp8 heads q_h (values as
   fp32) and head weights w_h with the query scales folded in.
-- Probing scores cluster c by Σ_h w_h ReLU(cos(q_h, c)) and takes a fixed
-  number (P) of clusters.
+- Probing scores cluster c by the key score with its unit centroid as the
+  key, Σ_h w_h ReLU(q_h · c), and takes a fixed number (P) of clusters.
 - Every visible key of the probed clusters is a candidate (no cap); the top-k
   candidates by the DSA score Σ_h w_h ReLU(q_h · k) · scale_k are selected.
 """
@@ -102,6 +102,9 @@ class KmeansResult(NamedTuple):
     n_clusters: int
     # Centroid updates run before the assignments settled (<= iters).
     updates: int = 0
+    # [C] length of each centroid's member key sum at its last update (0
+    # before any update or for an empty cluster), as the record stores it.
+    lengths: torch.Tensor | None = None
 
 
 def kmeans_reference(
@@ -150,6 +153,7 @@ def kmeans_reference(
         init = init_centroids.float()
     c_f32 = torch.where(live[:, None], init, torch.zeros_like(init))
     c_bf16 = c_f32.to(torch.bfloat16).float()
+    lengths = torch.zeros(C)
 
     def assign() -> torch.Tensor:
         # The key norm cannot change the argmax (cosine assignment).
@@ -174,6 +178,7 @@ def kmeans_reference(
         c_f32 = torch.where(keep_old[:, None], c_f32, unit)
         c_f32 = torch.where(live[:, None], c_f32, torch.zeros_like(c_f32))
         c_bf16 = c_f32.to(torch.bfloat16).float()
+        lengths = torch.where(live, norm / _SUM_SCALE, torch.zeros_like(norm))
     cid = assign()
     return KmeansResult(
         centroids=c_bf16,
@@ -181,6 +186,51 @@ def kmeans_reference(
         sizes=torch.bincount(cid, minlength=C),
         n_clusters=c_eff,
         updates=updates,
+        lengths=lengths,
+    )
+
+
+def kmeans_append_reference(
+    k_fp8: torch.Tensor, k_scale: torch.Tensor, prev: KmeansResult
+) -> KmeansResult:
+    """Append keys ``[len(prev.cluster_of_pos), T)`` to a request's clusters.
+
+    The earlier keys keep their clusters. Each new key joins its most cosine
+    similar current centroid; each centroid's member sum (stored length times
+    its bf16 unit direction) gains its new members and is renormalized, a zero
+    sum keeping the centroid.
+
+    Args:
+        k_fp8: All T keys' fp8 values as fp32.
+        k_scale: Their scales.
+        prev: The clustering of the first keys, with ``lengths``.
+
+    Returns:
+        The clustering of all T keys, with the updated ``lengths``.
+
+    """
+    k_fp8 = k_fp8.float()
+    n_prev = prev.cluster_of_pos.numel()
+    C = prev.centroids.shape[0]
+    new = k_fp8[n_prev:]
+    sim = new @ prev.centroids.T
+    sim[:, prev.n_clusters :] = float("-inf")
+    new_cid = sim.argmax(dim=1)
+    fixed = (new * (k_scale[n_prev:].float() * _SUM_SCALE)[:, None]).to(torch.int64)
+    added = torch.zeros((C, HEAD_DIM), dtype=torch.int64).index_add_(0, new_cid, fixed)
+    total = prev.centroids * prev.lengths[:, None] + added.float() / _SUM_SCALE
+    norm = total.norm(dim=1)
+    unit = total / norm.clamp(min=1e-30)[:, None]
+    live = torch.arange(C) < prev.n_clusters
+    centroids = torch.where((norm == 0)[:, None], prev.centroids, unit)
+    centroids = torch.where(live[:, None], centroids, torch.zeros_like(centroids))
+    cid = torch.cat([prev.cluster_of_pos, new_cid])
+    return KmeansResult(
+        centroids=centroids.to(torch.bfloat16).float(),
+        cluster_of_pos=cid,
+        sizes=torch.bincount(cid, minlength=C),
+        n_clusters=prev.n_clusters,
+        lengths=torch.where(live, norm, torch.zeros_like(norm)),
     )
 
 
@@ -195,10 +245,8 @@ def decode_assign_reference(
 def probe_scores_reference(
     q_fp8: torch.Tensor, weights: torch.Tensor, centroids: torch.Tensor
 ) -> torch.Tensor:
-    """Cluster scores Σ_h w_h ReLU(cos(q_h, c)) of unit ``centroids`` [C, 128]."""
-    q = q_fp8.float()
-    q_unit = q / q.norm(dim=1, keepdim=True).clamp(min=1e-12)
-    return (torch.relu(centroids.float() @ q_unit.T) * weights.float()).sum(1)
+    """Cluster scores Σ_h w_h ReLU(q_h · c) of unit ``centroids`` [C, 128]."""
+    return (torch.relu(centroids.float() @ q_fp8.float().T) * weights.float()).sum(1)
 
 
 def probe_reference(

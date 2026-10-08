@@ -25,6 +25,13 @@ class IvfIndexerConfig:
     topk: int
     # Stop k-means once at most this fraction of keys moved in an iteration.
     kmeans_stop_fraction: float = 0.0
+    # Iterations (at most ``kmeans_iters``) of a full rebuild that starts from
+    # the previous chunk's centroids; a cold build runs ``kmeans_iters``.
+    kmeans_warm_iters: int = 2
+    # Later prefill chunks assign only their new keys and update the centroids
+    # from running sums; a chunk whose key count crosses a power of two
+    # rebuilds all keys instead.
+    kmeans_incremental: bool = True
 
     @classmethod
     def from_hf_config(cls, config, max_model_len: int) -> "IvfIndexerConfig":
@@ -32,6 +39,7 @@ class IvfIndexerConfig:
         num_clusters = getattr(config, "index_num_clusters", 256)
         num_probes = getattr(config, "index_num_probes", 32)
         kmeans_iters = getattr(config, "index_kmeans_iters", 10)
+        warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
         if not 1 <= num_clusters <= 32767:
             raise ValueError(
@@ -43,6 +51,8 @@ class IvfIndexerConfig:
             )
         if kmeans_iters < 0:
             raise ValueError(f"index_kmeans_iters must be >= 0, got {kmeans_iters}")
+        if warm_iters < 0:
+            raise ValueError(f"index_kmeans_warm_iters must be >= 0, got {warm_iters}")
         if not 0.0 <= stop_fraction < 1.0:
             raise ValueError(
                 f"index_kmeans_stop_fraction must be in [0, 1), got {stop_fraction}"
@@ -55,6 +65,8 @@ class IvfIndexerConfig:
             kmeans_seed=getattr(config, "index_kmeans_seed", 0),
             topk=config.index_topk,
             kmeans_stop_fraction=stop_fraction,
+            kmeans_warm_iters=warm_iters,
+            kmeans_incremental=bool(getattr(config, "index_kmeans_incremental", True)),
         )
 
 

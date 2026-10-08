@@ -43,6 +43,8 @@ class IvfIndexerMetadata:
     # Host lengths of the prefill requests (rows num_decodes onward).
     prefill_seq_lens_cpu: list[int]
     prefill_query_lens_cpu: list[int]
+    # Whether each prefill row's chunk completes its prompt.
+    prefill_final_cpu: list[bool]
 
 
 @dataclass
@@ -78,12 +80,23 @@ class IvfIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         prefill_seq_lens: list[int] = []
         prefill_query_lens: list[int] = []
+        prefill_final: list[bool] = []
         if num_prefills > 0:
             assert cam.seq_lens_cpu_upper_bound is not None
             rows = slice(num_decodes, cam.num_reqs)
             prefill_seq_lens = cam.seq_lens_cpu_upper_bound[rows].tolist()
             qsl = cam.query_start_loc_cpu[num_decodes : cam.num_reqs + 1]
             prefill_query_lens = (qsl[1:] - qsl[:-1]).tolist()
+            if cam.prefill_lens_cpu is None:
+                # Unknown prompt lengths: treat every chunk as the last.
+                prefill_final = [True] * num_prefills
+            else:
+                prefill_final = [
+                    s >= p
+                    for s, p in zip(
+                        prefill_seq_lens, cam.prefill_lens_cpu[rows].tolist()
+                    )
+                ]
         return IvfIndexerMetadata(
             slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
@@ -97,6 +110,7 @@ class IvfIndexerMetadataBuilder(AttentionMetadataBuilder):
             req_index=self.req_index,
             prefill_seq_lens_cpu=prefill_seq_lens,
             prefill_query_lens_cpu=prefill_query_lens,
+            prefill_final_cpu=prefill_final,
         )
 
 
