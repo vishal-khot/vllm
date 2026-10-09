@@ -20,7 +20,7 @@ graph capture.
 
 import functools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.models.glm5next.nvidia import ivf_fidelity
 from vllm.models.glm5next.common.ivf_backend import (
     IvfIndexerMetadata,
     IvfStateMetadata,
@@ -573,6 +574,7 @@ def select_ivf_topk(
     max_scratch_bytes: int | None = None,
     max_width: int | None = None,
     token_lens: torch.Tensor | None = None,
+    score_sum_out: torch.Tensor | None = None,
 ) -> None:
     """Top-k over IVF candidates, written in place into ``out`` [rows, W].
 
@@ -729,6 +731,7 @@ def select_ivf_topk(
             out=out,
             topk=topk,
             topk_backend=topk_backend,
+            score_sum_out=score_sum_out,
         )
         return
 
@@ -753,6 +756,7 @@ def select_ivf_topk(
         out=out,
         topk=topk,
         topk_backend=topk_backend,
+        score_sum_out=score_sum_out,
         runs=_EmitRuns(
             totals=totals,
             query_pos=query_pos,
@@ -789,17 +793,30 @@ def _topk_and_emit(
     topk_backend: str,
     cand: torch.Tensor | None = None,
     runs: _EmitRuns | None = None,
+    score_sum_out: torch.Tensor | None = None,
 ) -> None:
     """Top-k slots of over-budget rows, then candidate positions into ``out``.
 
     Rows with at most top-k candidates have length 0 and keep all of them.
     Decode reads positions from ``cand``; prefill maps the selected slots
     through the run layout (``runs``), so it never materializes candidates.
+
+    When ``score_sum_out`` is given, write each row's summed DSA score over its
+    retained keys (the attention mass it keeps) -- used by the lost-attention
+    measurement, never on the production path.
     """
     assert (cand is None) != (runs is None)
     num_rows, width = scores.shape
     selected = torch.empty((num_rows, topk), dtype=torch.int32, device=out.device)
     get_indexer_topk(topk_backend)(scores, topk_lens, 1, selected, topk, width)
+    if score_sum_out is not None:
+        # Over-budget rows sum their top-k slots; the rest keep every candidate.
+        idx = selected.long().clamp_(0, width - 1)
+        topk_sum = scores.gather(1, idx).sum(dim=1)
+        col = torch.arange(width, device=scores.device)
+        valid = col[None, :] < counts[:, None]
+        all_sum = torch.where(valid, scores, scores.new_zeros(())).sum(dim=1)
+        score_sum_out.copy_(torch.where(topk_lens > 0, topk_sum, all_sum))
     block = TUNING.emit_block
     if runs is not None:
         has_tail = runs.token_lens is not None
@@ -1167,6 +1184,12 @@ def sparse_attn_indexer_ivf(
     k = k[:num_tokens]
     gate_score = gate_score[:num_tokens]
     head_dim = k.shape[-1]
+
+    # Exact reference probes every cluster; the diff is the attention lost to
+    # probing. Same scoring path, so fp8 precision cancels out of the measure.
+    measure = ivf_fidelity.enabled()
+    exact_config = replace(config, num_probes=config.num_clusters) if measure else None
+
     nd = meta.num_decodes
     # The kpool indexer's writes: a prefill caches its complete pools and its
     # incomplete tail pool; a decode token (one per request) joins the tail
@@ -1224,6 +1247,7 @@ def sparse_attn_indexer_ivf(
         completed = torch.where(seq_lens % kpool == 0, num_pools, 0)
         append_ivf_decode_keys(key=key, state=state, seq_lens=completed)
         pools = torch.empty((nd, config.topk), dtype=torch.int32, device=q_fp8.device)
+        real_mass = q_fp8.new_empty((nd,), dtype=torch.float32) if measure else None
         select_ivf_topk(
             key=key,
             state=state,
@@ -1235,9 +1259,30 @@ def sparse_attn_indexer_ivf(
             out=pools,
             topk_backend=topk_backend,
             seq_lens=num_pools,
+            score_sum_out=real_mass,
         )
         tokens = kpool_ops.expand_pools_and_append_tail(pools, seq_lens, kpool)
         topk_indices_buffer[:nd, : tokens.shape[1]] = tokens
+        if measure:
+            exact_pools = torch.full_like(pools, -1)
+            exact_mass = q_fp8.new_empty((nd,), dtype=torch.float32)
+            select_ivf_topk(
+                key=key,
+                state=state,
+                q_fp8=q_fp8[:nd],
+                weights=weights[:nd],
+                row_batch=meta.req_index[:nd],
+                query_pos=num_pools - 1,
+                config=exact_config,
+                out=exact_pools,
+                topk_backend=topk_backend,
+                seq_lens=num_pools,
+                score_sum_out=exact_mass,
+            )
+            ivf_fidelity.record(
+                k_cache_prefix, "decode", pools, exact_pools,
+                real_mass, exact_mass,
+            )
 
     if meta.num_prefills > 0:
         device = q_fp8.device
@@ -1265,6 +1310,9 @@ def sparse_attn_indexer_ivf(
             device,
         )
         if built:
+            real_mass = (
+                q_fp8.new_empty((num_rows,), dtype=torch.float32) if measure else None
+            )
             select_ivf_topk(
                 key=key,
                 state=state,
@@ -1280,7 +1328,32 @@ def sparse_attn_indexer_ivf(
                 # A query sees at most its request's pools: no width read-back.
                 max_width=max(num_pools_cpu),
                 token_lens=token_lens,
+                score_sum_out=real_mass,
             )
+            if measure:
+                exact_out = torch.full_like(topk_indices_buffer[start:end], -1)
+                exact_mass = q_fp8.new_empty((num_rows,), dtype=torch.float32)
+                select_ivf_topk(
+                    key=key,
+                    state=state,
+                    q_fp8=q_fp8[start:end],
+                    weights=weights[start:end],
+                    row_batch=row_batch,
+                    query_pos=pool_pos,
+                    config=exact_config,
+                    out=exact_out,
+                    topk_backend=topk_backend,
+                    layout=layout,
+                    max_scratch_bytes=max_scratch_bytes,
+                    max_width=max(num_pools_cpu),
+                    token_lens=token_lens,
+                    score_sum_out=exact_mass,
+                )
+                ivf_fidelity.record(
+                    k_cache_prefix, "prefill",
+                    topk_indices_buffer[start:end], exact_out,
+                    real_mass, exact_mass,
+                )
         else:
             pools = torch.full(
                 (num_rows, config.topk), -1, dtype=torch.int32, device=device
