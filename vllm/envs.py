@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_ENABLE_DSA_IVF_INDEXER: bool = False
+    VLLM_DSA_IVF_MEASURE_LOST_ATTENTION: bool = False
+    VLLM_DSA_IVF_LOST_ATTENTION_DIR: str = ""
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1108,6 +1110,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer. Changes the indexer KV cache layout, so it is fixed at startup.
     "VLLM_ENABLE_DSA_IVF_INDEXER": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DSA_IVF_INDEXER", "0"))
+    ),
+    # GLM-5.3-Flash IVF indexer only: for each indexer forward, also run the
+    # selection with every cluster probed (the exact top-k under the same fp8
+    # scoring) and record how many of those keys the real P-probe selection
+    # recovered -- i.e. the attention lost to probing. Expensive; enable only
+    # for select measurement runs. Results are written per rank at exit.
+    "VLLM_DSA_IVF_MEASURE_LOST_ATTENTION": lambda: bool(
+        int(os.getenv("VLLM_DSA_IVF_MEASURE_LOST_ATTENTION", "0"))
+    ),
+    # Directory for the lost-attention JSON dumps. Empty = current directory.
+    "VLLM_DSA_IVF_LOST_ATTENTION_DIR": lambda: os.getenv(
+        "VLLM_DSA_IVF_LOST_ATTENTION_DIR", ""
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
