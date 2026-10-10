@@ -58,30 +58,34 @@ metrics:
     prefill_split: [cluster, assign_score]   # IVF only
   lost_attention: [key_lost, mass_lost]       # IVF only; fractions dropped vs exact top-k
 
-# The two cases. Every field listed; null = not used by this case.
+# The default run: the shared operating point both arms start from. Each case
+# below references it with `<<: *default` and overrides only what differs, so the
+# base kpool/ivf pair is apples-to-apples (same config, k-means off vs on).
+default: &default
+  P: null
+  clusters: null
+  cadence: null
+  concurrency: 1
+  exec_mode: eager
+  measure_lost_attention: false
+  datasets: [ruler, regression, swebench]
+
+# The two cases. `<<: *default` pulls the default run; list only the diffs.
 # `sweep` on a case adds ablation runs: one knob flipped per value (-> [ruler],
 # id like ivf_P_64). `with` overrides extra fields on those runs.
 runs:
   - id: kpool                 # without k-means
+    <<: *default
     indexer: kpool
-    P: null
-    clusters: null
-    cadence: null
-    concurrency: 1
-    exec_mode: eager
-    measure_lost_attention: false
-    datasets: [ruler, regression, swebench]
 
   - id: ivf                   # with k-means (base operating point)
+    <<: *default
     indexer: ivf
     P: 32
     clusters: 256
     cadence: every_chunk
-    concurrency: 1
-    exec_mode: eager
     measure_lost_attention: true
-    datasets: [ruler, regression, swebench]
-    sweep:
+    sweep: # knobs to change the default run; each value produces a new run (-> [ruler], id like ivf_P_64)
       P: [64, 128]
       clusters: [128, 512]
       cadence: [first_chunk, every_2]
