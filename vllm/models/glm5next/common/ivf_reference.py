@@ -11,7 +11,8 @@ time. It is the oracle for the kernel tests and runs on CPU.
 - A query is the stock indexer's input: H rotated fp8 heads q_h (values as
   fp32) and head weights w_h with the query scales folded in.
 - Probing scores cluster c by the key score with its unit centroid as the
-  key, Σ_h w_h ReLU(q_h · c), and takes a fixed number (P) of clusters.
+  key, Σ_h w_h ReLU(q_h · c), and takes a fixed number (P) of clusters; a
+  query that sees at most top-k keys probes all of them (it keeps every key).
 - Every visible key of the probed clusters is a candidate (no cap); the top-k
   candidates by the DSA score Σ_h w_h ReLU(q_h · k) · scale_k are selected.
 """
@@ -346,7 +347,7 @@ def ivf_select_one_reference(
         weights=weights,
         kmeans=kmeans,
         visible=visible,
-        num_probes=num_probes,
+        num_probes=C if t < topk else num_probes,
     )
     total = int(visible[probed].sum())
     cand = collect_reference(

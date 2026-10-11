@@ -3044,23 +3044,20 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
 def _glm5_like_kv_cache_spec_with_ivf(
     num_clusters: int = 256,
 ) -> dict[str, KVCacheSpec]:
-    """GLM-5.3-Flash with the IVF indexer: per-token indexer keys plus the
-    per-request cluster-id and centroid state that aliases the indexer page."""
-    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    """GLM-5.3-Flash with the IVF indexer: the kpool indexer's pooled keys and
+    tail plus the per-request cluster-id (one per pool) and centroid state
+    that aliases the indexer page."""
+    kpool = 4
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_tail()
     for i in range(3, 45, 4):
-        idx = replace(
-            cast(MLAAttentionSpec, kv_cache_spec[f"layers.{i}.indexer"]),
-            tokens_per_state=1,
-            cache_role=SparseCacheRole.INDEXER,
-        )
-        kv_cache_spec[f"layers.{i}.indexer"] = idx
-        idx_page = idx.page_size_bytes
+        idx_page = kv_cache_spec[f"layers.{i}.indexer"].page_size_bytes
         kv_cache_spec[f"layers.{i}.ivf_cid"] = IvfClusterIdSpec(
-            block_size=idx_page // 2,
+            block_size=idx_page // 2 * kpool,
             num_kv_heads=1,
             head_size=1,
             head_size_v=0,
             dtype=torch.int16,
+            tokens_per_state=kpool,
         )
         records = idx_page // 136
         kv_cache_spec[f"layers.{i}.ivf_centroids"] = IvfCentroidSpec(
@@ -3121,22 +3118,28 @@ def test_get_kv_cache_config_glm5_ivf_state_aliases_indexer():
     layout = kv_cache_utils._glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
     assert layout is not None
     assert layout[3] == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
-    assert layout[6] == []
+    assert layout[6] == [f"layers.{4 * i + 3}.tail" for i in range(11)]
     assert layout[8] == [cid_group, cen_group]
 
     attn_group = next(
         group
         for group in groups
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        and group not in (cid_group, cen_group)
+        and all(
+            type(spec) is MLAAttentionSpec
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
     )
     attn_blocks = attn_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
     mamba_blocks = 4 * (1 + new_mamba_spec().num_speculative_blocks)
     records = idx_page // 136
-    ivf_blocks = -(-8192 // (idx_page // 2)) + -(-256 // records)
+    # One cluster id per pool: a block covers idx_page // 2 pools of 4 tokens.
+    ivf_blocks = -(-8192 // (idx_page // 2 * 4)) + -(-256 // records)
+    tail_group = next(g for g in groups if g.layer_names == layout[6])
+    tail_blocks = tail_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
     assert (
         kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
-        == (attn_blocks + mamba_blocks + ivf_blocks) * bytes_per_block
+        == (attn_blocks + mamba_blocks + tail_blocks + ivf_blocks) * bytes_per_block
     )
 
     sched_vllm_config = SimpleNamespace(
