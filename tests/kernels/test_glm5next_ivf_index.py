@@ -3,6 +3,7 @@
 """glm5next IVF indexer Triton kernels against the torch reference."""
 
 import dataclasses
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -19,6 +20,11 @@ pytestmark = [
     pytest.mark.usefixtures("workspace_init"),
 ]
 
+from vllm.models.glm5next.common.ivf_backend import (  # noqa: E402
+    IvfIndexerMetadata,
+    IvfIndexerMetadataBuilder,
+    IvfStateMetadata,
+)
 from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig  # noqa: E402
 from vllm.models.glm5next.common.ivf_reference import (  # noqa: E402
     KmeansResult,
@@ -37,14 +43,16 @@ from vllm.models.glm5next.nvidia import ivf_sparse_indexer  # noqa: E402
 from vllm.models.glm5next.nvidia.ivf_sparse_indexer import (  # noqa: E402
     IvfKeyView,
     IvfStateView,
+    _prefill_rows,
     append_ivf_decode_keys,
     build_ivf_index,
     select_ivf_topk,
-    write_ivf_keys,
+    sparse_attn_indexer_ivf,
 )
 from vllm.models.glm5next.nvidia.ops.ivf_index import REC_BYTES  # noqa: E402
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
-    fwht128_quant_fp8,
+    expand_pools_and_append_tail,
+    kpool_compress_and_write_cache,
 )
 
 DEV = "cuda"
@@ -161,28 +169,6 @@ def _queries(num_rows, seed=0) -> Queries:
     q, scale = quantize_rows_fp8(torch.randn(num_rows, HEADS, 128, generator=g), True)
     w = torch.randn(num_rows, HEADS, generator=g) * scale
     return Queries(q.to(torch.float8_e4m3fn).to(DEV), w.to(DEV), q, w)
-
-
-def test_write_keys_matches_rotated_quant():
-    """Cached keys are FWHT-rotated and quantized exactly as the query is."""
-    k = torch.randn(300, 128, device=DEV, dtype=torch.bfloat16)
-    num_pages = 8
-    cache = torch.zeros(num_pages, PAGE, 132, dtype=torch.uint8, device=DEV)
-    slots = torch.randperm(num_pages * PAGE, device=DEV)[:300]
-    slots[5] = -1
-    key = IvfKeyView.of(cache, torch.zeros(1, 1, dtype=torch.int32, device=DEV))
-    write_ivf_keys(key, k, slots)
-    want_fp8, want_scale = fwht128_quant_fp8(k)
-    page, off = slots // PAGE, slots % PAGE
-    # A page is [PAGE x 128 fp8][PAGE x fp32 scale]; index it as flat bytes.
-    flat = cache.view(num_pages, PAGE * 132)
-    got_fp8 = torch.stack(
-        [flat[p, o * 128 : (o + 1) * 128] for p, o in zip(page.tolist(), off.tolist())]
-    ).view(torch.float8_e4m3fn)
-    live = slots >= 0
-    assert torch.equal(got_fp8[live].float(), want_fp8[live].float())
-    scale_bytes = flat[:, PAGE * 128 :].contiguous().view(torch.float32)
-    assert torch.equal(scale_bytes[page[live], off[live]], want_scale[live, 0])
 
 
 def _cosines(k: torch.Tensor, km: KmeansResult) -> torch.Tensor:
@@ -539,18 +525,20 @@ def test_prefill_select_matches_reference(num_probes, num_clusters, monkeypatch)
     "tuning",
     [
         {},
-        {"select_rows_per_pass": 37},
-        {"gemm_key_tiles": 1, "gemm_grab_units": 1},
+        {"gemm_row_tiles": 1},
         {"gemm_mma_cols": 64},
-        {"gemm_block_n": 128, "gemm_num_warps": 8},
+        {"gemm_block_n": 128, "gemm_num_stages": 3},
+        {"gemm_key_chunks": 2, "gemm_chunked_keys": 0, "gemm_row_tiles": 1},
+        {"gemm_chunked_keys": 0},
     ],
 )
 def test_grouped_gemm_scores_every_probed_key(tuning, monkeypatch):
     """The prefill grouped GEMM writes the DSA score sum_h w_h ReLU(q_h . k) of
     every visible key of every probed cluster into the row's candidate slots,
-    in one or many row passes, with clusters split across many units or few.
-    A group's rows span several row tiles, so the units that stop at their
-    rows' last visible key, or skip every key, are exercised."""
+    with groups split across many units or few.
+    A group's rows span several row tiles and its keys several chunks, so
+    units whose rows see only part of their chunk, or none of it, are
+    exercised."""
     captured = {}
     real = ivf_sparse_indexer._score_grouped_gemm
 
@@ -674,31 +662,109 @@ def test_prefill_every_row_spanning_probe_tiles():
     assert not torch.any((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0))
 
 
-def test_prefill_row_passes_match_one_pass():
-    """Splitting rows to fit the scratch bound changes nothing but memory."""
+def test_prefill_rows_from_host_lengths():
+    """Each prefill row's batch row, last complete pool and visible tokens
+    follow from its request's context and query lengths."""
+    kpool, first_row = 4, 2
+    seq_lens, query_lens = [5, 9, 3], [2, 4, 3]
+    row_batch, pool_pos, token_lens = _prefill_rows(
+        seq_lens, query_lens, first_row, kpool, DEV
+    )
+    want_rows, want_tokens = [], []
+    for i, (n, q) in enumerate(zip(seq_lens, query_lens)):
+        want_rows += [first_row + i] * q
+        want_tokens += list(range(n - q + 1, n + 1))
+    assert row_batch.tolist() == want_rows
+    assert token_lens.tolist() == want_tokens
+    assert pool_pos.tolist() == [t // kpool - 1 for t in want_tokens]
+
+
+def test_prefill_emit_expands_pools_like_the_kpool_indexer():
+    """With token lengths, the prefill select writes the kpool indexer's
+    expanded row (each pool's tokens, the incomplete tail pool, then -1) for
+    the pools it selects, straight into a wider top-k buffer."""
+    kpool, width = 4, TOPK * 4 + 128
     setup = Setup(_config())
     layout = setup.build()
-    qb = _queries(64, seed=5)
-    b, n = 3, LENGTHS[3]
-    pos = torch.arange(n - 64, n, dtype=torch.int32, device=DEV)
+    row_batch, query_pos = [], []
+    for b, n in enumerate(LENGTHS):
+        picks = sorted({0, n - 1, *torch.randint(0, n, (40,)).tolist()})
+        row_batch += [b] * len(picks)
+        query_pos += picks
+    rows = len(row_batch)
+    qb = _queries(rows, seed=3)
+    pos = torch.tensor(query_pos, dtype=torch.int32, device=DEV)
+    # A row's last complete pool is its key position; 0..3 tail tokens follow.
+    token_lens = (pos + 1) * kpool + torch.randint(
+        0, kpool, (rows,), dtype=torch.int32, device=DEV
+    )
     outs = []
-    for max_scratch in (None, 1):
-        out = torch.full((64, TOPK), -7, dtype=torch.int32, device=DEV)
+    for out, kw in (
+        (torch.full((rows, TOPK), -7, dtype=torch.int32, device=DEV), {}),
+        (
+            torch.full((rows, width), -7, dtype=torch.int32, device=DEV),
+            {"token_lens": token_lens},
+        ),
+    ):
         select_ivf_topk(
             key=setup.key,
             state=setup.state,
             q_fp8=qb.fp8,
             weights=qb.w,
-            row_batch=torch.full((64,), b, dtype=torch.int32, device=DEV),
+            row_batch=torch.tensor(row_batch, dtype=torch.int32, device=DEV),
+            query_pos=pos,
+            config=dataclasses.replace(setup.config, kpool=kpool),
+            out=out,
+            topk_backend="auto",
+            layout=layout,
+            **kw,
+        )
+        outs.append(out)
+    pools, fused = outs
+    want = torch.full((rows, width), -1, dtype=torch.int32, device=DEV)
+    expanded = expand_pools_and_append_tail(pools, token_lens, kpool)
+    want[:, : expanded.shape[1]] = expanded
+    # Top-k lists a row's pools in any order: compare each row's tokens.
+    assert torch.equal(fused.sort(dim=1).values, want.sort(dim=1).values)
+
+
+def test_prefill_scratch_bound_drops_lowest_scoring_probes():
+    """A scratch bound that fits every row's candidates changes nothing; one
+    below them drops a row's lowest-scoring probed clusters, so it still
+    selects distinct visible keys from at least its best probe."""
+    setup = Setup(_config())
+    layout = setup.build()
+    rows = 64
+    qb = _queries(rows, seed=5)
+    b, n = 3, LENGTHS[3]
+    pos = torch.arange(n - rows, n, dtype=torch.int32, device=DEV)
+    outs = []
+    for max_scratch in (None, rows * 4 * (n + TOPK), 1):
+        out = torch.full((rows, TOPK), -7, dtype=torch.int32, device=DEV)
+        select_ivf_topk(
+            key=setup.key,
+            state=setup.state,
+            q_fp8=qb.fp8,
+            weights=qb.w,
+            row_batch=torch.full((rows,), b, dtype=torch.int32, device=DEV),
             query_pos=pos,
             config=setup.config,
             out=out,
             topk_backend="auto",
             layout=layout,
             max_scratch_bytes=max_scratch,
+            max_width=n,
         )
-        outs.append(out.sort(dim=1).values)
-    assert torch.equal(outs[0], outs[1])
+        outs.append(out.cpu())
+    uncapped, generous, capped = outs
+    assert torch.equal(uncapped.sort(dim=1).values, generous.sort(dim=1).values)
+    valid = capped >= 0
+    assert torch.all(capped[~valid] == -1) and torch.all(valid.any(dim=1))
+    assert torch.all(capped[valid] <= pos.cpu()[:, None].expand_as(capped)[valid])
+    ordered = capped.sort(dim=1).values
+    assert not torch.any((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0))
+    # The bound (top-k slots) is below these rows' candidates: some dropped.
+    assert not torch.equal(ordered, uncapped.sort(dim=1).values)
 
 
 def _decode_step(setup, seq_lens, qb: Queries):
@@ -778,3 +844,244 @@ def test_decode_cuda_graph_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured.sort(dim=1).values, eager.sort(dim=1).values)
+
+
+KPOOL = 4
+POOL_PAGE = 32  # the pooled cache's kernel page at block_size 1152
+POOL_TOPK = TOPK // KPOOL
+# Requests with more pools than top-k and fewer, plus ones whose last row sees
+# exactly POOL_TOPK and POOL_TOPK + 1 pools; all end mid-pool so the tail is
+# live and the first decode steps complete a pool.
+POOLED_LENGTHS = [
+    4 * 600 + 2,
+    4 * 257 + 2,
+    KPOOL * POOL_TOPK + 2,
+    KPOOL * (POOL_TOPK + 1) + 2,
+]
+
+
+class PooledSetup:
+    """Caches and metadata for ``sparse_attn_indexer_ivf`` on pooled keys."""
+
+    def __init__(self, num_probes: int):
+        self.config = dataclasses.replace(
+            _config(num_probes=num_probes), topk=POOL_TOPK, kpool=KPOOL
+        )
+        g = torch.Generator().manual_seed(11)
+        rows = len(POOLED_LENGTHS)
+        cap = max(POOLED_LENGTHS) + 8
+        self.k = [_keys(cap, seed=20 + b).to(torch.bfloat16) for b in range(rows)]
+        self.gate = [
+            torch.randn(cap, 128, generator=g).to(torch.bfloat16) for _ in range(rows)
+        ]
+        self.ape = (torch.randn(KPOOL, 128, generator=g) * 0.1).to(DEV)
+        pages = (cap // KPOOL + POOL_PAGE - 1) // POOL_PAGE
+        self.key_cache = torch.zeros(
+            rows * pages + 3, POOL_PAGE, 132, dtype=torch.uint8, device=DEV
+        )
+        self.bt = _block_table(rows, pages, self.key_cache.shape[0], 4).to(DEV)
+        ring = KPOOL
+        self.tail = torch.zeros(rows, 2, ring, 128, dtype=torch.bfloat16, device=DEV)
+        cid_blocks = MAX_LEN // CID_BS
+        cen_blocks = (C + CPB - 1) // CPB
+        self.cid = torch.randint(
+            0, C, (rows * cid_blocks + 3, CID_BS, 1), generator=g, dtype=torch.int16
+        ).to(DEV)
+        self.cen = torch.randint(
+            0, 256, (rows * cen_blocks + 3, CPB, REC_BYTES), generator=g
+        ).to(device=DEV, dtype=torch.uint8)
+        self.cid_bt = _block_table(rows, cid_blocks, self.cid.shape[0], 5).to(DEV)
+        self.cen_bt = _block_table(rows, cen_blocks, self.cen.shape[0], 6).to(DEV)
+
+    def pool_slot(self, b: int, pos: int) -> int:
+        """The kpool slot written by the token at ``pos`` (-1 mid-pool)."""
+        if (pos + 1) % KPOOL:
+            return -1
+        p = pos // KPOOL
+        return int(self.bt[b, p // POOL_PAGE]) * POOL_PAGE + p % POOL_PAGE
+
+    def step(self, monkeypatch, starts, ends, qb):
+        """One indexer step: request b runs tokens [starts[b], ends[b])."""
+        rows = len(starts)
+        qlens = [e - s for s, e in zip(starts, ends)]
+        tokens = [(b, pos) for b in range(rows) for pos in range(starts[b], ends[b])]
+        decode = all(q == 1 for q in qlens) and min(starts) > 0
+        k = torch.stack([self.k[b][pos] for b, pos in tokens]).to(DEV)
+        gate = torch.stack([self.gate[b][pos] for b, pos in tokens]).to(DEV)
+        positions = torch.tensor([pos for _, pos in tokens], device=DEV)
+        slot = torch.tensor([self.pool_slot(b, pos) for b, pos in tokens], device=DEV)
+        tail_slot = torch.tensor(
+            [b * KPOOL + pos % KPOOL for b, pos in tokens], device=DEV
+        )
+        qsl = torch.tensor([0, *torch.tensor(qlens).cumsum(0).tolist()])
+        seq_lens = list(ends)
+        meta = IvfIndexerMetadata(
+            slot_mapping=slot,
+            block_table=self.bt,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+            query_start_loc=qsl.to(device=DEV, dtype=torch.int32),
+            num_reqs=rows,
+            num_decodes=rows if decode else 0,
+            num_decode_tokens=len(tokens) if decode else 0,
+            num_prefills=0 if decode else rows,
+            num_prefill_tokens=0 if decode else len(tokens),
+            req_index=torch.arange(rows, dtype=torch.int32, device=DEV),
+            prefill_seq_lens_cpu=[] if decode else seq_lens,
+            prefill_query_lens_cpu=[] if decode else qlens,
+            prefill_final_cpu=[] if decode else [True] * rows,
+        )
+        attn_metadata = {
+            "k": meta,
+            "tail": SimpleNamespace(slot_mapping=tail_slot),
+            "cid": IvfStateMetadata(block_table=self.cid_bt),
+            "cen": IvfStateMetadata(block_table=self.cen_bt),
+        }
+        monkeypatch.setattr(
+            ivf_sparse_indexer,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata=attn_metadata),
+        )
+        out = torch.full((len(tokens), TOPK + 128), -7, dtype=torch.int32, device=DEV)
+        sparse_attn_indexer_ivf(
+            k,
+            "k",
+            "tail",
+            "cid",
+            "cen",
+            self.key_cache,
+            self.tail,
+            self.cid,
+            self.cen,
+            qb.fp8,
+            qb.w,
+            k,
+            gate,
+            self.ape,
+            positions,
+            self.config,
+            out,
+            "auto",
+            1 << 30,
+        )
+        return out.cpu(), tokens
+
+    def pooled_keys(self, b: int, num_pools: int):
+        """Request b's first pools as stock compresses them (fp8 as fp32, scale)."""
+        n = num_pools * KPOOL
+        slot_k = self.k[b][:n].view(num_pools, KPOOL, 128).to(DEV)
+        slot_score = self.gate[b][:n].view(num_pools, KPOOL, 128).to(DEV)
+        loc = torch.zeros(num_pools, dtype=torch.int64, device=DEV)
+        fp8, scale = kpool_compress_and_write_cache(
+            self.key_cache,
+            slot_k,
+            slot_score,
+            self.ape,
+            loc,
+            KPOOL,
+            return_compressed=True,
+            write_cache=False,
+        )
+        return fp8.float().cpu(), scale.cpu()
+
+    def cached_pool(self, b: int, p: int):
+        """Pool p of request b as read back through the IVF key view."""
+        page = int(self.bt[b, p // POOL_PAGE])
+        flat = self.key_cache[page].view(-1).cpu()
+        off = p % POOL_PAGE
+        fp8 = flat[off * 128 : (off + 1) * 128].view(torch.float8_e4m3fn).float()
+        scale = flat[POOL_PAGE * 128 :].view(torch.float32)[off]
+        return fp8, scale
+
+
+def _check_row(got, t, scores, recall=True):
+    """A row selects its top pools (expanded) plus its tail, nothing else."""
+    num_pools = (t + 1) // KPOOL
+    tail = set(range(KPOOL * num_pools, t + 1))
+    assert len(got) == len(set(got)) and max(got) <= t
+    assert tail <= set(got)
+    pools = {pos // KPOOL for pos in got if pos < KPOOL * num_pools}
+    # Selected pools come whole.
+    assert sum(pos < KPOOL * num_pools for pos in got) == KPOOL * len(pools)
+    if num_pools <= POOL_TOPK:
+        assert pools == set(range(num_pools))
+    else:
+        # Few probes can see fewer than top-k pools; every candidate is kept.
+        assert 0 < len(pools) <= POOL_TOPK
+        if recall:
+            assert len(pools) == POOL_TOPK
+            exact = exact_topk_reference(scores, num_pools - 1, POOL_TOPK)
+            selected = torch.tensor(sorted(pools))
+            assert tie_aware_recall(selected, exact, scores) > 0.999
+
+
+def test_page_table_counts_cache_pages():
+    """The group's block table counts kernel blocks (64 tokens), smaller than
+    the pooled cache's pages (128 tokens = 32 pools); IVF reads and writes
+    through the page table, as the kpool indexer does."""
+    pages = torch.tensor([[7, 2, 5], [0, 9, 4]], dtype=torch.int32, device=DEV)
+    kernel_blocks = torch.stack([2 * pages, 2 * pages + 1], dim=2).flatten(1)
+    builder = SimpleNamespace(
+        kv_cache_spec=SimpleNamespace(block_size=128),
+        kernel_block_size=64,
+        page_table_buffer=None,
+        max_num_seqs=4,
+    )
+    cam = SimpleNamespace(block_table_tensor=kernel_blocks)
+    got = IvfIndexerMetadataBuilder._page_table(builder, cam)
+    assert torch.equal(got, pages)
+    # A persistent buffer: decode CUDA graphs keep its address.
+    again = IvfIndexerMetadataBuilder._page_table(builder, cam)
+    assert again.data_ptr() == got.data_ptr()
+
+
+@pytest.mark.parametrize("num_probes", [C, 4])
+def test_pooled_prefill_and_decode(monkeypatch, num_probes):
+    """IVF on the kpool indexer's pools: stock-written pools are what the IVF
+    key view reads; probing every cluster gives the exact top pools; rows
+    seeing at most top-k pools keep them all; every row keeps its tail; decode
+    appends a pool exactly when it completes."""
+    setup = PooledSetup(num_probes)
+    rows = len(POOLED_LENGTHS)
+    total = sum(POOLED_LENGTHS)
+    qb = _queries(total, seed=5)
+    out, tokens = setup.step(monkeypatch, [0] * rows, POOLED_LENGTHS, qb)
+
+    for b, n in enumerate(POOLED_LENGTHS):
+        fp8, scale = setup.pooled_keys(b, n // KPOOL)
+        for p in (0, n // KPOOL - 1):
+            got_fp8, got_scale = setup.cached_pool(b, p)
+            assert torch.equal(got_fp8, fp8[p]) and float(got_scale) == float(scale[p])
+    keys = [setup.pooled_keys(b, n // KPOOL) for b, n in enumerate(POOLED_LENGTHS)]
+    for r, (b, t) in enumerate(tokens):
+        if t % 97 and t != POOLED_LENGTHS[b] - 1:
+            continue
+        got = out[r][out[r] >= 0].tolist()
+        scores = key_scores_reference(qb.q[r], qb.w_cpu[r], *keys[b])
+        _check_row(got, t, scores, recall=num_probes == C)
+    assert int(out.min()) >= -1
+
+    def live_size(b):
+        recs = torch.stack(
+            [setup.cen.cpu()[setup.cen_bt[b, c // CPB], c % CPB] for c in range(C)]
+        )
+        size = recs[:, 256:260].contiguous().view(torch.int32).flatten()
+        return int(size.clamp(min=0).sum())
+
+    # Two decode tokens: the first leaves the pool open, the second completes it.
+    lens = list(POOLED_LENGTHS)
+    for completes in (False, True):
+        before = [live_size(b) for b in range(rows)]
+        dq = _queries(rows, seed=6 + completes)
+        out, _ = setup.step(monkeypatch, lens, [n + 1 for n in lens], dq)
+        lens = [n + 1 for n in lens]
+        for b, n in enumerate(lens):
+            assert live_size(b) == before[b] + completes == n // KPOOL
+            num_pools = n // KPOOL
+            cached = [setup.cached_pool(b, p) for p in range(num_pools)]
+            fp8, scale = setup.pooled_keys(b, num_pools)
+            assert torch.equal(torch.stack([c[0] for c in cached]), fp8)
+            assert torch.equal(torch.stack([c[1] for c in cached]), scale)
+            scores = key_scores_reference(dq.q[b], dq.w_cpu[b], fp8, scale)
+            got = out[b][out[b] >= 0].tolist()
+            _check_row(got, n - 1, scores, recall=num_probes == C)
+        assert int(out.min()) >= -1

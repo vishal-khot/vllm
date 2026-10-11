@@ -11,10 +11,13 @@ from vllm.platforms import current_platform
 
 @dataclass(frozen=True)
 class IvfIndexerConfig:
-    """Fixed IVF counts (no adaptive probing, no candidate cap).
+    """Fixed IVF counts (no adaptive probing).
 
-    A request has ``num_clusters`` clusters (fewer only while it has fewer
-    keys) and a query probes ``num_probes`` of those with a key visible to it.
+    The keys are the kpool indexer's pools (``kpool`` tokens each) and
+    ``topk`` counts pools. A request has ``num_clusters`` clusters (fewer only
+    while it has fewer pools) and a query probes ``num_probes`` of those with a
+    pool visible to it. A prefill row with more candidates than its scratch
+    holds drops its lowest-scoring probes.
     """
 
     num_clusters: int
@@ -25,6 +28,7 @@ class IvfIndexerConfig:
     topk: int
     # Stop k-means once at most this fraction of keys moved in an iteration.
     kmeans_stop_fraction: float = 0.0
+    kpool: int = 1
     # Iterations (at most ``kmeans_iters``) of a full rebuild that starts from
     # the previous chunk's centroids; a cold build runs ``kmeans_iters``.
     kmeans_warm_iters: int = 2
@@ -36,8 +40,8 @@ class IvfIndexerConfig:
     @classmethod
     def from_hf_config(cls, config, max_model_len: int) -> "IvfIndexerConfig":
         """Defaults, overridable per key with ``--hf-overrides``."""
-        num_clusters = getattr(config, "index_num_clusters", 256)
-        num_probes = getattr(config, "index_num_probes", 32)
+        num_clusters = getattr(config, "index_num_clusters", 64)
+        num_probes = getattr(config, "index_num_probes", 8)
         kmeans_iters = getattr(config, "index_kmeans_iters", 10)
         warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
@@ -63,7 +67,8 @@ class IvfIndexerConfig:
             max_clusters=num_clusters,
             kmeans_iters=kmeans_iters,
             kmeans_seed=getattr(config, "index_kmeans_seed", 0),
-            topk=config.index_topk,
+            topk=config.index_topk // config.index_kpool,
+            kpool=config.index_kpool,
             kmeans_stop_fraction=stop_fraction,
             kmeans_warm_iters=warm_iters,
             kmeans_incremental=bool(getattr(config, "index_kmeans_incremental", True)),
@@ -84,6 +89,11 @@ def check_ivf_indexer_supported(vllm_config: VllmConfig, config) -> None:
     n_heads = config.index_n_heads
     if n_heads is None or n_heads < 16 or n_heads & (n_heads - 1):
         unsupported.append(f"index_n_heads={n_heads} (needs a power of two >= 16)")
+    kpool = config.index_kpool
+    if kpool is None or kpool < 2 or config.index_topk % kpool:
+        unsupported.append(
+            f"index_kpool={kpool} (needs >= 2, dividing index_topk={config.index_topk})"
+        )
     if vllm_config.num_speculative_tokens > 0:
         unsupported.append("speculative decoding / MTP")
     if vllm_config.kv_transfer_config is not None:

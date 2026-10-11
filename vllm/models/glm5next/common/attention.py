@@ -195,8 +195,8 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         return KpoolTailBackend
 
 
-class Glm5NextIvfKeyCache(DeepseekV32IndexerCache):
-    """Per-token rotated fp8 indexer keys for the IVF indexer."""
+class Glm5NextIvfKeyCache(Glm5NextIndexerCache):
+    """The kpool indexer's pooled key cache, read by the IVF indexer."""
 
     def get_attn_backend(self):
         from vllm.models.glm5next.common.ivf_backend import Glm5NextIvfIndexerBackend
@@ -204,23 +204,29 @@ class Glm5NextIvfKeyCache(DeepseekV32IndexerCache):
         return Glm5NextIvfIndexerBackend
 
 
-def _ivf_page_bytes(cache_config) -> int:
-    # IVF state pages match the per-token indexer page:
-    # block_size tokens x (128 fp8 + fp32).
-    return cache_config.block_size * 132
+def _ivf_page_bytes(cache_config, index_kpool: int) -> int:
+    # IVF state pages match the pooled indexer page:
+    # block_size / kpool pools x (128 fp8 + fp32).
+    return cache_config.block_size // index_kpool * 132
 
 
 class Glm5NextIvfClusterIdCache(DeepseekV32IndexerCache):
-    """int16 cluster id of every position of a request (not prefix-cacheable)."""
+    """int16 cluster id of every pool of a request (not prefix-cacheable)."""
+
+    def __init__(self, *, index_kpool: int, **kwargs):
+        super().__init__(**kwargs)
+        self.index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
+        pools_per_block = _ivf_page_bytes(self.cache_config, self.index_kpool) // 2
         return IvfClusterIdSpec(
-            block_size=_ivf_page_bytes(self.cache_config) // 2,
+            block_size=pools_per_block * self.index_kpool,
             num_kv_heads=1,
             max_tp_shards=1,
             head_size=1,
             head_size_v=0,
             dtype=torch.int16,
+            tokens_per_state=self.index_kpool,
         )
 
     def get_attn_backend(self):
@@ -232,12 +238,14 @@ class Glm5NextIvfClusterIdCache(DeepseekV32IndexerCache):
 class Glm5NextIvfCentroidCache(DeepseekV32IndexerCache):
     """Per-request centroid records: 128 bf16 + int32 size, 16-byte aligned."""
 
-    def __init__(self, *, num_clusters: int, **kwargs):
+    def __init__(self, *, num_clusters: int, index_kpool: int, **kwargs):
         super().__init__(**kwargs)
         self.num_clusters = num_clusters
+        self.index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
-        records_per_block = _ivf_page_bytes(self.cache_config) // IVF_REC_BYTES
+        page_bytes = _ivf_page_bytes(self.cache_config, self.index_kpool)
+        records_per_block = page_bytes // IVF_REC_BYTES
         return IvfCentroidSpec(
             block_size=records_per_block,
             num_kv_heads=1,
@@ -331,7 +339,8 @@ class Indexer(nn.Module):
         self._wp_fp32: torch.Tensor | None = None
 
         if self.ivf_config is not None:
-            # Per-token keys plus per-request IVF state; no kpool tail.
+            # The kpool indexer's pooled keys and tail, plus per-request IVF
+            # state over the pools.
             from vllm.models.glm5next.nvidia.ivf_sparse_indexer import (
                 SparseAttnIndexerIVF,
             )
@@ -342,8 +351,17 @@ class Indexer(nn.Module):
                 dtype=torch.uint8,
                 prefix=f"{prefix}.k_cache",
                 cache_config=cache_config,
+                index_kpool=self.index_kpool,
+            )
+            self.tail_cache = Glm5NextTailCache(
+                head_dim=self.head_dim,
+                dtype=torch.bfloat16,
+                prefix=f"{prefix}.tail_cache",
+                cache_config=cache_config,
+                index_kpool=self.index_kpool,
             )
             self.ivf_cid_cache = Glm5NextIvfClusterIdCache(
+                index_kpool=self.index_kpool,
                 head_dim=1,
                 dtype=torch.int16,
                 prefix=f"{prefix}.ivf_cid",
@@ -351,14 +369,15 @@ class Indexer(nn.Module):
             )
             self.ivf_centroid_cache = Glm5NextIvfCentroidCache(
                 num_clusters=self.ivf_config.max_clusters,
+                index_kpool=self.index_kpool,
                 head_dim=IVF_REC_BYTES,
                 dtype=torch.uint8,
                 prefix=f"{prefix}.ivf_centroids",
                 cache_config=cache_config,
             )
-            self.tail_cache = None
             self.indexer_op = SparseAttnIndexerIVF(
                 self.k_cache,
+                self.tail_cache,
                 self.ivf_cid_cache,
                 self.ivf_centroid_cache,
                 self.ivf_config,
@@ -466,14 +485,22 @@ class Indexer(nn.Module):
         weights = _fused_indexer_weight_scale(
             weights, q_scale, self.softmax_scale * self.n_head**-0.5
         )
-        if self.ivf_config is not None:
-            # IVF probes and scores with the same per-head query and weights.
-            return self.indexer_op(hidden_states, q_fp8, weights, k)
-
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
         gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        if self.ivf_config is not None:
+            # IVF probes and scores the pools with the same per-head query and
+            # weights.
+            return self.indexer_op(
+                hidden_states,
+                q_fp8,
+                weights,
+                k,
+                gate_score,
+                self.index_kpool_compress_ape,
+                positions,
+            )
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this

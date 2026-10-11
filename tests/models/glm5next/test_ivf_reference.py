@@ -156,13 +156,26 @@ def test_fixed_probes_take_every_visible_key_of_them():
             k_fp8, k_scale, km, t, num_probes=want_probes, decode=False, seed=seed
         )
         visible = torch.bincount(km.cluster_of_pos[: t + 1], minlength=C_MAX)
-        assert int(trace.probed.sum()) == min(want_probes, int((visible > 0).sum()))
+        eligible = int((visible > 0).sum())
+        # A query seeing at most top-k keys probes every cluster.
+        probes = eligible if t < TOPK else min(want_probes, eligible)
+        assert int(trace.probed.sum()) == probes
         cand = trace.candidates
         # Uncapped: every visible key of every probed cluster, nothing else.
         assert cand.numel() == trace.total == int(visible[trace.probed].sum())
         assert int(cand.max()) <= t
         assert cand.unique().numel() == cand.numel()
         assert torch.all(trace.probed[km.cluster_of_pos[cand]])
+
+
+def test_short_query_keeps_every_visible_key():
+    """A query seeing at most top-k keys selects all of them, as the kpool
+    indexer's brute force does."""
+    k_fp8, k_scale = quantize_rows_fp8(_keys(3000), True)
+    km = _kmeans(k_fp8, k_scale, num_clusters=C_MAX)
+    for seed, t in enumerate([0, 17, TOPK - 1]):
+        trace = _select(k_fp8, k_scale, km, t, num_probes=2, decode=False, seed=seed)
+        assert sorted(trace.selected.tolist()) == list(range(t + 1))
 
 
 def test_probe_picks_the_best_centroids():

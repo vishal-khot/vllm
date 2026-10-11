@@ -2981,9 +2981,10 @@ def test_packed_groups_glm5_like_hybrid():
 def _glm5_like_kv_cache_spec_with_ivf(
     with_ivf: bool = True, num_clusters: int = 256
 ) -> dict[str, KVCacheSpec]:
-    """GLM-5.3-Flash with the IVF indexer: per-token indexer keys plus the
-    per-request cluster-id and centroid state sized to the indexer page."""
-    block_size = 1024
+    """GLM-5.3-Flash with the IVF indexer: the kpool indexer's pooled keys and
+    tail plus the per-request cluster-id (one per pool) and centroid state
+    sized to the indexer page."""
+    kpool, block_size = 4, 1024
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     for i in range(11):
         kv_cache_spec[f"layers.{i}.attn"] = MLAAttentionSpec(
@@ -2997,17 +2998,26 @@ def _glm5_like_kv_cache_spec_with_ivf(
             num_kv_heads=1,
             head_size=132,
             dtype=torch.uint8,
+            tokens_per_state=kpool,
         )
         kv_cache_spec[f"layers.{i}.indexer"] = idx
+        kv_cache_spec[f"layers.{i}.tail"] = CircularBufferSpec(
+            block_size=kpool,
+            num_kv_heads=2,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+        )
         if not with_ivf:
             continue
         idx_page = idx.page_size_bytes
         kv_cache_spec[f"layers.{i}.ivf_cid"] = IvfClusterIdSpec(
-            block_size=idx_page // 2,
+            block_size=idx_page // 2 * kpool,
             num_kv_heads=1,
             head_size=1,
             head_size_v=0,
             dtype=torch.int16,
+            tokens_per_state=kpool,
         )
         records = idx_page // 136
         kv_cache_spec[f"layers.{i}.ivf_centroids"] = IvfCentroidSpec(
@@ -3061,7 +3071,8 @@ def test_packed_groups_glm5_ivf_state():
     )
 
     records = idx_page // 136
-    ivf_blocks = -(-8192 // (idx_page // 2)) + -(-256 // records)
+    # One cluster id per pool: a block covers idx_page // 2 pools of 4 tokens.
+    ivf_blocks = -(-8192 // (idx_page // 2 * 4)) + -(-256 // records)
     assert kv_cache_utils._max_memory_usage_bytes_from_groups(
         vllm_config, groups
     ) == kv_cache_utils._max_memory_usage_bytes_from_groups(
