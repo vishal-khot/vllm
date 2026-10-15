@@ -712,7 +712,12 @@ def select_ivf_topk(
         _collect_by_scan(
             state=state, row_batch=row_batch, seq_lens=seq_lens, sel=sel, cand=cand
         )
-        scores = torch.empty((num_rows, width), dtype=torch.float32, device=device)
+        # Measuring lost attention sums score mass over the row, so zero the
+        # unwritten tail columns; the production path leaves them uninitialized
+        # since the kernels only read what they fill.
+        scores = (torch.zeros if score_sum_out is not None else torch.empty)(
+            (num_rows, width), dtype=torch.float32, device=device
+        )
         _score_per_row(
             key=key,
             q_fp8=q_fp8,
@@ -736,7 +741,10 @@ def select_ivf_topk(
         return
 
     width = int(counts.max()) if max_width is None else max_count
-    scores = torch.empty((num_rows, width), dtype=torch.float32, device=device)
+    # See the decode path: zero the unwritten tail only when measuring mass.
+    scores = (torch.zeros if score_sum_out is not None else torch.empty)(
+        (num_rows, width), dtype=torch.float32, device=device
+    )
     _score_grouped_gemm(
         q_fp8=q_fp8,
         weights=weights,
