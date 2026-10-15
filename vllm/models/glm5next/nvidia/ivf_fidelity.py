@@ -21,6 +21,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -32,6 +33,10 @@ logger = init_logger(__name__)
 
 # Log a running summary every this many measured forwards (per phase).
 _LOG_EVERY = 50
+# Rewrite the dump at most this often (seconds). The dump runs on the hot path,
+# so it is throttled; it also means the file survives a worker kill, which skips
+# atexit (TP workers are terminated, not exited, on serve shutdown).
+_FLUSH_SECONDS = 5.0
 
 
 @dataclass
@@ -43,8 +48,16 @@ class _Stat:
     recall_min: float = 1.0
     mass_sum: float = 0.0
     mass_min: float = 1.0
+    real_mass_sum: float = 0.0
+    exact_mass_sum: float = 0.0
 
-    def add(self, recall: torch.Tensor, mass: torch.Tensor) -> None:
+    def add(
+        self,
+        recall: torch.Tensor,
+        mass: torch.Tensor,
+        real_mass: torch.Tensor,
+        exact_mass: torch.Tensor,
+    ) -> None:
         n = recall.numel()
         if n == 0:
             return
@@ -53,6 +66,8 @@ class _Stat:
         self.recall_min = min(self.recall_min, float(recall.min()))
         self.mass_sum += float(mass.sum())
         self.mass_min = min(self.mass_min, float(mass.min()))
+        self.real_mass_sum += float(real_mass.sum())
+        self.exact_mass_sum += float(exact_mass.sum())
 
     def summary(self) -> dict:
         n = self.rows
@@ -66,23 +81,33 @@ class _Stat:
             "mass_captured_mean": mass_mean,
             "mass_captured_min": self.mass_min if n else 0.0,
             "mass_lost_mean": 1.0 - mass_mean,
+            # Raw summed DSA-score mass each selection kept, for debugging the
+            # captured ratio above.
+            "real_mass_mean": self.real_mass_sum / n if n else 0.0,
+            "exact_mass_mean": self.exact_mass_sum / n if n else 0.0,
         }
 
 
 @dataclass
 class _Recorder:
     stats: dict[tuple[str, str], _Stat] = field(default_factory=dict)
-    _dumped: bool = False
+    _last_flush: float = 0.0
 
     def add(
-        self, layer: str, phase: str, recall: torch.Tensor, mass: torch.Tensor
+        self,
+        layer: str,
+        phase: str,
+        recall: torch.Tensor,
+        mass: torch.Tensor,
+        real_mass: torch.Tensor,
+        exact_mass: torch.Tensor,
     ) -> None:
         key = (layer, phase)
         stat = self.stats.get(key)
         if stat is None:
             stat = self.stats[key] = _Stat()
         before = stat.rows
-        stat.add(recall, mass)
+        stat.add(recall, mass, real_mass, exact_mass)
         if before // _LOG_EVERY != stat.rows // _LOG_EVERY:
             s = stat.summary()
             logger.info(
@@ -96,19 +121,25 @@ class _Recorder:
                 s["mass_captured_min"],
                 s["rows"],
             )
+        now = time.time()
+        if now - self._last_flush > _FLUSH_SECONDS:
+            self.dump()
+            self._last_flush = now
 
     def dump(self) -> None:
-        if self._dumped or not self.stats:
+        if not self.stats:
             return
-        self._dumped = True
-        out = {f"{layer}|{phase}": stat.summary() for (layer, phase), stat in
-               self.stats.items()}
+        out = {
+            f"{layer}|{phase}": stat.summary()
+            for (layer, phase), stat in self.stats.items()
+        }
         directory = envs.VLLM_DSA_IVF_LOST_ATTENTION_DIR or "."
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"lost_attention_pid{os.getpid()}.json")
-        with open(path, "w") as f:
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
             json.dump(out, f, indent=2)
-        logger.info("IVF lost-attention written to %s", path)
+        os.replace(tmp, path)  # atomic, so a kill mid-write can't truncate it
 
 
 _RECORDER: _Recorder | None = None
@@ -118,11 +149,20 @@ def enabled() -> bool:
     return envs.VLLM_DSA_IVF_MEASURE_LOST_ATTENTION
 
 
+def _safe_dump() -> None:
+    # atexit runs after logging/stdout may be closed; never raise from here.
+    try:
+        if _RECORDER is not None:
+            _RECORDER.dump()
+    except Exception:
+        pass
+
+
 def _recorder() -> _Recorder:
     global _RECORDER
     if _RECORDER is None:
         _RECORDER = _Recorder()
-        atexit.register(_RECORDER.dump)
+        atexit.register(_safe_dump)
     return _RECORDER
 
 
@@ -168,4 +208,6 @@ def record(
         phase,
         key_recall(selected, exact),
         mass_captured(real_mass, exact_mass),
+        real_mass,
+        exact_mass,
     )

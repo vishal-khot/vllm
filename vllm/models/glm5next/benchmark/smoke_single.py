@@ -35,7 +35,6 @@ BENCH_DIR = "/fork/vllm/models/glm5next/benchmark"
 image = (
     modal.Image.from_registry("vllm/vllm-openai:nightly", add_python="3.12")
     .entrypoint([])
-    .pip_install("uv")
     .add_local_dir(
         FORK,
         "/fork",
@@ -50,9 +49,15 @@ image = (
         ],
         copy=True,
     )
+    # IVF is pure Python/Triton, so overlay the fork's vllm python onto the
+    # nightly image's install (keeping its cu130-compiled .so) instead of
+    # rebuilding: no source build, no wheel download, no .git. Target the vllm
+    # that the `vllm` console script imports (the serve process's interpreter).
     .run_commands(
-        "cd /fork && VLLM_USE_PRECOMPILED=1 uv pip install --system -e . "
-        "--torch-backend=auto"
+        'VLLM_PY=$(head -1 "$(which vllm)" | sed "s/^#!//") && '
+        'VLLM_DIR=$("$VLLM_PY" -c '
+        '"import vllm, os; print(os.path.dirname(vllm.__file__))") && '
+        'echo "overlay -> $VLLM_DIR" && cp -rf /fork/vllm/* "$VLLM_DIR/"'
     )
 )
 
