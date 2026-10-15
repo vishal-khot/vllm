@@ -204,11 +204,12 @@ def _install():
         print(f"[glm5-instrument] wrote {fn}", flush=True)
 
     def _drain_and_flush():
+        # atexit runs after stdout may be closed; never raise from here.
         try:
             _drain()
+            _flush()
         except Exception:
             pass
-        _flush()
 
     atexit.register(_drain_and_flush)
     print(
