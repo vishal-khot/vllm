@@ -818,12 +818,19 @@ def _topk_and_emit(
     selected = torch.empty((num_rows, topk), dtype=torch.int32, device=out.device)
     get_indexer_topk(topk_backend)(scores, topk_lens, 1, selected, topk, width)
     if score_sum_out is not None:
-        # Over-budget rows sum their top-k slots; the rest keep every candidate.
-        idx = selected.long().clamp_(0, width - 1)
-        topk_sum = scores.gather(1, idx).sum(dim=1)
+        # Attention mass is the non-negative DSA relevance a key carries: a head
+        # score is ReLU(q.k) but weighted by w_h, which can be negative, so the
+        # per-key sum can be negative. Clamp it to >=0 before summing, else the
+        # mass of different keys cancels and the captured ratio is meaningless.
+        pos = scores.clamp(min=0.0)
+        # Over-budget rows sum their top-k slots (ignoring -1 fills); the rest
+        # keep every candidate.
+        keep = selected >= 0
+        idx = selected.clamp(min=0).long()
+        topk_sum = (pos.gather(1, idx) * keep).sum(dim=1)
         col = torch.arange(width, device=scores.device)
         valid = col[None, :] < counts[:, None]
-        all_sum = torch.where(valid, scores, scores.new_zeros(())).sum(dim=1)
+        all_sum = torch.where(valid, pos, pos.new_zeros(())).sum(dim=1)
         score_sum_out.copy_(torch.where(topk_lens > 0, topk_sum, all_sum))
     block = TUNING.emit_block
     if runs is not None:
