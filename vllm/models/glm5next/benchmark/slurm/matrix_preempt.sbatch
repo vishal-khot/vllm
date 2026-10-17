@@ -5,8 +5,9 @@
 # the config the Modal runs used). On another cluster either edit them, or
 # override at submit time without editing, e.g.:
 #   sbatch --partition=<p> --qos=<q> --gres=gpu:<type>:4 matrix_preempt.sbatch
-# The job can be preempted; --requeue restarts it (model restages/resumes, runs
-# re-measure from scratch; already-copied per-run dirs are left in OUT_ROOT).
+# The job can be preempted; --requeue restarts it and the runner resumes --
+# model restages/resumes, and only runs without a verdict.json in OUT_ROOT are
+# re-measured, so finished runs are not repeated.
 #
 # Submit from this slurm/ directory, or set GLM5_REPO to the vllm repo root:
 #   RULER_SRC=/path/to/ruler sbatch matrix_preempt.sbatch

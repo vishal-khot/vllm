@@ -5,8 +5,9 @@
 # preempt_qos: 4x H200, TP4 — the config the Modal runs used). On another
 # cluster edit them, or override at submit time, e.g.:
 #   sbatch --partition=<p> --qos=<q> --gres=gpu:<type>:4 lost_attention_preempt.sbatch
-# The job can be preempted; --requeue restarts it (model restages/resumes,
-# cells re-measure from scratch).
+# The job can be preempted; --requeue restarts it and the runner resumes --
+# model restages/resumes, and only cells without a verdict.json in OUT_ROOT are
+# re-measured, so finished cells are not repeated.
 #
 # Submit from this slurm/ directory, or set GLM5_REPO to the vllm repo root:
 #   RULER_SRC=/path/to/ruler sbatch lost_attention_preempt.sbatch
