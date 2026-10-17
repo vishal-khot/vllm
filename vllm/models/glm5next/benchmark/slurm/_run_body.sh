@@ -34,6 +34,11 @@ OUT_ROOT="${OUT_ROOT:-${HOME}/glm5_lost_attention/${JOB}}"
 NODE_OUT="${NODE_SCRATCH}/out/${JOB}"
 RULER_LOCAL="${NODE_SCRATCH}/ruler"
 
+# Shared persistent dirs from run_benchmark.sh take precedence over node-local
+# staging: serve straight from them, no per-node download/copy.
+[ -n "${SHARED_MODEL_DIR:-}" ] && MODEL_DIR="${SHARED_MODEL_DIR}"
+[ -n "${SHARED_RULER_DIR:-}" ] && RULER_LOCAL="${SHARED_RULER_DIR}"
+
 echo "[$(date +%T)] host=$(hostname) tp=${GLM5_TP}"
 nvidia-smi -L || true
 mkdir -p "${NODE_SCRATCH}" "${NODE_OUT}" "${OUT_ROOT}"
@@ -69,8 +74,11 @@ PY
 )
 echo "[$(date +%T)] tasks=${TASKS} lengths=${LENGTHS}"
 
-# ---- 3. model -> node-local NVMe (resumable; re-downloaded on a fresh node) ----
-if [ ! -f "${MODEL_DIR}/config.json" ]; then
+# ---- 3. model (shared dir if given, else node-local NVMe; resumable) ----
+if [ -n "${SHARED_MODEL_DIR:-}" ]; then
+  echo "[$(date +%T)] using shared model ${MODEL_DIR}"
+  [ -f "${MODEL_DIR}/config.json" ] || { echo "ERROR: no config.json in ${MODEL_DIR}" >&2; exit 2; }
+elif [ ! -f "${MODEL_DIR}/config.json" ]; then
   echo "[$(date +%T)] downloading ${MODEL_REPO} -> ${MODEL_DIR}"
   df -h "${NODE_SCRATCH}" | tail -1
   python - <<PY
@@ -83,22 +91,26 @@ else
   echo "[$(date +%T)] model already staged at ${MODEL_DIR}"
 fi
 
-# ---- 4. RULER jsonl -> node-local ----
-if [ -z "${RULER_SRC}" ]; then
-  echo "ERROR: RULER_SRC is unset. Point it at the dir holding" >&2
-  echo "       <task>/validation_<len>.jsonl (the old glm5-ruler volume)." >&2
-  exit 2
-fi
-IFS=',' read -ra TASK_ARR <<< "${TASKS}"
-IFS=',' read -ra LEN_ARR <<< "${LENGTHS}"
-for T in "${TASK_ARR[@]}"; do
-  mkdir -p "${RULER_LOCAL}/${T}"
-  for L in "${LEN_ARR[@]}"; do
-    src="${RULER_SRC}/${T}/validation_${L}.jsonl"
-    [ -f "${src}" ] || { echo "ERROR: missing ${src}" >&2; exit 2; }
-    cp -n "${src}" "${RULER_LOCAL}/${T}/" || true
+# ---- 4. RULER jsonl (shared dir if given, else stage from RULER_SRC) ----
+if [ -n "${SHARED_RULER_DIR:-}" ]; then
+  echo "[$(date +%T)] using shared ruler ${RULER_LOCAL}"
+else
+  [ -n "${RULER_SRC}" ] || {
+    echo "ERROR: set RULER_SRC (dir of <task>/validation_<len>.jsonl) or" >&2
+    echo "       SHARED_RULER_DIR (run_benchmark.sh does this)." >&2
+    exit 2
+  }
+  IFS=',' read -ra TASK_ARR <<< "${TASKS}"
+  IFS=',' read -ra LEN_ARR <<< "${LENGTHS}"
+  for T in "${TASK_ARR[@]}"; do
+    mkdir -p "${RULER_LOCAL}/${T}"
+    for L in "${LEN_ARR[@]}"; do
+      src="${RULER_SRC}/${T}/validation_${L}.jsonl"
+      [ -f "${src}" ] || { echo "ERROR: missing ${src}" >&2; exit 2; }
+      cp -n "${src}" "${RULER_LOCAL}/${T}/" || true
+    done
   done
-done
+fi
 
 # ---- 5. run (cells, clusters, probes all come from runs.yaml) ----
 echo "[$(date +%T)] running lost_attention_run.py -> ${NODE_OUT}"
