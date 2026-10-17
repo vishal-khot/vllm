@@ -7,6 +7,10 @@ set -euo pipefail
 REPO="${GLM5_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}"
 VENV="${REPO}/.venv"
 export PATH="${HOME}/.local/bin:${PATH}"
+# `auto` detects the CUDA wheel from the GPU node's driver. Override (e.g.
+# TORCH_BACKEND=cu128) if auto picks a torch that ABI-mismatches the
+# precompiled vLLM wheel -- `import vllm` would fail here, blocking the jobs.
+TORCH_BACKEND="${TORCH_BACKEND:-auto}"
 
 if "${VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
   echo "[build] venv ready: vllm $("${VENV}/bin/python" -c 'import vllm; print(vllm.__version__)')"
@@ -15,5 +19,6 @@ fi
 echo "[build] building ${VENV} (VLLM_USE_PRECOMPILED; IVF is pure Python/Triton)"
 uv venv --python 3.12 "${VENV}"
 ( cd "${REPO}" && VLLM_USE_PRECOMPILED=1 \
-    uv pip install --python "${VENV}/bin/python" -e . --torch-backend=auto )
+    uv pip install --python "${VENV}/bin/python" -e . \
+      --torch-backend="${TORCH_BACKEND}" )
 "${VENV}/bin/python" -c "import vllm; print('[build] vllm', vllm.__version__)"

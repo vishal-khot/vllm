@@ -19,7 +19,22 @@ Inputs:
 - **Optional:** `HF_TOKEN` (gated model), `MODE=normal|preempt` (default normal),
   `MODEL_DIR` / `RULER_DIR` (defaults `./model` / `./ruler` — point these at
   existing data to skip the download/generation), `NUM_SAMPLES` (RULER
-  samples/task, default 100), `GLM5_ONLY=<run ids>`, `BRANCH`, `CLONE_DEST`.
+  samples/task, default 100), `GLM5_ONLY=<run ids>`, `TORCH_BACKEND` (default
+  `auto`), `BRANCH`, `CLONE_DEST`.
+
+**Preemption.** `MODE=preempt` sets `--requeue`, and the runners resume: results
+go straight to the persistent output dir, and a requeued job re-runs only the
+runs/cells that have not yet written `verdict.json`. So on a busy cluster that
+preempts every hour, each slice of walltime makes real progress and the sweep
+eventually finishes. (`SLURM_JOB_ID` is preserved across requeue, so the job
+resumes into its own output dir.)
+
+**Torch wheel / CUDA.** No CUDA compile happens — `VLLM_USE_PRECOMPILED=1` pulls
+vLLM's prebuilt sm90 `.so` and the IVF fork is pure Python/Triton, so only the
+GPU **driver** matters (a CUDA 13.x driver runs the CUDA 12.x wheels fine).
+`--torch-backend=auto` picks the torch wheel from the driver; if that build's
+`import vllm` fails with an ABI mismatch, set `TORCH_BACKEND=cu128` (or your
+driver's variant) and re-run.
 
 The two experiments it launches (both driven by `../runs.yaml`):
 1. **A/B matrix** — kpool vs IVF: accuracy, latency, throughput, memory.
@@ -58,7 +73,8 @@ Files: `run_benchmark.sh` (orchestrator), `prepare_ruler.sh` (RULER gen),
 ## Where results are stored
 
 Jobs serve from the shared `./model` + `./ruler` (or node-local staging) and
-write per-run results to persistent storage:
+write per-run results **straight to persistent storage** (so preemption never
+loses finished runs):
 
 - **A/B matrix** → `${OUT_ROOT:-$HOME/glm5_ab_matrix/<jobid>}/`
   ```

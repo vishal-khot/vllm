@@ -106,6 +106,10 @@ def _one_request(port: int, meta: dict, request_timeout: float) -> dict:
 def run_one(run, args) -> dict:
     """Serve one run, run its datasets, store results under its own id."""
     base_out = os.path.join(args.out_dir, run.id)
+    # Drop any partial dir from a preempted attempt so stale instrument dumps
+    # (globbed by the summarizers) don't bleed into this run's numbers.
+    if os.path.isdir(base_out):
+        shutil.rmtree(base_out)
     timing_dir = os.path.join(base_out, "timing")
     lost_dir = os.path.join(base_out, "lost_attention")
     for d in (base_out, timing_dir, lost_dir):
@@ -247,6 +251,9 @@ def main() -> None:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--runs-yaml", default=default_yaml)
     p.add_argument("--only", help="comma list of run ids to run (default: all)")
+    p.add_argument("--force", action="store_true",
+                   help="re-run every run even if its verdict.json exists "
+                        "(default: resume — skip already-finished runs)")
     p.add_argument("--tp", type=int, required=True)
     p.add_argument("--gpu-mem-util", type=float, default=0.9)
     p.add_argument("--port", type=int, default=8000)
@@ -268,8 +275,22 @@ def main() -> None:
           f"(from {args.runs_yaml}) ====", flush=True)
     summary = {}
     for run in runs:
-        s = run_one(run, args)
-        summary[run.id] = s["verdict"]
+        # Resume: a run is finished iff it wrote a readable verdict.json (the
+        # last write in run_one), so requeue after preemption re-runs only the
+        # runs that did not complete. --force overrides.
+        done = os.path.join(args.out_dir, run.id, "verdict.json")
+        prior = None
+        if not args.force and os.path.exists(done):
+            try:
+                with open(done) as f:
+                    prior = json.load(f)["verdict"]
+            except Exception:
+                prior = None  # truncated by a mid-write preemption -> re-run
+        if prior is not None:
+            summary[run.id] = prior
+            print(f"[{run.id}] resume: already complete, skipping", flush=True)
+        else:
+            summary[run.id] = run_one(run, args)["verdict"]
         with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
     print(f"\nwrote {os.path.join(args.out_dir, 'summary.json')}", flush=True)

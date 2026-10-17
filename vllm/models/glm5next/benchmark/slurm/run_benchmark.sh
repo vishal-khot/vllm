@@ -15,7 +15,13 @@
 # Optional : HF_TOKEN (gated model), MODE=normal|preempt (default normal),
 #            MODEL_DIR (default ./model), RULER_DIR (default ./ruler),
 #            NUM_SAMPLES (RULER samples/task, default 100), GLM5_ONLY=<run ids>,
+#            TORCH_BACKEND (default auto; set e.g. cu128 if the venv build picks
+#            a torch that ABI-mismatches the precompiled vLLM wheel),
 #            REPO_URL, BRANCH (default benchmarking), CLONE_DEST.
+#
+# Preemption: the preempt wrappers set --requeue, and the runners resume --
+# a requeued job re-runs only the runs/cells that have not yet written
+# verdict.json, so progress survives being preempted.
 #
 # Tip: the model download is large; run under tmux/nohup so a dropped session
 # does not kill it.
@@ -104,6 +110,7 @@ export GLM5_REPO="${REPO}" GLM5_TP="${TP}"
 export SHARED_MODEL_DIR="${MODEL_DIR}" SHARED_RULER_DIR="${RULER_DIR}"
 [ -n "${HF_TOKEN:-}" ] && export HF_TOKEN
 [ -n "${GLM5_ONLY:-}" ] && export GLM5_ONLY
+[ -n "${TORCH_BACKEND:-}" ] && export TORCH_BACKEND
 
 # ---- 5. build the venv once, on a GPU node (1 GPU) ----
 BUILD_GRES="${GRES%:*}:1"

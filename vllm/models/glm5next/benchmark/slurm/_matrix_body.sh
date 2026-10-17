@@ -29,8 +29,10 @@ RULER_SRC="${RULER_SRC:-}"
 
 : "${GLM5_TP:?set by the sbatch wrapper}"
 JOB="${SLURM_JOB_ID:-local}"
+# Results are written straight to persistent OUT_ROOT (not node-local scratch):
+# SLURM_JOB_ID survives --requeue, so after preemption the runner resumes into
+# the same dir and skips the runs that already wrote verdict.json.
 OUT_ROOT="${OUT_ROOT:-${HOME}/glm5_ab_matrix/${JOB}}"
-NODE_OUT="${NODE_SCRATCH}/ab_out/${JOB}"
 RULER_LOCAL="${NODE_SCRATCH}/ruler"
 
 # Shared persistent dirs from run_benchmark.sh take precedence over node-local
@@ -40,7 +42,7 @@ RULER_LOCAL="${NODE_SCRATCH}/ruler"
 
 echo "[$(date +%T)] host=$(hostname) tp=${GLM5_TP} repo=${REPO}"
 nvidia-smi -L || true
-mkdir -p "${NODE_SCRATCH}" "${NODE_OUT}" "${OUT_ROOT}"
+mkdir -p "${NODE_SCRATCH}" "${OUT_ROOT}"
 
 export PATH="${HOME}/.local/bin:${PATH}"   # uv installs here
 export HF_HOME="${NODE_SCRATCH}/hf"
@@ -53,7 +55,8 @@ if ! "${VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
   # .git present -> setuptools-scm resolves the version; IVF is pure
   # Python/Triton so the precompiled .so are reused (no CUDA rebuild).
   ( cd "${REPO}" && VLLM_USE_PRECOMPILED=1 \
-      uv pip install --python "${VENV}/bin/python" -e . --torch-backend=auto )
+      uv pip install --python "${VENV}/bin/python" -e . \
+        --torch-backend="${TORCH_BACKEND:-auto}" )
 fi
 source "${VENV}/bin/activate"
 python -c "import vllm; print('vllm', vllm.__version__)"
@@ -114,16 +117,13 @@ else
 fi
 
 # ---- 5. run the matrix (arms, lengths, clusters/probes all from runs.yaml) ----
-echo "[$(date +%T)] running matrix_run.py -> ${NODE_OUT}"
+# Resume-safe: runs that already wrote verdict.json in OUT_ROOT are skipped.
+echo "[$(date +%T)] running matrix_run.py -> ${OUT_ROOT}"
 python "${RUNNER}" \
   --model "${MODEL_DIR}" \
   --ruler-dir "${RULER_LOCAL}" \
-  --out-dir "${NODE_OUT}" \
+  --out-dir "${OUT_ROOT}" \
   --runs-yaml "${RUNS_YAML}" \
   --tp "${GLM5_TP}" \
   ${GLM5_ONLY:+--only "${GLM5_ONLY}"}
-
-# ---- 6. copy results off node-local to persistent storage ----
-echo "[$(date +%T)] copying results -> ${OUT_ROOT}"
-cp -r "${NODE_OUT}/." "${OUT_ROOT}/"
 echo "[$(date +%T)] done. results in ${OUT_ROOT}"

@@ -231,6 +231,10 @@ def run_cell(
     """
     tag = f"L{length} C{clusters} P{probes}({pct:g}%)"
     cell_out = os.path.join(args.out_dir, f"L{length}", f"C{clusters}_P{probes}")
+    # Drop any partial dir from a preempted attempt so stale per-rank dumps
+    # (globbed by the summarizers) don't bleed into this cell's numbers.
+    if os.path.isdir(cell_out):
+        shutil.rmtree(cell_out)
     lost_dir = os.path.join(cell_out, "lost_attention")
     timing_dir = os.path.join(cell_out, "timing")
     os.makedirs(lost_dir, exist_ok=True)
@@ -321,6 +325,9 @@ def main() -> None:
     p.add_argument("--task", help="restrict to one task (default: all ruler tasks)")
     p.add_argument("--n", type=int, help="override samples per task per cell")
     p.add_argument("--lengths", help="comma list to restrict to a subset of cells")
+    p.add_argument("--force", action="store_true",
+                   help="re-run every cell even if its verdict.json exists "
+                        "(default: resume — skip already-finished cells)")
     p.add_argument("--tp", type=int, required=True)
     p.add_argument("--gpu-mem-util", type=float, default=0.9)
     p.add_argument("--port", type=int, default=8000)
@@ -351,7 +358,23 @@ def main() -> None:
         for probes in cell["probes"]:
             probes = int(probes)
             pct = round(100.0 * probes / clusters, 2)
-            v = run_cell(length, clusters, probes, pct, tasks, n, args)
+            # Resume: a cell is finished iff it wrote a readable verdict.json
+            # (run_cell's last write), so requeue after preemption re-runs only
+            # the cells that did not complete. --force overrides.
+            done = os.path.join(
+                args.out_dir, f"L{length}", f"C{clusters}_P{probes}",
+                "verdict.json")
+            v = None
+            if not args.force and os.path.exists(done):
+                try:
+                    with open(done) as f:
+                        v = json.load(f)
+                    print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
+                          "resume: already complete, skipping", flush=True)
+                except Exception:
+                    v = None  # truncated by a mid-write preemption -> re-run
+            if v is None:
+                v = run_cell(length, clusters, probes, pct, tasks, n, args)
             summary.append(v)
             print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
                   f"recall_mean={v['recall_mean']:.3f} cells_done={len(summary)}",
