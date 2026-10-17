@@ -5,7 +5,7 @@
 # on it never race to build the shared $REPO/.venv.
 set -euo pipefail
 REPO="${GLM5_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}"
-VENV="${REPO}/.venv"
+VENV="${GLM5_VENV:-${REPO}/.venv}"
 export PATH="${HOME}/.local/bin:${PATH}"
 # `auto` detects the CUDA wheel from the GPU node's driver. Override (e.g.
 # TORCH_BACKEND=cu128) if auto picks a torch that ABI-mismatches the

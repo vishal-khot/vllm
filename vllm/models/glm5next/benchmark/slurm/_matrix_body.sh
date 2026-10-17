@@ -24,7 +24,7 @@ RUNNER="${REPO}/vllm/models/glm5next/benchmark/slurm/matrix_run.py"
 MODEL_REPO="zai-org/GLM-5.3-Flash"
 NODE_SCRATCH="/scratch/${USER}/glm5"
 MODEL_DIR="${NODE_SCRATCH}/GLM-5.3-Flash"
-VENV="${REPO}/.venv"
+VENV="${GLM5_VENV:-${REPO}/.venv}"
 RULER_SRC="${RULER_SRC:-}"
 
 : "${GLM5_TP:?set by the sbatch wrapper}"
