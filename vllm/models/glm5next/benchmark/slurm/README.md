@@ -1,57 +1,64 @@
 # GLM-5.3-Flash DSA-indexer benchmark on Slurm
 
-Two jobs, both driven by `../runs.yaml` (nothing is computed in the shell):
+## One command (start here)
 
+```bash
+PARTITION=<p> QOS=<q> GRES=gpu:<type>:8 bash run_benchmark.sh
+```
+
+`run_benchmark.sh` does everything: ensures the fork is on the `benchmarking`
+branch, installs `uv`, downloads the model to `./model`, generates RULER data to
+`./ruler`, builds the vLLM venv once (a short GPU job), then submits both
+experiments (each waits for the build). The **number of GPUs in `GRES` becomes
+the tensor-parallel size**, so pick 8 (or 4 for `MODE=preempt`); the GPUs must
+together hold ~306 GB. Run it under `tmux`/`nohup` — the model download is large.
+
+Inputs:
+- **Required:** `PARTITION`, `QOS`, `GRES` (e.g. `gpu:A100_80GB:8`) — your
+  cluster's scheduler values.
+- **Optional:** `HF_TOKEN` (gated model), `MODE=normal|preempt` (default normal),
+  `MODEL_DIR` / `RULER_DIR` (defaults `./model` / `./ruler` — point these at
+  existing data to skip the download/generation), `NUM_SAMPLES` (RULER
+  samples/task, default 100), `GLM5_ONLY=<run ids>`, `BRANCH`, `CLONE_DEST`.
+
+The two experiments it launches (both driven by `../runs.yaml`):
 1. **A/B matrix** — kpool vs IVF: accuracy, latency, throughput, memory.
-   `matrix_run.py` + `_matrix_body.sh` + `matrix_{normal,preempt}.sbatch`.
-2. **IVF lost-attention fidelity sweep** — key-recall / mass-captured (+ accuracy
-   + memory) across (length × clusters × probes).
-   `lost_attention_run.py` + `_run_body.sh` + `lost_attention_{normal,preempt}.sbatch`.
+2. **IVF fidelity sweep** — key-recall / mass-captured (+ accuracy + memory)
+   across (length × clusters × probes).
 
-Both are the Slurm counterparts of the Modal scripts (`../matrix_run.py`,
-`../smoke_single.py`); use these when you have a Slurm cluster but no Modal.
+## RULER data
 
-## Running on another cluster (read first)
+`run_benchmark.sh` generates it with the official NVIDIA/RULER pipeline and the
+GLM tokenizer (`prepare_ruler.sh`), so token lengths are correct for this model.
+This pulls the RULER source tarball + source corpora and needs internet on the
+node you run it from (a login node). If you already have RULER jsonl laid out as
+`<task>/validation_<len>.jsonl`, set `RULER_DIR=/that/dir` to skip generation.
 
-The `#SBATCH --partition/--qos/--gres` lines in the `.sbatch` files are **Babel
-defaults**. On a different cluster either edit those three lines, or override at
-submit time (later flags win):
+## Advanced / manual
 
-```bash
-sbatch --partition=<p> --qos=<q> --gres=gpu:<type>:<N> matrix_preempt.sbatch
-```
-
-Submit **from this `slurm/` directory** so the repo root is found automatically,
-or pass `GLM5_REPO=/path/to/vllm`. Normal mode uses `GLM5_TP=8` (8 GPUs); preempt
-uses `GLM5_TP=4` (4 GPUs). TP must divide the model's head counts and the GPUs
-must together hold ~306 GB.
-
-## You must provide
-
-1. **RULER data** — not on the cluster. Point `RULER_SRC` at a dir laid out as
-   `<task>/validation_<len>.jsonl` (the old Modal `glm5-ruler` volume contents).
-   The job stages exactly the task×length pairs each experiment needs.
-2. **HF_TOKEN** — only if `zai-org/GLM-5.3-Flash` is gated for your account.
-
-## Run
+The pieces are usable directly. The `#SBATCH --partition/--qos/--gres` lines in
+the `.sbatch` files are **Babel defaults**; override them at submit, and submit
+from this `slurm/` dir (or set `GLM5_REPO`). Point the jobs at ready data with
+`SHARED_MODEL_DIR` / `SHARED_RULER_DIR` (what `run_benchmark.sh` does), or let a
+job stage node-local from `RULER_SRC`:
 
 ```bash
-# A/B matrix (all 26 runs)
-RULER_SRC=/path/to/ruler sbatch matrix_preempt.sbatch
-RULER_SRC=/path/to/ruler sbatch matrix_normal.sbatch
-GLM5_ONLY=ivf,kpool RULER_SRC=/path/to/ruler sbatch matrix_preempt.sbatch  # subset
-
-# Fidelity sweep (25 cells)
-RULER_SRC=/path/to/ruler sbatch lost_attention_preempt.sbatch
+# one experiment, data already staged in shared dirs:
+SHARED_MODEL_DIR=./model SHARED_RULER_DIR=./ruler GLM5_TP=8 \
+  sbatch --partition=<p> --qos=<q> --gres=gpu:<type>:8 matrix_normal.sbatch
+# or stage node-local from a source tree:
+RULER_SRC=/path/to/ruler sbatch --partition=<p> --qos=<q> --gres=gpu:<type>:4 \
+  lost_attention_preempt.sbatch
 ```
 
-Optional env: `GLM5_REPO` (repo root), `OUT_ROOT` (where results land),
-`GLM5_ONLY` (matrix: restrict to run ids).
+Files: `run_benchmark.sh` (orchestrator), `prepare_ruler.sh` (RULER gen),
+`_build_venv.sh` (venv build job), `{matrix,lost_attention}_run.py` (runners),
+`_{matrix,run}_body.sh` (stage + run), `*.sbatch` (wrappers).
 
 ## Where results are stored
 
-Both bodies run on node-local NVMe (`/scratch/$USER/glm5/...`) and copy the
-tree to persistent storage at the end:
+Jobs serve from the shared `./model` + `./ruler` (or node-local staging) and
+write per-run results to persistent storage:
 
 - **A/B matrix** → `${OUT_ROOT:-$HOME/glm5_ab_matrix/<jobid>}/`
   ```
@@ -136,8 +143,10 @@ is the single source of truth.
 
 ## Notes / caveats
 
-- **Model staging is node-local** (`/scratch/$USER/glm5`, ~306 GB), re-downloaded
-  on a fresh node (resumable), reused if the node still has it.
+- **Model location.** `run_benchmark.sh` downloads once to the shared `./model`
+  and the jobs serve from it (`SHARED_MODEL_DIR`). Run a `.sbatch` directly with
+  neither `SHARED_MODEL_DIR` nor the model present and it falls back to a
+  node-local download under `/scratch/$USER/glm5` (~306 GB, resumable per node).
 - **venv** (`$REPO/.venv`) builds once via `VLLM_USE_PRECOMPILED=1 uv pip install
   -e .` (works because `.git` is present); reused afterwards.
 - **Eager runs run every sample** (`n: all` / the base pair); graph runs use

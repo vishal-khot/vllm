@@ -28,7 +28,7 @@
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail
-export GLM5_TP=4
+: "${GLM5_TP:=4}"; export GLM5_TP
 : "${GLM5_REPO:=$(cd "${SLURM_SUBMIT_DIR:-$(pwd)}/../../../../.." && pwd)}"
 BODY="${GLM5_REPO}/vllm/models/glm5next/benchmark/slurm/_matrix_body.sh"
 [ -f "${BODY}" ] || { echo "no body at ${BODY}; set GLM5_REPO to the repo root" >&2; exit 2; }
