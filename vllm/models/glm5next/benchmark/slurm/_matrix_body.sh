@@ -37,6 +37,7 @@ echo "[$(date +%T)] host=$(hostname) tp=${GLM5_TP} repo=${REPO}"
 nvidia-smi -L || true
 mkdir -p "${NODE_SCRATCH}" "${NODE_OUT}" "${OUT_ROOT}"
 
+export PATH="${HOME}/.local/bin:${PATH}"   # uv installs here
 export HF_HOME="${NODE_SCRATCH}/hf"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 

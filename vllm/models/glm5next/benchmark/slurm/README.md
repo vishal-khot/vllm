@@ -113,8 +113,8 @@ runs use `n=20`.
 | `ivf_L131072_c16` | throughput | ivf | 181 | 23 | 131072 | 147456 | 16 | graph | accuracy, throughput |
 
 Throughput-grid clusters/probes follow `clusters=round(sqrt(L/4))`, `probes=12.5%`;
-the concurrency ladder tapers at long context (KV memory). regression/swebench
-(on the base pair) have no in-repo scorer and are recorded `scorer_not_implemented`.
+the concurrency ladder tapers at long context (KV memory). RULER-only for now
+(regression/swebench deferred).
 
 ### Fidelity sweep — 25 cells (`lost_attention_run.py`), IVF only, eager
 
@@ -144,5 +144,6 @@ is the single source of truth.
   `n=20`. The eager path is single-stream and slow, so the full-sample fidelity
   sweep can take a long time — restrict with `lost_attention_run.py --n <k>` or
   the matrix with `GLM5_ONLY`.
-- **regression/swebench have no in-repo scorer yet** — the matrix records them as
-  `scorer_not_implemented` rather than faking a number.
+- **RULER-only for now.** The driver still records any non-ruler dataset as
+  `scorer_not_implemented` (none are configured today), so adding gsm8k/swebench
+  later is a runs.yaml change, not a code change.
