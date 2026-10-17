@@ -69,7 +69,7 @@ default: &default
   concurrency: 1
   exec_mode: eager
   measure_lost_attention: false
-  datasets: [ruler, regression, swebench]
+  datasets: [ruler]           # ruler-only for now (regression/swebench deferred)
 
 # The two cases. `<<: *default` pulls the default run; list only the diffs.
 # `sweep` on a case adds ablation runs: one knob flipped per value (-> [ruler],
