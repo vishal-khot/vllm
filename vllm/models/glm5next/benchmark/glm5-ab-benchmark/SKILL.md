@@ -58,7 +58,8 @@ for run in matrix.runs:
   `<case>_<knob>_<value>`, defaulting to the `ruler` dataset. A sweep value is
   a bare list, or `{values: [...], with: {<extra overrides>}}` to also flip extra
   fields (e.g. `exec_mode: graph` for the concurrency sweep).
-- Sweepable knobs: `P`, `clusters`, `cadence`, `concurrency`.
+- Sweepable knobs: `P`, `clusters`, `concurrency`. `cadence` is a per-run label
+  only (logged, never swept).
 - Which metrics a run emits is decided by run *type* in `Run.metrics()` (eager-only
   instrumentation, throughput vs latency by concurrency, IVF-only clustering +
   lost-attention), **not** by the `metrics:` block — that block is just definitions.
@@ -121,8 +122,9 @@ happens on Modal. Before any GPU run:
 
 ## Gotchas
 
-- `cadence` is in `runs.yaml` but the clustering-cadence knob is **not implemented**
-  yet (no `cluster_interval`); don't claim cadence results until it lands.
+- `cadence` is a **log-only label**: recorded in each run's config and printed, but
+  not swept and not wired to the indexer (no `cluster_interval`; rebuild mode is
+  chosen automatically in `build_ivf_index`). Don't present it as a measured variable.
 - Verify `--hf-overrides` knobs actually reach `getattr(config, "index_num_probes")`
   on Modal — this was an open item.
 - Watch `ivf_config` startup refusals (IVF + no-prefix-caching + chunked prefill at
