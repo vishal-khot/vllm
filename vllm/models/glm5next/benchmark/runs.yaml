@@ -26,7 +26,8 @@ indexer_arms:
     env: {VLLM_ENABLE_DSA_IVF_INDEXER: 0}
   ivf:
     env: {VLLM_ENABLE_DSA_IVF_INDEXER: 1}
-    hf_overrides: {index_num_clusters: 256, index_num_probes: 32}
+    # Base counts; the ivf case overrides them (see below).
+    hf_overrides: {index_num_clusters: 64, index_num_probes: 8}
 
 # Free axes. Each carries its own accuracy metric.
 datasets:
@@ -77,18 +78,48 @@ runs:
   - id: kpool                 # without k-means
     <<: *default
     indexer: kpool
+    sweep: # mirror the ivf throughput grid so the arms compare at equal load
+      throughput_grid:
+        with: {exec_mode: graph, measure_lost_attention: false}
+        cells:        # kpool has no indexer knobs; only length x concurrency
+          - {length: 16384,  concurrency: [1, 4, 16, 64, 256]}
+          - {length: 65536,  concurrency: [1, 4, 16, 64]}
+          - {length: 131072, concurrency: [1, 4, 16]}
 
   - id: ivf                   # with k-means (base operating point)
     <<: *default
     indexer: ivf
-    P: 32
-    clusters: 256
-    cadence: every_chunk
+    # Aligned to the fidelity grid's rule: clusters = round(sqrt(L/4)) sized for
+    # the longest ruler length this serve handles (16384 -> 64); probes = 12.5%
+    # of clusters (-> 8), the same probed fraction as the former 256/32 base.
+    clusters: 64
+    P: 8
     measure_lost_attention: true
-    sweep: # knobs to change the default run; each value produces a new run (-> [ruler], id like ivf_P_64)
-      P: [64, 128]
-      clusters: [128, 512]
-      cadence: [first_chunk, every_2]
-      concurrency:
-        values: [8, 32]
+    sweep: # ablations on the ivf run. throughput_grid = throughput vs
+           # (length x concurrency) in graph mode; cells = the per-length
+           # clusters/probes lost-attention grid (slurm runner).
+      # Throughput at IVF's real per-length operating point: clusters =
+      # round(sqrt(length/4)), probes = 12.5% of clusters (same rule as the
+      # fidelity grid). The ladder tapers at long context because KV memory
+      # caps concurrency. max_model_len is derived as length + max_tokens.
+      throughput_grid:
         with: {exec_mode: graph, measure_lost_attention: false}
+        cells:
+          - {length: 16384,  clusters: 64,  probes: 8,  concurrency: [1, 4, 16, 64, 256]}
+          - {length: 65536,  clusters: 128, probes: 16, concurrency: [1, 4, 16, 64]}
+          - {length: 131072, clusters: 181, probes: 23, concurrency: [1, 4, 16]}
+      # IVF lost-attention fidelity sweep, run by slurm/lost_attention_run.py
+      # (not the A/B matrix). One serve per (length, probe); every task in the
+      # ruler dataset runs through each serve (tasks are a free axis), n samples
+      # each. Every operating point is explicit -- nothing is computed at run
+      # time. Derived as clusters = round(sqrt(length/4)) = sqrt(#pools)
+      # (kpool=4), probes = round(clusters * {6.25,12.5,25,50,75}%).
+      cells:
+        n: all                  # eager fidelity: run every sample in each file
+        tasks: all              # all tasks listed in the ruler dataset above
+        grid:
+          - {length: 8192,   clusters: 45,  probes: [3, 6, 11, 23, 34]}
+          - {length: 16384,  clusters: 64,  probes: [4, 8, 16, 32, 48]}
+          - {length: 32768,  clusters: 91,  probes: [6, 11, 23, 46, 68]}
+          - {length: 65536,  clusters: 128, probes: [8, 16, 32, 64, 96]}
+          - {length: 131072, clusters: 181, probes: [11, 23, 45, 91, 136]}

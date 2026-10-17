@@ -57,15 +57,15 @@ function of cadence.
 memory vs L; the regime where sparse selection pays off).
 
 **6. Ablations** — the k-means design knobs (accuracy vs cost Pareto).
-- **Clustering cadence (the prefill-cost lever).** Today k-means **rebuilds the
-  index on every prefill chunk** (decode just assigns to fixed centroids). This
-  dominates prefill cost. Hypothesis under test: cluster only at **particular
-  chunks** (first-chunk-only, or every Nth chunk) and assign in between. Measure
-  the accuracy vs prefill-latency tradeoff across cadences, and the staleness risk
-  (centroids built on a partial prefix). Expected to be the main performance win.
-- P = `index_num_probes` sweep: 32, 64, (128).
-- `index_num_clusters` sweep: 128 / 256 / 512.
-- `index_kmeans_iters` sensitivity (does fewer iters hold accuracy?).
+- **Probes (the per-query cost lever).** IVF scores only the P probed clusters
+  per query, so P drives both speed and recall. Swept as a fraction of clusters
+  (6.25 / 12.5 / 25 / 50 / 75 %) in the fidelity sweep; the A/B throughput grid
+  fixes P = 12.5 %. (Clustering cadence is automatic — cold/warm/append chosen in
+  `build_ivf_index`, not a knob — so it is logged only, never swept.)
+- **Clusters** sized per length: `clusters = round(sqrt(length/4))` = sqrt(#pools),
+  keeping the index balanced as context grows (45 at 8K → 181 at 128K).
+- **Context length × concurrency** throughput grid (graph mode), both arms, to
+  show where IVF's sub-quadratic scoring wins as length grows.
 
 **Core paper tables/figures:** (i) accuracy x task x length, both arms; (ii) accuracy
 vs latency and vs memory Pareto from the P/cluster sweeps; (iii) per-layer time +
@@ -75,13 +75,14 @@ peak memory bars; (iv) fidelity (recall IVF-vs-k-pool) per layer (optional).
 
 IVF is implemented, pure Python/Triton (no CUDA rebuild). Gated by env
 `VLLM_ENABLE_DSA_IVF_INDEXER`; knobs from model config: `index_num_clusters`
-(256), `index_num_probes`=P (32), `index_kmeans_iters` (10). IVF disables prefix
-caching. Classes: `SparseAttnIndexerKpool` (stock) / `SparseAttnIndexerIVF` (IVF).
+(= round(sqrt(L/4)), 64 at L=16K), `index_num_probes` = P (= 12.5% of clusters,
+8 at L=16K), `index_kmeans_iters` (10). IVF disables prefix caching. Classes:
+`SparseAttnIndexerKpool` (stock) / `SparseAttnIndexerIVF` (IVF).
 
 | arm | env | notes |
 |-----|-----|-------|
 | without k-means (k-pool) | `=0` | stock baseline |
-| with k-means (IVF) | `=1` | anchor P=32, clusters=256; P/clusters/cadence are sweeps within this arm |
+| with k-means (IVF) | `=1` | clusters=round(sqrt(L/4)), P=12.5%; swept over length×concurrency (A/B) and probe fraction (fidelity) |
 
 ## Harness — one serve per arm captures everything
 
@@ -109,7 +110,7 @@ match on stock). Only the indexer differs.
 2. Modal fork-image build time/cost (first build) with precompiled artifacts.
 3. Is there a **dense** indexer path for the fidelity ceiling, or do we reference k-pool full-score?
 4. IVF + no-prefix-caching + chunked prefill at 16K — watch `ivf_config` startup refusals.
-5. **Clustering-cadence knob** is not implemented yet (no `cluster_interval`); define
-   how cadence is parameterized (e.g. first-chunk-only vs every-N-chunks) before
-   benchmarking it, and whether it needs a new env/config field + instrument split
+5. **Clustering cadence** is recorded as a per-run label only (not implemented as a
+   knob — no `cluster_interval`, and the rebuild mode is chosen automatically in
+   `build_ivf_index`). Don't sweep or claim cadence results until a real knob lands.
    of cluster-vs-assign time.

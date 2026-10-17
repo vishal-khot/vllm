@@ -21,7 +21,7 @@ Inspect from the shell:
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,9 @@ _REQUIRED_RUN_FIELDS = (
     "measure_lost_attention",
     "datasets",
 )
+
+# Optional run fields a sweep may inject (not required on the base cases).
+_OPTIONAL_RUN_FIELDS = ("length", "max_model_len")
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class Run:
     prefix_caching: bool
     measure_lost_attention: bool
     datasets: list[Dataset]
+    length: int | None = None  # throughput-grid runs pin a single context length
 
     @property
     def eager(self) -> bool:
@@ -130,7 +134,8 @@ class Run:
             self.indexer,
             self.exec_mode,
             self.concurrency,
-            self.cadence,
+            self.max_model_len,  # per-length throughput runs differ here
+            # cadence is a log-only label; it does not change the serve.
             tuple(sorted(self.env.items())),
             tuple(sorted((k, repr(v)) for k, v in self.hf_overrides.items())),
         )
@@ -138,10 +143,11 @@ class Run:
     def describe(self) -> str:
         hf = ", ".join(f"{k}={v}" for k, v in self.hf_overrides.items()) or "-"
         ds = ", ".join(d.name for d in self.datasets)
+        length = str(self.length) if self.length is not None else "-"
         return (
-            f"{self.id:16s} indexer={self.indexer:5s} "
+            f"{self.id:22s} indexer={self.indexer:5s} "
             f"exec={self.exec_mode:5s} conc={self.concurrency:<3d} "
-            f"cadence={self.cadence:12s} hf=[{hf}]\n"
+            f"L={length:>7s} mml={self.max_model_len:<7d} hf=[{hf}]\n"
             f"             datasets=[{ds}]  metrics=[{', '.join(self.metrics())}]"
         )
 
@@ -188,7 +194,7 @@ def _resolve_run(
     missing = [f for f in _REQUIRED_RUN_FIELDS if f not in raw]
     if missing:
         raise ConfigError(f"run {rid!r}: missing fields {missing}")
-    unknown = set(raw) - set(_REQUIRED_RUN_FIELDS)
+    unknown = set(raw) - set(_REQUIRED_RUN_FIELDS) - set(_OPTIONAL_RUN_FIELDS)
     if unknown:
         raise ConfigError(f"run {rid!r}: unknown fields {sorted(unknown)}")
 
@@ -219,11 +225,25 @@ def _resolve_run(
             f"run {rid!r}: P/clusters only apply to the ivf arm, not {indexer!r}"
         )
 
+    # A throughput-grid run pins one context length; max_model_len must hold
+    # that length plus the generated tokens. Explicit max_model_len wins; else a
+    # pinned length derives it; else the fairness default applies.
+    length = int(raw["length"]) if raw.get("length") is not None else None
+    if raw.get("max_model_len") is not None:
+        max_model_len = int(raw["max_model_len"])
+    elif length is not None:
+        max_model_len = length + int(fairness["max_tokens"])
+    else:
+        max_model_len = int(fairness["max_model_len"])
+
     resolved_ds = []
     for name in raw["datasets"]:
         if name not in datasets:
             raise ConfigError(f"run {rid!r}: unknown dataset {name!r}")
-        resolved_ds.append(datasets[name])
+        ds = datasets[name]
+        if length is not None and ds.name == "ruler":
+            ds = replace(ds, lengths=[length])
+        resolved_ds.append(ds)
 
     return Run(
         id=rid,
@@ -234,12 +254,13 @@ def _resolve_run(
         concurrency=int(raw["concurrency"]),
         cadence=raw["cadence"] if raw["cadence"] is not None else "n/a",
         max_tokens=int(fairness["max_tokens"]),
-        max_model_len=int(fairness["max_model_len"]),
+        max_model_len=max_model_len,
         seed=int(fairness["seed"]),
         greedy=bool(fairness["greedy"]),
         prefix_caching=_as_bool(fairness["prefix_caching"]),
         measure_lost_attention=measure,
         datasets=resolved_ds,
+        length=length,
     )
 
 
@@ -250,8 +271,37 @@ def _as_bool(v: Any) -> bool:
     return str(v).lower() in ("true", "on", "yes", "1")
 
 
-# Knobs a sweep may flip, each mapping to a run field it overrides.
-_SWEEP_KNOBS = ("P", "clusters", "cadence", "concurrency")
+# Knobs a sweep may flip, each mapping to a run field it overrides. `cadence` is
+# intentionally absent: it is a log-only label, not wired to the indexer.
+_SWEEP_KNOBS = ("P", "clusters", "concurrency")
+
+
+def _expand_throughput_grid(base: dict[str, Any], spec: dict[str, Any]) -> list[dict]:
+    """Expand a (length x concurrency) grid into one run per cell.
+
+    Each cell fixes a context length (and, on the ivf arm, the per-length
+    ``clusters``/``probes``) and lists the ``concurrency`` ladder to serve at
+    that length. ``with`` sets shared overrides (graph mode, lost-attention
+    off). Runs are named ``<base id>_L<length>_c<conc>``; max_model_len is
+    derived from the length in _resolve_run.
+    """
+    extra = spec.get("with", {})
+    out: list[dict] = []
+    for cell in spec["cells"]:
+        length = int(cell["length"])
+        for conc in cell["concurrency"]:
+            run = dict(base)
+            run.update(extra)
+            run["concurrency"] = int(conc)
+            run["length"] = length
+            run["datasets"] = ["ruler"]
+            if cell.get("clusters") is not None:
+                run["clusters"] = cell["clusters"]
+            if cell.get("probes") is not None:
+                run["P"] = cell["probes"]
+            run["id"] = f"{base['id']}_L{length}_c{conc}"
+            out.append(run)
+    return out
 
 
 def _expand_sweep(base: dict[str, Any], sweep: dict[str, Any]) -> list[dict]:
@@ -263,6 +313,13 @@ def _expand_sweep(base: dict[str, Any], sweep: dict[str, Any]) -> list[dict]:
     """
     out: list[dict] = []
     for knob, spec in sweep.items():
+        if knob == "cells":
+            # The IVF lost-attention fidelity grid (per-length clusters/probes),
+            # consumed by slurm/lost_attention_run.py, not the A/B matrix.
+            continue
+        if knob == "throughput_grid":
+            out += _expand_throughput_grid(base, spec)
+            continue
         if knob not in _SWEEP_KNOBS:
             raise ConfigError(f"sweep knob {knob!r} not in {list(_SWEEP_KNOBS)}")
         if isinstance(spec, dict):
