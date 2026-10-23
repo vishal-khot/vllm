@@ -130,7 +130,7 @@ BUILD_GRES="${GRES%:*}:1"
 BUILD_ID=$(sbatch --parsable --job-name=glm5-build \
   --partition="${PARTITION}" --qos="${QOS}" --gres="${BUILD_GRES}" \
   --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=64G --time=2:00:00 \
-  --export=ALL --output="glm5-build-%j.out" \
+  --requeue --export=ALL --output="glm5-build-%j.out" \
   --wrap="bash ${SLURM_DIR}/_build_venv.sh")
 say "build job: ${BUILD_ID}"
 
