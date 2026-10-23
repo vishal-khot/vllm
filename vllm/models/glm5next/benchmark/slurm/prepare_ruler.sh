@@ -33,7 +33,8 @@ MODEL_DIR="$(cd "${MODEL_DIR}" && pwd)"
 # --no-project: never treat the surrounding vLLM (or RULER) tree as a project to
 # build -- these are standalone scripts and a build would need a CUDA toolkit.
 UVW=(--no-project --with transformers --with nltk --with wonderwords --with html2text
-     --with tenacity --with numpy --with sentencepiece --with huggingface_hub)
+     --with tenacity --with numpy --with scipy --with tqdm --with pyyaml
+     --with beautifulsoup4 --with sentencepiece --with huggingface_hub)
 
 # ---- 1. fetch RULER source (tarball; no git clone) ----
 SRC="${WORK}/RULER-${RULER_REF}"
