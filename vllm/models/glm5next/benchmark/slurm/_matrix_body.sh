@@ -22,7 +22,10 @@ REPO="${GLM5_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}
 RUNS_YAML="${REPO}/vllm/models/glm5next/benchmark/runs.yaml"
 RUNNER="${REPO}/vllm/models/glm5next/benchmark/slurm/matrix_run.py"
 MODEL_REPO="zai-org/GLM-5.3-Flash"
-NODE_SCRATCH="/scratch/${USER}/glm5"
+# Node-local scratch. Overridable: some clusters have no writable /scratch, and
+# when SHARED_* dirs are given we serve straight from them and only need a
+# writable spot for the HF cache. Point GLM5_NODE_SCRATCH at shared storage there.
+NODE_SCRATCH="${GLM5_NODE_SCRATCH:-/scratch/${USER}/glm5}"
 MODEL_DIR="${NODE_SCRATCH}/GLM-5.3-Flash"
 VENV="${GLM5_VENV:-${REPO}/.venv}"
 RULER_SRC="${RULER_SRC:-}"
@@ -45,7 +48,7 @@ nvidia-smi -L || true
 mkdir -p "${NODE_SCRATCH}" "${OUT_ROOT}"
 
 export PATH="${HOME}/.local/bin:${PATH}"   # uv installs here
-export HF_HOME="${NODE_SCRATCH}/hf"
+export HF_HOME="${HF_HOME:-${NODE_SCRATCH}/hf}"   # keep a caller-set HF_HOME
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # ---- 1. vLLM + fork venv (built once; .venv lives in the persistent repo) ----
