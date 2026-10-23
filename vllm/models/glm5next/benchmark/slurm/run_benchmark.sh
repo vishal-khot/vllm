@@ -12,6 +12,9 @@
 #   PARTITION=<p> QOS=<q> GRES=gpu:<type>:8 bash run_benchmark.sh
 #
 # Required : PARTITION, QOS, GRES (e.g. gpu:A100_80GB:8).
+#            (not required when SETUP_ONLY=1 -- staging submits no jobs.)
+# SETUP_ONLY=1 : stage repo/uv/model/RULER and STOP before any sbatch. Safe to
+#            run on a login node (resumable); re-run without it to submit.
 # Optional : HF_TOKEN (gated model), MODE=normal|preempt (default normal),
 #            MODEL_DIR (default ./model), RULER_DIR (default ./ruler),
 #            NUM_SAMPLES (RULER samples/task, default 100), GLM5_ONLY=<run ids>,
@@ -30,6 +33,7 @@ set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/vishal-khot/vllm.git}"
 BRANCH="${BRANCH:-benchmarking}"
 MODE="${MODE:-normal}"
+SETUP_ONLY="${SETUP_ONLY:-0}"   # 1 = stage repo/uv/model/RULER then stop (no sbatch)
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 MODEL_DIR="${MODEL_DIR:-${PWD}/model}"
 RULER_DIR="${RULER_DIR:-${PWD}/ruler}"
@@ -37,17 +41,19 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say() { printf '\n[run] %s\n' "$*"; }
 
-# ---- required cluster inputs ----
-if [ -z "${PARTITION:-}" ] || [ -z "${QOS:-}" ] || [ -z "${GRES:-}" ]; then
-  echo "ERROR: set PARTITION, QOS and GRES. Example:" >&2
-  echo "  PARTITION=general QOS=normal GRES=gpu:A100_80GB:8 bash run_benchmark.sh" >&2
-  echo "Partitions/GRES available here:" >&2
-  sinfo -o "  %P %l %G" 2>/dev/null | sort -u >&2 || true
-  exit 2
+# ---- required cluster inputs (only when we will submit jobs) ----
+if [ "${SETUP_ONLY}" != "1" ]; then
+  if [ -z "${PARTITION:-}" ] || [ -z "${QOS:-}" ] || [ -z "${GRES:-}" ]; then
+    echo "ERROR: set PARTITION, QOS and GRES. Example:" >&2
+    echo "  PARTITION=general QOS=normal GRES=gpu:A100_80GB:8 bash run_benchmark.sh" >&2
+    echo "Partitions/GRES available here:" >&2
+    sinfo -o "  %P %l %G" 2>/dev/null | sort -u >&2 || true
+    exit 2
+  fi
+  TP="${GRES##*:}"
+  [[ "${TP}" =~ ^[0-9]+$ ]] || { echo "ERROR: GRES must end in :<N> (e.g. gpu:A100_80GB:8)" >&2; exit 2; }
+  case "${MODE}" in normal|preempt) ;; *) echo "ERROR: MODE must be normal|preempt" >&2; exit 2 ;; esac
 fi
-TP="${GRES##*:}"
-[[ "${TP}" =~ ^[0-9]+$ ]] || { echo "ERROR: GRES must end in :<N> (e.g. gpu:A100_80GB:8)" >&2; exit 2; }
-case "${MODE}" in normal|preempt) ;; *) echo "ERROR: MODE must be normal|preempt" >&2; exit 2 ;; esac
 
 # ---- 1. repo on the right branch (clone if absent) ----
 if [ -n "${GLM5_REPO:-}" ]; then
@@ -74,20 +80,20 @@ fi
 say "uv: $(uv --version)"
 
 # ---- 3. model -> ./model ----
+# Always call snapshot_download: it verifies every file and fetches only what is
+# missing, so a partial download (e.g. a login-node process that was killed
+# mid-way) resumes instead of being mistaken for complete. A complete tree is a
+# cheap no-op (HEAD per file).
 mkdir -p "${MODEL_DIR}"
-if [ -f "${MODEL_DIR}/config.json" ]; then
-  say "model already present at ${MODEL_DIR}"
-else
-  say "downloading zai-org/GLM-5.3-Flash -> ${MODEL_DIR} (large; resumable)"
-  HF_HUB_ENABLE_HF_TRANSFER=1 uv run --no-project --with huggingface_hub --with hf_transfer \
-    python - "${MODEL_DIR}" <<'PY'
+say "staging zai-org/GLM-5.3-Flash -> ${MODEL_DIR} (resumes if partial)"
+uv run --no-project --with huggingface_hub \
+  python - "${MODEL_DIR}" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
-snapshot_download("zai-org/GLM-5.3-Flash", local_dir=sys.argv[1],
-                  max_workers=8, resume_download=True)
-print("model ->", sys.argv[1])
+p = snapshot_download("zai-org/GLM-5.3-Flash", local_dir=sys.argv[1],
+                      max_workers=8)
+print("MODEL_READY", p)
 PY
-fi
 
 # ---- 4. RULER -> ./ruler (skip if already populated or RULER_DIR supplied) ----
 if [ -f "${RULER_DIR}/niah_single_1/validation_16384.jsonl" ]; then
@@ -102,6 +108,13 @@ fi
   echo "       Fix generation, or set RULER_DIR to a pre-generated dir." >&2
   exit 2
 }
+
+if [ "${SETUP_ONLY}" = "1" ]; then
+  say "SETUP_ONLY: staging complete (repo, uv, model, RULER). No jobs submitted."
+  say "to run the benchmark, re-run WITHOUT SETUP_ONLY, e.g.:"
+  echo "    SBATCH_ACCOUNT=ci PARTITION=main QOS=ci GRES=gpu:8 bash ${BASH_SOURCE[0]}"
+  exit 0
+fi
 
 # Pass config to the jobs through the environment (carried by --export=ALL).
 # NOT via --export=k=v,... because GLM5_ONLY may contain commas, which SLURM
