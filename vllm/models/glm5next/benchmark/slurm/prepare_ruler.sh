@@ -30,7 +30,9 @@ OUT="$(cd "${OUT}" && pwd)"
 MODEL_DIR="$(cd "${MODEL_DIR}" && pwd)"
 
 # RULER's prepare.py deps, in an ephemeral uv env (no global installs).
-UVW=(--with transformers --with nltk --with wonderwords --with html2text
+# --no-project: never treat the surrounding vLLM (or RULER) tree as a project to
+# build -- these are standalone scripts and a build would need a CUDA toolkit.
+UVW=(--no-project --with transformers --with nltk --with wonderwords --with html2text
      --with tenacity --with numpy --with sentencepiece --with huggingface_hub)
 
 # ---- 1. fetch RULER source (tarball; no git clone) ----
