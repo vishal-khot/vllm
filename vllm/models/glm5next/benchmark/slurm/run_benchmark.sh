@@ -79,7 +79,7 @@ if [ -f "${MODEL_DIR}/config.json" ]; then
   say "model already present at ${MODEL_DIR}"
 else
   say "downloading zai-org/GLM-5.3-Flash -> ${MODEL_DIR} (large; resumable)"
-  HF_HUB_ENABLE_HF_TRANSFER=1 uv run --with huggingface_hub --with hf_transfer \
+  HF_HUB_ENABLE_HF_TRANSFER=1 uv run --no-project --with huggingface_hub --with hf_transfer \
     python - "${MODEL_DIR}" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
