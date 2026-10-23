@@ -47,13 +47,19 @@ DATA="${SRC}/scripts/data"
 [ -d "${DATA}" ] || { echo "[ruler] ERROR: unexpected RULER layout at ${DATA}" >&2; exit 2; }
 
 # ---- 2. source corpora (essays for NIAH/VT/aggregation; QA sets for qa_*) ----
+# Check the SPECIFIC required files, not "any *.json": RULER ships
+# english_words.json + the downloader scripts, so a glob always matches and
+# would wrongly skip the real downloads. The downloaders use relative paths
+# (read URLs, write <name>.json), so they must run from synthetic/json/.
 cd "${DATA}"
 uv run "${UVW[@]}" python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')" || true
-if ls synthetic/json/*.json >/dev/null 2>&1; then
-  echo "[ruler] corpora already present"
-else
-  uv run "${UVW[@]}" python synthetic/json/download_paulgraham_essay.py
-  bash synthetic/json/download_qa_dataset.sh
+if [ ! -f synthetic/json/PaulGrahamEssays.json ]; then
+  echo "[ruler] downloading Paul Graham essays ..."
+  ( cd synthetic/json && uv run "${UVW[@]}" python download_paulgraham_essay.py )
+fi
+if [ ! -f synthetic/json/squad.json ] || [ ! -f synthetic/json/hotpotqa.json ]; then
+  echo "[ruler] downloading QA datasets (squad, hotpotqa) ..."
+  ( cd synthetic/json && bash download_qa_dataset.sh )
 fi
 
 # ---- 3. generate each (task, length) ----
