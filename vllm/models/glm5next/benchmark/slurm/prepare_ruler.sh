@@ -54,6 +54,15 @@ DATA="${SRC}/scripts/data"
 # (read URLs, write <name>.json), so they must run from synthetic/json/.
 cd "${DATA}"
 uv run "${UVW[@]}" python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')" || true
+# english_words.json is Git-LFS tracked; the codeload tarball ships only the
+# pointer (cwe does json.load on it and crashes). Fetch the real blob from the
+# LFS media endpoint when the on-disk file is still a pointer.
+if head -c 64 synthetic/json/english_words.json 2>/dev/null | grep -q "git-lfs"; then
+  echo "[ruler] fetching LFS english_words.json from media endpoint ..."
+  curl -fsSL \
+    "https://media.githubusercontent.com/media/NVIDIA/RULER/${RULER_REF}/scripts/data/synthetic/json/english_words.json" \
+    -o synthetic/json/english_words.json
+fi
 if [ ! -f synthetic/json/PaulGrahamEssays.json ]; then
   echo "[ruler] downloading Paul Graham essays ..."
   ( cd synthetic/json && uv run "${UVW[@]}" python download_paulgraham_essay.py )
