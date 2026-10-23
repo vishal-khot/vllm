@@ -33,6 +33,10 @@ RULER_SRC="${RULER_SRC:-}"
 
 : "${GLM5_TP:?set by the sbatch wrapper}"
 JOB="${SLURM_JOB_ID:-local}"
+# Unique serve port per job: nodes are shared, so a fixed 8000 collides with
+# other tenants' servers (the driver then talks to the wrong one). Derive a
+# high port from the job id so /health only answers once OUR server binds it.
+PORT=$(( 20000 + (${SLURM_JOB_ID:-$$} % 20000) ))
 # Results are written straight to persistent OUT_ROOT (not node-local scratch):
 # SLURM_JOB_ID survives --requeue, so after preemption the runner resumes into
 # the same dir and skips the cells that already wrote verdict.json.
@@ -126,5 +130,6 @@ python "${RUNNER}" \
   --ruler-dir "${RULER_LOCAL}" \
   --out-dir "${OUT_ROOT}" \
   --runs-yaml "${RUNS_YAML}" \
-  --tp "${GLM5_TP}"
+  --tp "${GLM5_TP}" \
+  --port "${PORT}"
 echo "[$(date +%T)] done. results in ${OUT_ROOT}"
