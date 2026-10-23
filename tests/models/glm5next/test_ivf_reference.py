@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of the IVF indexer reference, the oracle for the kernel tests."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig
 from vllm.models.glm5next.common.ivf_reference import (
     build_paged_indexer_cache,
     cluster_count,
@@ -21,6 +24,36 @@ from vllm.models.glm5next.common.ivf_reference import (
 TOPK = 64
 C_MAX = 64
 HEADS = 16
+
+
+@pytest.mark.parametrize(
+    "assignment_fp8,probe_fp8",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_fp8_overrides_are_independent(assignment_fp8, probe_fp8):
+    hf = SimpleNamespace(
+        index_topk=2048,
+        index_kpool=4,
+        index_kmeans_assignment_fp8=assignment_fp8,
+        index_kmeans_probe_fp8=probe_fp8,
+    )
+    config = IvfIndexerConfig.from_hf_config(hf, max_model_len=16384)
+    assert config.assignment_fp8 is assignment_fp8
+    assert config.probe_fp8 is probe_fp8
+    default = IvfIndexerConfig.from_hf_config(
+        SimpleNamespace(index_topk=2048, index_kpool=4), max_model_len=16384
+    )
+    assert not default.assignment_fp8 and not default.probe_fp8
+
+
+@pytest.mark.parametrize(
+    "name", ["index_kmeans_assignment_fp8", "index_kmeans_probe_fp8"]
+)
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_fp8_overrides_reject_non_boolean_values(name, value):
+    hf = SimpleNamespace(index_topk=2048, index_kpool=4, **{name: value})
+    with pytest.raises(ValueError, match=name):
+        IvfIndexerConfig.from_hf_config(hf, max_model_len=16384)
 
 
 def _keys(num_keys: int, seed: int = 0, centers: int = 8) -> torch.Tensor:

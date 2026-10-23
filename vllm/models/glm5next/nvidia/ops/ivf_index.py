@@ -140,19 +140,54 @@ def _phase_wait(sync_ptr, target):
 
 
 @triton.jit
-def _nearest_centroid(kb, cf_lo, cf_hi, live_lo, live_hi, HALF: tl.constexpr):
+def _quantize_centroid_rows(cf):
+    """BF16 unit centroids -> E4M3 rows and positive FP32 dequant scales.
+
+    Power-of-two scales keep scaling exact, including at rounding boundaries.
+    Quantize at consumption so warm builds, appends and decode always see the
+    latest BF16 records without changing the paged cache's ABI. Zero/padded
+    rows quantize to zero with a finite scale.
+    """
+    x = cf.to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=1)
+    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, 1e-4) / FP8_MAX)))
+    scaled = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX)
+    return scaled.to(tl.float8e4nv, fp_downcast_rounding="rtne"), scale
+
+
+@triton.jit
+def _nearest_centroid(
+    kb,
+    cf_lo,
+    cf_hi,
+    live_lo,
+    live_hi,
+    scale_lo,
+    scale_hi,
+    HALF: tl.constexpr,
+    ASSIGNMENT_FP8: tl.constexpr,
+):
     """Id of each key's most similar centroid, ties to the lower id.
 
     Scores the centroid halves one at a time to halve the live similarity
     tile. The key norm is a positive per-key factor, so it cannot change the
     argmax and is never computed.
     """
-    s = tl.dot(kb, tl.trans(cf_lo))
+    if ASSIGNMENT_FP8:
+        s = tl.dot(kb, tl.trans(cf_lo), max_num_imprecise_acc=0)
+        # Key scales/norms cancel within a row; centroid scales do not.
+        s = s * scale_lo[None, :]
+    else:
+        s = tl.dot(kb, tl.trans(cf_lo))
     s = tl.where(live_lo[None, :], s, float("-inf"))
     v_lo, i_lo = tl.max(
         s, axis=1, return_indices=True, return_indices_tie_break_left=True
     )
-    s = tl.dot(kb, tl.trans(cf_hi))
+    if ASSIGNMENT_FP8:
+        s = tl.dot(kb, tl.trans(cf_hi), max_num_imprecise_acc=0)
+        s = s * scale_hi[None, :]
+    else:
+        s = tl.dot(kb, tl.trans(cf_hi))
     s = tl.where(live_hi[None, :], s, float("-inf"))
     v_hi, i_hi = tl.max(
         s, axis=1, return_indices=True, return_indices_tie_break_left=True
@@ -208,6 +243,7 @@ def ivf_kmeans_kernel(
     MIN_SEG_TILES: tl.constexpr,
     PAGE: tl.constexpr,
     TILE_PAGES: tl.constexpr,
+    ASSIGNMENT_FP8: tl.constexpr = False,
 ):
     """The whole cosine k-means of every listed request in one launch.
 
@@ -221,7 +257,8 @@ def ivf_kmeans_kernel(
 
     An assign unit is one segment of a request's key pages
     (``_segment_tiles``), TILE_PAGES pages per MMA. It loads the request's bf16
-    centroids once, keeps them on chip, and sums its keys per cluster in
+    centroids once (quantizing on chip if ASSIGNMENT_FP8), keeps them on chip,
+    and sums its keys per cluster in
     registers (one-hot MMA, fp32); the segment's sums are stored once, with no
     atomics. An update unit adds a cluster block's segment sums in segment
     order. Segments depend only on the key count, so the result is independent
@@ -286,6 +323,11 @@ def ivf_kmeans_kernel(
                     )
                     cf_lo = _load_centroids(cen_ptr, rec_lo, live_lo, ".cg")
                     cf_hi = _load_centroids(cen_ptr, rec_hi, live_hi, ".cg")
+                    scale_lo = tl.full([HALF], 1.0, tl.float32)
+                    scale_hi = tl.full([HALF], 1.0, tl.float32)
+                    if ASSIGNMENT_FP8:
+                        cf_lo, scale_lo = _quantize_centroid_rows(cf_lo)
+                        cf_hi, scale_hi = _quantize_centroid_rows(cf_hi)
                     live_c = offs_cp < c_eff
                     rec_all = _rec(
                         cen_bt_ptr, cen_bt_stride, b, offs_cp, cpb, cen_stride, live_c
@@ -302,9 +344,19 @@ def ivf_kmeans_kernel(
                             )
                             kb = _load_keys(
                                 k_u8_ptr, k_page_stride, page, pos, PAGE, mask_t
-                            ).to(tl.bfloat16)
+                            )
+                            if not ASSIGNMENT_FP8:
+                                kb = kb.to(tl.bfloat16)
                             best_c = _nearest_centroid(
-                                kb, cf_lo, cf_hi, live_lo, live_hi, HALF
+                                kb,
+                                cf_lo,
+                                cf_hi,
+                                live_lo,
+                                live_hi,
+                                scale_lo,
+                                scale_hi,
+                                HALF,
+                                ASSIGNMENT_FP8,
                             )
                             hit = (best_c[:, None] == offs_cp[None, :]) & mask_t[
                                 :, None
@@ -361,7 +413,11 @@ def ivf_kmeans_kernel(
                                     k_f32_ptr, k_page_stride, page, pos, PAGE, mask_t
                                 )
                                 onehot = tl.where(hit, k_scale[:, None], 0.0)
-                                acc = tl.dot(tl.trans(onehot.to(tl.bfloat16)), kb, acc)
+                                acc = tl.dot(
+                                    tl.trans(onehot.to(tl.bfloat16)),
+                                    kb.to(tl.bfloat16),
+                                    acc,
+                                )
                         if not final:
                             row = ((s0 + s) * C + offs_cp).to(tl.int64)
                             tl.store(
@@ -501,6 +557,7 @@ def ivf_kmeans_append_kernel(
     C: tl.constexpr,
     C_PAD: tl.constexpr,
     PAGE: tl.constexpr,
+    ASSIGNMENT_FP8: tl.constexpr = False,
 ):
     """One key page of an appending request: the first ``n_prev`` keys keep
     their clusters, the chunk's keys join their nearest current centroid.
@@ -540,9 +597,18 @@ def ivf_kmeans_append_kernel(
         )
         cf_lo = _load_centroids(cen_ptr, rec_lo, live_lo)
         cf_hi = _load_centroids(cen_ptr, rec_hi, live_hi)
+        scale_lo = tl.full([HALF], 1.0, tl.float32)
+        scale_hi = tl.full([HALF], 1.0, tl.float32)
+        if ASSIGNMENT_FP8:
+            cf_lo, scale_lo = _quantize_centroid_rows(cf_lo)
+            cf_hi, scale_hi = _quantize_centroid_rows(cf_hi)
         page = tl.load(k_bt_ptr + b * k_bt_stride + start // PAGE).to(tl.int64)
-        kb = _load_keys(k_u8_ptr, k_page_stride, page, pos, PAGE, new).to(tl.bfloat16)
-        best = _nearest_centroid(kb, cf_lo, cf_hi, live_lo, live_hi, HALF)
+        kb = _load_keys(k_u8_ptr, k_page_stride, page, pos, PAGE, new)
+        if not ASSIGNMENT_FP8:
+            kb = kb.to(tl.bfloat16)
+        best = _nearest_centroid(
+            kb, cf_lo, cf_hi, live_lo, live_hi, scale_lo, scale_hi, HALF, ASSIGNMENT_FP8
+        )
         tl.store(
             cid_ptr + cblk * cid_stride + pos % cid_bs, best.to(tl.int16), mask=new
         )
@@ -561,7 +627,7 @@ def ivf_kmeans_append_kernel(
         # product are exact, as in the full k-means accumulation.
         k_scale = _load_key_scales(k_f32_ptr, k_page_stride, page, pos, PAGE, new)
         onehot = tl.where(hit_new, k_scale[:, None], 0.0).to(tl.bfloat16)
-        acc = tl.dot(tl.trans(onehot), kb)
+        acc = tl.dot(tl.trans(onehot), kb.to(tl.bfloat16))
         row = tl.load(new_tile_first_ptr + i) + (start - n_prev // PAGE * PAGE) // PAGE
         offs_d = tl.arange(0, 128)
         dst = (row * C + offs_cp).to(tl.int64)[:, None] * 128 + offs_d[None, :]
@@ -862,6 +928,7 @@ def ivf_probe_score_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
     IS_DECODE: tl.constexpr,
+    PROBE_FP8: tl.constexpr = False,
 ):
     """Centroid scores and visible key counts of BLOCK_R rows against
     ``c_per_program`` clusters (``program_id(1)``-th share), BLOCK_C at a time.
@@ -870,7 +937,8 @@ def ivf_probe_score_kernel(
     key, sum_h w_h ReLU(q_h . c), over its H fp8 query heads ``q``
     [rows, H, 128] and head weights ``w`` [rows, H] (query scales folded in).
     Rows of one request share the centroid tile (at prefill one TMA load from
-    the build's dense copy); fp8 is exact in bf16, so all
+    the build's dense copy). With PROBE_FP8, quantize them to E4M3 and rescale
+    the FP32 GEMM result before ReLU. Otherwise fp8 is exact in bf16, so all
     ``BLOCK_R * H`` heads, gathered once and head-major (column h * BLOCK_R +
     r), take one ``[BLOCK_C, 128] x [128, BLOCK_R * H]`` bf16 MMA with fp32
     sums per centroid tile. Visible counts: the
@@ -894,7 +962,9 @@ def ivf_probe_score_kernel(
         q_fp8_ptr + heads.to(tl.int64)[None, :] * 128 + offs_d[:, None],
         mask=mask_rh[None, :],
         other=0.0,
-    ).to(tl.bfloat16)
+    )
+    if not PROBE_FP8:
+        q_t = q_t.to(tl.bfloat16)
     w = tl.load(w_ptr + heads, mask=mask_rh, other=0.0)
 
     pending = mask_r
@@ -915,7 +985,15 @@ def ivf_probe_score_kernel(
                 size = tl.load(cen_size_ptr + b * C + offs_c, mask=in_c, other=-1)
                 live = in_c & (size >= 0)
                 cf = cen_desc.load([b * C + c0, 0])
-            per_head = tl.maximum(tl.dot(cf, q_t), 0.0) * w[None, :]
+            if PROBE_FP8:
+                cf_fp8, cf_scale = _quantize_centroid_rows(cf)
+                dots = tl.dot(cf_fp8, q_t, max_num_imprecise_acc=0)
+                dots = dots * cf_scale[:, None]
+            else:
+                dots = tl.dot(cf, q_t)
+            # Query scales are already folded into w. Only undo the new
+            # centroid quantization; keep ReLU and signed-head reduction FP32.
+            per_head = tl.maximum(dots, 0.0) * w[None, :]
             # [BLOCK_C, BLOCK_R], stored as computed.
             score = tl.sum(tl.reshape(per_head, (BLOCK_C, H, BLOCK_R)), axis=1)
             if IS_DECODE:

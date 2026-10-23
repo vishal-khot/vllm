@@ -36,6 +36,7 @@ from vllm.models.glm5next.common.ivf_reference import (  # noqa: E402
     key_scores_reference,
     kmeans_append_reference,
     kmeans_reference,
+    probe_scores_reference,
     quantize_rows_fp8,
     tie_aware_recall,
 )
@@ -49,7 +50,10 @@ from vllm.models.glm5next.nvidia.ivf_sparse_indexer import (  # noqa: E402
     select_ivf_topk,
     sparse_attn_indexer_ivf,
 )
-from vllm.models.glm5next.nvidia.ops.ivf_index import REC_BYTES  # noqa: E402
+from vllm.models.glm5next.nvidia.ops.ivf_index import (  # noqa: E402
+    REC_BYTES,
+    ivf_probe_score_kernel,
+)
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
     expand_pools_and_append_tail,
     kpool_compress_and_write_cache,
@@ -171,9 +175,15 @@ def _queries(num_rows, seed=0) -> Queries:
     return Queries(q.to(torch.float8_e4m3fn).to(DEV), w.to(DEV), q, w)
 
 
-def _cosines(k: torch.Tensor, km: KmeansResult) -> torch.Tensor:
+def _cosines(
+    k: torch.Tensor, km: KmeansResult, assignment_fp8: bool = False
+) -> torch.Tensor:
     """[N, C] cosine of every key to every live centroid (-inf elsewhere)."""
-    sim = k @ km.centroids.T
+    if assignment_fp8:
+        cq, cs = quantize_rows_fp8(km.centroids, True)
+        sim = (k @ cq.T) * cs[None, :]
+    else:
+        sim = k @ km.centroids.T
     sim = sim / k.norm(dim=1, keepdim=True).clamp(min=1e-12)
     sim[:, km.n_clusters :] = float("-inf")
     return sim
@@ -181,9 +191,16 @@ def _cosines(k: torch.Tensor, km: KmeansResult) -> torch.Tensor:
 
 @pytest.mark.parametrize("iters", [0, 5])
 @pytest.mark.parametrize("num_clusters", [C, 20])
-def test_build_matches_reference_and_is_deterministic(iters, num_clusters):
+@pytest.mark.parametrize("assignment_fp8", [False, True])
+def test_build_matches_reference_and_is_deterministic(
+    iters, num_clusters, assignment_fp8
+):
     """Fewer keys than num_clusters (n = 1) clamps the count to n."""
-    setup = Setup(_config(kmeans_iters=iters, num_clusters=num_clusters))
+    setup = Setup(
+        _config(
+            kmeans_iters=iters, num_clusters=num_clusters, assignment_fp8=assignment_fp8
+        )
+    )
     setup.build()
     first = (setup.cid.clone(), setup.cen.clone())
     setup.build()
@@ -198,14 +215,15 @@ def test_build_matches_reference_and_is_deterministic(iters, num_clusters):
             num_clusters=num_clusters,
             iters=iters,
             seed=0,
+            assignment_fp8=assignment_fp8,
         )
         got = setup.kmeans_from_state(b, n)
         assert got.n_clusters == ref.n_clusters == cluster_count(n, num_clusters, C)
         assert int(got.sizes.sum()) == n
         assert torch.equal(got.sizes, torch.bincount(got.cluster_of_pos, minlength=C))
         # Every key sits in its most cosine-similar cluster under the kernel's
-        # own centroids, up to near-ties (bf16 MMA with fp32 sums vs torch).
-        sim = _cosines(k, got)
+        # own (optionally quantized) centroids, up to MMA vs torch near-ties.
+        sim = _cosines(k, got, assignment_fp8)
         chosen = sim.gather(1, got.cluster_of_pos[:, None]).squeeze(1)
         gap = (sim.max(dim=1).values - chosen).max().item()
         assert gap <= 1e-4, (b, gap)
@@ -224,15 +242,16 @@ def test_build_matches_reference_and_is_deterministic(iters, num_clusters):
             # and with more clusters than content modes the trajectories part
             # on near-ties; the clustering quality must still match.
             got_fit = chosen.mean().item()
-            ref_fit = _cosines(k, ref).max(dim=1).values.mean().item()
+            ref_fit = _cosines(k, ref, assignment_fp8).max(dim=1).values.mean().item()
             assert got_fit >= ref_fit - 0.01, (b, got_fit, ref_fit)
 
 
-def test_prefill_chunk_resumes_from_previous_centroids():
+@pytest.mark.parametrize("assignment_fp8", [False, True])
+def test_prefill_chunk_resumes_from_previous_centroids(assignment_fp8):
     """A chunk after the first starts from the request's stored centroids when
     its cluster count is unchanged, else it seeds afresh. With no iterations
     the build is just the final assignment against those centroids."""
-    setup = Setup(_config())
+    setup = Setup(_config(assignment_fp8=assignment_fp8))
     first = [max(n // 2, 1) for n in LENGTHS]
     setup.build(n_keys=first)
     before = [setup.kmeans_from_state(b, n) for b, n in enumerate(first)]
@@ -252,18 +271,19 @@ def test_prefill_chunk_resumes_from_previous_centroids():
                 got.centroids[live], seeded.centroids[live], dim=1
             )
             assert cos.min().item() > 0.999, b
-        sim = _cosines(setup.fp8_vals[b][:n], got)
+        sim = _cosines(setup.fp8_vals[b][:n], got, assignment_fp8)
         chosen = sim.gather(1, got.cluster_of_pos[:, None]).squeeze(1)
         assert (sim.max(dim=1).values - chosen).max().item() <= 1e-4, b
 
 
-def test_prefill_chunk_appends_without_crossing_a_power_of_two():
+@pytest.mark.parametrize("assignment_fp8", [False, True])
+def test_prefill_chunk_appends_without_crossing_a_power_of_two(assignment_fp8):
     """A chunk whose key count stays below the next power of two appends: the
     earlier keys keep their clusters, the chunk's keys join their nearest
     stored centroid, and each centroid absorbs its new members' sum. Covers
     no new keys (n = 1), pages split between old and new keys, and a long
     append; the result is deterministic."""
-    setup = Setup(_config())
+    setup = Setup(_config(assignment_fp8=assignment_fp8))
     first = [1, 65, 2050, 8200]
     setup.build(n_keys=first)
     before = [setup.kmeans_from_state(b, n) for b, n in enumerate(first)]
@@ -279,13 +299,15 @@ def test_prefill_chunk_appends_without_crossing_a_power_of_two():
     for b, n in enumerate(LENGTHS):
         k, k_scale = setup.fp8_vals[b][:n], setup.scales[b][:n]
         got = setup.kmeans_from_state(b, n)
-        ref = kmeans_append_reference(k, k_scale, before[b])
+        ref = kmeans_append_reference(
+            k, k_scale, before[b], assignment_fp8=assignment_fp8
+        )
         assert got.n_clusters == before[b].n_clusters
         assert torch.equal(got.cluster_of_pos[: first[b]], before[b].cluster_of_pos)
         assert torch.equal(got.sizes, torch.bincount(got.cluster_of_pos, minlength=C))
         assert torch.equal(run_size[b].long(), got.sizes), b
         # New keys sit in their nearest pre-append centroid, up to near-ties.
-        sim = _cosines(k[first[b] :], before[b])
+        sim = _cosines(k[first[b] :], before[b], assignment_fp8)
         chosen = sim.gather(1, got.cluster_of_pos[first[b] :, None]).squeeze(1)
         if chosen.numel():
             gap = (sim.max(dim=1).values - chosen).max().item()
@@ -300,12 +322,13 @@ def test_prefill_chunk_appends_without_crossing_a_power_of_two():
         )
 
 
-def test_final_prefill_chunk_reclusters_every_key():
+@pytest.mark.parametrize("assignment_fp8", [False, True])
+def test_final_prefill_chunk_reclusters_every_key(assignment_fp8):
     """A request's final prefill chunk always runs k-means over all its keys
     (warm, from the stored centroids), even where it would otherwise append.
     With no warm iterations that keeps the centroids and moves every key, old
     ones included, to its nearest one."""
-    setup = Setup(_config(kmeans_warm_iters=0))
+    setup = Setup(_config(kmeans_warm_iters=0, assignment_fp8=assignment_fp8))
     first = [1, 65, 2050, 8200]
     setup.build(n_keys=first)
     before = [setup.kmeans_from_state(b, n) for b, n in enumerate(first)]
@@ -322,15 +345,16 @@ def test_final_prefill_chunk_reclusters_every_key():
     for b, n in enumerate(LENGTHS):
         got = setup.kmeans_from_state(b, n)
         assert torch.equal(got.centroids, before[b].centroids), b
-        sim = _cosines(setup.fp8_vals[b][:n], got)
+        sim = _cosines(setup.fp8_vals[b][:n], got, assignment_fp8)
         chosen = sim.gather(1, got.cluster_of_pos[:, None]).squeeze(1)
         assert (sim.max(dim=1).values - chosen).max().item() <= 1e-4, b
 
 
-def test_kmeans_stops_at_a_fixed_point():
+@pytest.mark.parametrize("assignment_fp8", [False, True])
+def test_kmeans_stops_at_a_fixed_point(assignment_fp8):
     """With iterations to spare, k-means stops once an assignment moves no key:
     every centroid is then the normalized mean of its members."""
-    setup = Setup(_config(kmeans_iters=100))
+    setup = Setup(_config(kmeans_iters=100, assignment_fp8=assignment_fp8))
     setup.build()
     for b, n in enumerate(LENGTHS):
         got = setup.kmeans_from_state(b, n)
@@ -341,6 +365,47 @@ def test_kmeans_stops_at_a_fixed_point():
             sums[full], got.centroids[full], dim=1
         )
         assert cos.min().item() > 0.999, (b, cos.min().item())
+
+
+@pytest.mark.parametrize("zero_centroids", [False, True])
+def test_fp8_assignment_restores_centroid_scales_and_breaks_ties(zero_centroids):
+    """Warm assignment must use current records, distinct scales, and lower-id ties."""
+    setup = Setup(
+        _config(
+            kmeans_iters=0,
+            kmeans_warm_iters=0,
+            kmeans_incremental=False,
+            assignment_fp8=True,
+        )
+    )
+    setup.build()
+    cf = torch.eye(128)[:C].clone()
+    cf[1::2] = 1 / (128**0.5)
+    cf[2] = 0
+    cf[C // 2] = cf[0]  # Equal scores across the two centroid halves.
+    if zero_centroids:
+        cf.zero_()
+    cf = cf.to(torch.bfloat16)
+    table = setup.cen_bt.cpu()
+    for b, n in enumerate(LENGTHS):
+        for c in range(min(n, C)):
+            setup.cen[table[b, c // CPB], c % CPB, :256].copy_(
+                cf[c].view(torch.uint8).to(DEV)
+            )
+    # No iterations: no update can hide a bad scale or stale quantized copy.
+    setup.build(n_prev=LENGTHS)
+    for b, n in enumerate(LENGTHS):
+        got = setup.kmeans_from_state(b, n)
+        torch.testing.assert_close(
+            got.centroids[: got.n_clusters],
+            cf[: got.n_clusters].float(),
+            rtol=0,
+            atol=0,
+        )
+        sim = _cosines(setup.fp8_vals[b][:n], got, assignment_fp8=True)
+        assert torch.equal(got.cluster_of_pos, sim.argmax(1))
+        if zero_centroids:
+            assert torch.all(got.cluster_of_pos == 0)
 
 
 @pytest.mark.parametrize("sms", [1, 4096])
@@ -489,13 +554,92 @@ def _reference(setup, b, t, qb: Queries, r, n, decode):
         num_probes=setup.config.num_probes,
         decode=decode,
         scores_all=scores,
+        probe_fp8=setup.config.probe_fp8,
     )
     return ref, scores
 
 
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("heads", [16, 64])
+def test_fp8_probe_scores_match_scaled_reference(decode, heads):
+    """Check actual scores (not just ranks), signed weights and padded row tiles."""
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    setup = Setup(_config(num_clusters=20, kmeans_iters=0, probe_fp8=True))
+    layout = setup.build()
+    # Interleave requests in each tile; nine rows leave a partial last tile.
+    batch = [3, 0, 1, 2, 3, 1, 2, 0, 3]
+    positions = [LENGTHS[b] - 1 for b in batch]
+    positions[-1] = -1  # Padded CUDA-graph row: no visible candidates.
+    rows = len(batch)
+    g = torch.Generator().manual_seed(91)
+    q, qs = quantize_rows_fp8(torch.randn(rows, heads, 128, generator=g), True)
+    w = torch.randn(rows, heads, generator=g) * qs
+    # Distinct scales, zero rows, and negative entries in the centroid operands.
+    cf = torch.eye(128)[:C].clone()
+    cf[1::2] = -1 / (128**0.5)
+    cf[2] = 0
+    cf = cf.to(torch.bfloat16)
+    table = setup.cen_bt.cpu()
+    for b, n in enumerate(LENGTHS):
+        for c in range(min(n, 20)):
+            setup.cen[table[b, c // CPB], c % CPB, :256].copy_(
+                cf[c].view(torch.uint8).to(DEV)
+            )
+        layout.cen_dense[b * C : (b + 1) * C].copy_(
+            torch.where(torch.arange(C)[:, None] < min(n, 20), cf, 0).to(DEV)
+        )
+    score = torch.full((rows, C), float("nan"), device=DEV)
+    visible = torch.full((rows, C), -99, dtype=torch.int32, device=DEV)
+    block_r = min(8, 256 // heads)
+    desc = TensorDescriptor.from_tensor(layout.cen_dense, [C, 128])
+    compiled = ivf_probe_score_kernel[((rows + block_r - 1) // block_r, 1)](
+        q.to(torch.float8_e4m3fn).to(DEV),
+        w.to(DEV),
+        torch.tensor(batch, dtype=torch.int32, device=DEV),
+        torch.tensor(positions, dtype=torch.int32, device=DEV),
+        *setup.state.cen_args(),
+        layout.run_start,
+        layout.run_pos,
+        layout.run_size,
+        None if decode else desc,
+        layout.cen_size,
+        score,
+        visible,
+        rows,
+        C,
+        C=C,
+        H=heads,
+        BLOCK_R=block_r,
+        BLOCK_C=C,
+        IS_DECODE=decode,
+        PROBE_FP8=True,
+        num_warps=4,
+    )
+    # Check the native FP8 instruction on Hopper; newer GPUs use other mnemonics.
+    if current_platform.get_device_capability().major == 9:
+        assert any(
+            ("mma.sync" in line or "wgmma.mma_async" in line) and ".e4m3.e4m3" in line
+            for line in compiled.asm["ptx"].splitlines()
+        )
+    got, vis = score.cpu(), visible.cpu()
+    for r, b in enumerate(batch):
+        km = setup.kmeans_from_state(b, LENGTHS[b])
+        expected = probe_scores_reference(q[r], w[r], km.centroids, probe_fp8=True)
+        cq, cs = quantize_rows_fp8(km.centroids, True)
+        bound = (torch.relu(cq @ q[r].T) * w[r].abs()).sum(1) * cs
+        assert torch.isfinite(got[r]).all()
+        assert torch.all((got[r] - expected).abs() <= 2e-4 * bound + 1e-6)
+        assert torch.all(vis[r, km.n_clusters :] == -1)
+    assert torch.all(vis[-1, :20] == 0)
+
+
 @pytest.mark.parametrize("num_probes", [5, 16])
 @pytest.mark.parametrize("num_clusters", [C, 20])
-def test_prefill_select_matches_reference(num_probes, num_clusters, monkeypatch):
+@pytest.mark.parametrize("probe_fp8", [False, True])
+def test_prefill_select_matches_reference(
+    num_probes, num_clusters, probe_fp8, monkeypatch
+):
     """Fixed P probes, every visible key of them a candidate (no cap), top-k by
     the DSA score: the candidate count and the selection match the reference."""
     counts = []
@@ -506,7 +650,9 @@ def test_prefill_select_matches_reference(num_probes, num_clusters, monkeypatch)
         real(**kw)
 
     monkeypatch.setattr(ivf_sparse_indexer, "_topk_and_emit", spy)
-    setup = Setup(_config(num_probes=num_probes, num_clusters=num_clusters))
+    setup = Setup(
+        _config(num_probes=num_probes, num_clusters=num_clusters, probe_fp8=probe_fp8)
+    )
     layout = setup.build()
     out, row_batch, query_pos, qb = _run_prefill_select(setup, layout, 6)
     counts = torch.cat(counts)
@@ -786,8 +932,9 @@ def _decode_step(setup, seq_lens, qb: Queries):
     return out
 
 
-def test_decode_matches_reference():
-    setup = Setup(_config(), extra_decode_key=True)
+@pytest.mark.parametrize("probe_fp8", [False, True])
+def test_decode_matches_reference(probe_fp8):
+    setup = Setup(_config(probe_fp8=probe_fp8), extra_decode_key=True)
     setup.build()
     before = [setup.kmeans_from_state(b, n) for b, n in enumerate(LENGTHS)]
     seq_lens = torch.tensor([n + 1 for n in LENGTHS], dtype=torch.int32, device=DEV)
@@ -808,10 +955,11 @@ def test_decode_matches_reference():
         assert tie_aware_recall(got, ref.selected, scores) > 0.999
 
 
-def test_decode_first_key_seeds_one_cluster():
+@pytest.mark.parametrize("probe_fp8", [False, True])
+def test_decode_first_key_seeds_one_cluster(probe_fp8):
     """A one-token prompt decodes against garbage state: it must get one
     cluster holding its own key, and select exactly position 0."""
-    setup = Setup(_config())
+    setup = Setup(_config(probe_fp8=probe_fp8))
     seq_lens = torch.ones(len(LENGTHS), dtype=torch.int32, device=DEV)
     out = _decode_step(setup, seq_lens, _queries(len(LENGTHS), seed=3)).cpu()
     for b in range(len(LENGTHS)):
@@ -821,8 +969,9 @@ def test_decode_first_key_seeds_one_cluster():
         assert out[b][out[b] >= 0].tolist() == [0]
 
 
-def test_decode_cuda_graph_matches_eager():
-    setup = Setup(_config(), extra_decode_key=True)
+@pytest.mark.parametrize("probe_fp8", [False, True])
+def test_decode_cuda_graph_matches_eager(probe_fp8):
+    setup = Setup(_config(probe_fp8=probe_fp8), extra_decode_key=True)
     setup.build()
     snapshot = (setup.cid.clone(), setup.cen.clone())
     seq_lens = torch.tensor([n + 1 for n in LENGTHS], dtype=torch.int32, device=DEV)
@@ -1035,12 +1184,19 @@ def test_page_table_counts_cache_pages():
 
 
 @pytest.mark.parametrize("num_probes", [C, 4])
-def test_pooled_prefill_and_decode(monkeypatch, num_probes):
+@pytest.mark.parametrize(
+    "assignment_fp8,probe_fp8",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_pooled_prefill_and_decode(monkeypatch, num_probes, assignment_fp8, probe_fp8):
     """IVF on the kpool indexer's pools: stock-written pools are what the IVF
     key view reads; probing every cluster gives the exact top pools; rows
     seeing at most top-k pools keep them all; every row keeps its tail; decode
     appends a pool exactly when it completes."""
     setup = PooledSetup(num_probes)
+    setup.config = dataclasses.replace(
+        setup.config, assignment_fp8=assignment_fp8, probe_fp8=probe_fp8
+    )
     rows = len(POOLED_LENGTHS)
     total = sum(POOLED_LENGTHS)
     qb = _queries(total, seed=5)

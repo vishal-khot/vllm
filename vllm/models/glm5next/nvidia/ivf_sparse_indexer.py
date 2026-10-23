@@ -30,13 +30,13 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import get_indexer_topk
-from vllm.models.glm5next.nvidia import ivf_fidelity
 from vllm.models.glm5next.common.ivf_backend import (
     IvfIndexerMetadata,
     IvfStateMetadata,
 )
 from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig
 from vllm.models.glm5next.common.sparse_indexer import RADIX_TOPK_WORKSPACE_SIZE
+from vllm.models.glm5next.nvidia import ivf_fidelity
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.nvidia.ops.ivf_index import (
     REC_BYTES,
@@ -437,6 +437,7 @@ def build_ivf_index(
             MIN_SEG_TILES=tune.kmeans_min_segment_tiles,
             PAGE=page,
             TILE_PAGES=tile_pages,
+            ASSIGNMENT_FP8=config.assignment_fp8,
             num_warps=tune.kmeans_num_warps,
         )
     if num_full < num_items:
@@ -467,6 +468,7 @@ def build_ivf_index(
             C=C,
             C_PAD=C_PAD,
             PAGE=page,
+            ASSIGNMENT_FP8=config.assignment_fp8,
             num_warps=tune.kmeans_num_warps,
         )
         nb = triton.cdiv(C, tune.kmeans_update_block)
@@ -682,6 +684,7 @@ def select_ivf_topk(
         BLOCK_R=tune.probe_rows,
         BLOCK_C=tune.centroid_block,
         IS_DECODE=is_decode,
+        PROBE_FP8=config.probe_fp8,
         num_warps=tune.probe_num_warps,
     )
     ivf_probe_select_kernel[(num_rows,)](
@@ -1295,8 +1298,12 @@ def sparse_attn_indexer_ivf(
                 score_sum_out=exact_mass,
             )
             ivf_fidelity.record(
-                k_cache_prefix, "decode", pools, exact_pools,
-                real_mass, exact_mass,
+                k_cache_prefix,
+                "decode",
+                pools,
+                exact_pools,
+                real_mass,
+                exact_mass,
             )
 
     if meta.num_prefills > 0:
@@ -1365,9 +1372,12 @@ def sparse_attn_indexer_ivf(
                     score_sum_out=exact_mass,
                 )
                 ivf_fidelity.record(
-                    k_cache_prefix, "prefill",
-                    topk_indices_buffer[start:end], exact_out,
-                    real_mass, exact_mass,
+                    k_cache_prefix,
+                    "prefill",
+                    topk_indices_buffer[start:end],
+                    exact_out,
+                    real_mass,
+                    exact_mass,
                 )
         else:
             pools = torch.full(
