@@ -9,7 +9,6 @@ serve and its own ``VLLM_DSA_IVF_LOST_ATTENTION_DIR`` so the per-(layer, phase)
 recall/mass stats are isolated per bucket rather than blended across lengths
 (the recorder accumulates globally within a process).
 
-This is the Slurm counterpart of ``smoke_single.py`` (which only runs on Modal).
 It assumes the model and the RULER jsonl are already staged on local disk and a
 working vLLM+fork env is active; ``_run_body.sh`` does that staging.
 
