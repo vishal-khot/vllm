@@ -23,6 +23,7 @@ and a top-level ``<out>/summary.json`` over all cells.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import glob
 import json
 import os
@@ -189,13 +190,26 @@ def _summarize_lost(lost_dir: str) -> dict:
     }
 
 
-def _run_task(port: int, task: str, rows: list, request_timeout: float) -> list:
-    """Stream ``task``'s samples through the live serve; return per-sample recs."""
+def _run_task(
+    port: int, task: str, rows: list, request_timeout: float,
+    concurrency: int = 1,
+) -> list:
+    """Stream ``task``'s samples through the live serve; return per-sample recs.
+
+    With ``concurrency`` > 1 the samples are issued through a thread pool so the
+    server's continuous batching runs them together. This is metric-neutral:
+    recall is per-request and the per-(layer, phase) key/mass_lost stats are
+    aggregated per row, so batch composition does not change them. Every sample
+    here shares one task, hence identical length and clusters/probes. It does
+    blur the per-request ``prefill_ms``/``decode_ms`` (requests share a step);
+    the authoritative latency/timing come from the A/B matrix, not this sweep.
+    """
     max_tokens = TASKS[task]["max_tokens"]
-    samples = []
-    for ex in rows:
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+    def _one(ex: dict) -> dict:
         ttft, dec_s, text, usage = _post_stream(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
+            url,
             {
                 "model": "glm",
                 "messages": [{"role": "user", "content": ex["input"]}],
@@ -204,17 +218,20 @@ def _run_task(port: int, task: str, rows: list, request_timeout: float) -> list:
             },
             timeout=request_timeout,
         )
-        otk = usage.get("completion_tokens")
-        samples.append({
+        return {
             "idx": ex["index"],
             "gold": ex["outputs"],
             "recall": recall(ex["outputs"], text),
             "prefill_ms": round(ttft * 1000, 1),
             "decode_ms": round(dec_s * 1000, 1),
             "in_tok": usage.get("prompt_tokens"),
-            "out_tok": otk,
-        })
-    return samples
+            "out_tok": usage.get("completion_tokens"),
+        }
+
+    if concurrency <= 1:
+        return [_one(ex) for ex in rows]
+    with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(_one, rows))
 
 
 def run_cell(
@@ -264,7 +281,9 @@ def run_cell(
             rows = [json.loads(line) for line in open(jsonl)][:cap]
             if not rows:
                 raise RuntimeError(f"no samples in {jsonl}")
-            samples = _run_task(args.port, task, rows, args.request_timeout)
+            samples = _run_task(
+                args.port, task, rows, args.request_timeout, args.concurrency
+            )
             rmean = sum(s["recall"] for s in samples) / len(samples)
             per_task[task] = {"recall_mean": rmean, "samples": samples}
             print(f"[{tag}] {task:16s} recall_mean={rmean:.3f} n={len(samples)}",
@@ -330,6 +349,10 @@ def main() -> None:
                    help="source of the explicit ivf sweep.cells grid")
     p.add_argument("--task", help="restrict to one task (default: all ruler tasks)")
     p.add_argument("--n", type=int, help="override samples per task per cell")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="requests in flight per task (ThreadPool); the server "
+                        "batches them. >1 speeds the sweep and leaves recall and "
+                        "key/mass_lost unchanged, but blurs per-request latency.")
     p.add_argument("--lengths", help="comma list to restrict to a subset of cells")
     p.add_argument("--force", action="store_true",
                    help="re-run every cell even if its verdict.json exists "
@@ -354,6 +377,7 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"==== IVF lost-attention: tasks={len(tasks)} n={n} tp={args.tp} "
+          f"concurrency={args.concurrency} "
           f"cells={sum(len(c['probes']) for c in grid)} (from {args.runs_yaml}) ====",
           flush=True)
 

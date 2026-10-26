@@ -126,16 +126,56 @@ def _one_request(port: int, meta: dict, request_timeout: float) -> dict:
     }
 
 
+def _run_block(
+    port: int, metas: list, request_timeout: float, concurrency: int,
+    block_path: str, force: bool = False,
+) -> tuple[list, bool]:
+    """Run one (length, task) block and checkpoint its results to disk.
+
+    Returns ``(results, cached)``. If ``block_path`` already holds a complete
+    block and ``force`` is False, it is loaded and no requests are issued, so a
+    requeued run skips blocks a previous attempt finished. The write is atomic
+    (tmp + rename) so a preemption mid-write leaves the old block intact.
+    """
+    if not force and os.path.exists(block_path):
+        try:
+            with open(block_path) as f:
+                cached = json.load(f)
+            if len(cached) == len(metas):
+                return cached, True
+        except Exception:
+            pass  # truncated/unreadable -> re-run the block
+    if concurrency <= 1:
+        res = [_one_request(port, m, request_timeout) for m in metas]
+    else:
+        with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            res = list(pool.map(
+                lambda m: _one_request(port, m, request_timeout), metas))
+    tmp = block_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(res, f)
+    os.replace(tmp, block_path)
+    return res, False
+
+
 def run_one(run, args) -> dict:
     """Serve one run, run its datasets, store results under its own id."""
     base_out = os.path.abspath(os.path.join(args.out_dir, run.id))
-    # Drop any partial dir from a preempted attempt so stale instrument dumps
-    # (globbed by the summarizers) don't bleed into this run's numbers.
-    if os.path.isdir(base_out):
+    partial_dir = os.path.join(base_out, "partial")
+    # Resume a preempted eager run from its per-block checkpoints: keep partial/
+    # if it exists (and not --force), else start clean. The per-rank instrument
+    # dumps (timing/, lost_attention/) are always cleared so a prior attempt's
+    # dumps don't blend into this one -- they are re-measured over whatever
+    # blocks this attempt actually serves.
+    resuming = os.path.isdir(partial_dir) and not args.force
+    if os.path.isdir(base_out) and not resuming:
         shutil.rmtree(base_out)
     timing_dir = os.path.join(base_out, "timing")
     lost_dir = os.path.join(base_out, "lost_attention")
-    for d in (base_out, timing_dir, lost_dir):
+    for d in (timing_dir, lost_dir):
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+    for d in (base_out, timing_dir, lost_dir, partial_dir):
         os.makedirs(d, exist_ok=True)
 
     # A local model path must survive the server's cwd change.
@@ -165,26 +205,46 @@ def run_one(run, args) -> dict:
             # Eager runs are the instrumented accuracy/fidelity points: every
             # sample. Graph runs are throughput/latency: a per-task cap is fine.
             cap = None if run.eager else (ds.n or 1)
-            metas = []
-            for length in ds.lengths:
-                for task in ds.tasks:
-                    path = os.path.join(
-                        args.ruler_dir, task, f"validation_{length}.jsonl")
-                    if not os.path.exists(path):
-                        raise SystemExit(f"missing ruler data: {path}")
-                    rows = [json.loads(line) for line in open(path)][:cap]
-                    for ex in rows:
-                        metas.append({
-                            "task": task, "L": length, "idx": ex["index"],
-                            "gold": ex["outputs"], "input": ex["input"],
-                        })
+
+            def _metas(length, task):
+                path = os.path.join(
+                    args.ruler_dir, task, f"validation_{length}.jsonl")
+                if not os.path.exists(path):
+                    raise SystemExit(f"missing ruler data: {path}")
+                rows = [json.loads(line) for line in open(path)][:cap]
+                return [{"task": task, "L": length, "idx": ex["index"],
+                         "gold": ex["outputs"], "input": ex["input"]}
+                        for ex in rows]
 
             wall0 = time.time()
             if run.concurrency <= 1:
-                results = [
-                    _one_request(args.port, m, args.request_timeout) for m in metas
-                ]
+                # Checkpoint per (length, task) block so a preemption keeps the
+                # blocks already done; a requeue re-runs only the missing ones.
+                # This is what lets the long eager base runs survive lowprio's
+                # ~hourly preemption, which the per-run-only resume could not.
+                ds_partial = os.path.join(partial_dir, ds.name)
+                os.makedirs(ds_partial, exist_ok=True)
+                results = []
+                ran_any = False
+                blocks = [(l, t) for l in ds.lengths for t in ds.tasks]
+                for i, (length, task) in enumerate(blocks):
+                    metas = _metas(length, task)
+                    bpath = os.path.join(ds_partial, f"L{length}__{task}.json")
+                    # Re-run the final block fresh even if cached, so the serve
+                    # always processes >=1 block and this attempt's instrument /
+                    # lost-attention dumps are non-empty.
+                    force_block = (i == len(blocks) - 1) and not ran_any
+                    block, cached = _run_block(
+                        args.port, metas, args.request_timeout,
+                        run.concurrency, bpath, force=force_block)
+                    ran_any = ran_any or not cached
+                    results.extend(block)
+                    print(f"[{run.id}] block L{length} {task}: "
+                          f"{'cached' if cached else 'ran'} ({len(block)})",
+                          flush=True)
             else:
+                metas = [m for length in ds.lengths for task in ds.tasks
+                         for m in _metas(length, task)]
                 with cf.ThreadPoolExecutor(max_workers=run.concurrency) as pool:
                     results = list(pool.map(
                         lambda m: _one_request(args.port, m, args.request_timeout),
