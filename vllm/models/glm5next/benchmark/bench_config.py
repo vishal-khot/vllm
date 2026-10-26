@@ -52,7 +52,7 @@ _REQUIRED_RUN_FIELDS = (
 )
 
 # Optional run fields a sweep may inject (not required on the base cases).
-_OPTIONAL_RUN_FIELDS = ("length", "max_model_len")
+_OPTIONAL_RUN_FIELDS = ("length", "lengths", "max_model_len")
 
 
 @dataclass(frozen=True)
@@ -236,13 +236,21 @@ def _resolve_run(
     else:
         max_model_len = int(fairness["max_model_len"])
 
+    # `lengths` replaces the ruler lengths for this run only (one serve over
+    # several lengths, unlike a pinned `length`).
+    lengths = raw.get("lengths")
+    if lengths is not None and length is not None:
+        raise ConfigError(f"run {rid!r}: set `length` or `lengths`, not both")
+    if length is not None:
+        lengths = [length]
+
     resolved_ds = []
     for name in raw["datasets"]:
         if name not in datasets:
             raise ConfigError(f"run {rid!r}: unknown dataset {name!r}")
         ds = datasets[name]
-        if length is not None and ds.name == "ruler":
-            ds = replace(ds, lengths=[length])
+        if lengths is not None and ds.name == "ruler":
+            ds = replace(ds, lengths=[int(x) for x in lengths])
         resolved_ds.append(ds)
 
     return Run(

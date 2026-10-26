@@ -86,6 +86,12 @@ runs:
           - {length: 65536,  concurrency: [1, 4, 16, 64]}
           - {length: 131072, concurrency: [1, 4, 16]}
 
+  - id: stock_ruler           # stock vLLM v0.32.0 alone: RULER 4k-128k
+    <<: *default
+    indexer: kpool
+    lengths: [4096, 8192, 16384, 32768, 65536, 131072]
+    max_model_len: 135168     # 128k prompt + 2048 generated + chat template
+
   - id: ivf                   # with k-means (base operating point)
     <<: *default
     indexer: ivf
