@@ -23,6 +23,7 @@ and a top-level ``<out>/summary.json`` over all cells.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import glob
 import json
 import os
@@ -189,32 +190,53 @@ def _summarize_lost(lost_dir: str) -> dict:
     }
 
 
-def _run_task(port: int, task: str, rows: list, request_timeout: float) -> list:
-    """Stream ``task``'s samples through the live serve; return per-sample recs."""
-    max_tokens = TASKS[task]["max_tokens"]
-    samples = []
-    for ex in rows:
+def _run_task(
+    port: int, task: str, rows: list, request_timeout: float,
+    concurrency: int, max_tokens: int, seed: int | None, greedy: bool,
+) -> list:
+    """Stream ``task``'s samples through the live serve; return per-sample recs.
+
+    ``max_tokens``, ``seed`` and ``greedy`` come from the ``fairness`` block of
+    ``runs.yaml`` (the single source of truth both benchmark arms share), not
+    from the per-task caps in ``tasks.py``, so the fidelity sweep uses the same
+    generation budget and decoding settings as the A/B matrix.
+
+    With ``concurrency`` > 1 the samples are issued through a thread pool so the
+    server's continuous batching runs them together. This is metric-neutral:
+    recall is per-request and the per-(layer, phase) key/mass_lost stats are
+    aggregated per row, so batch composition does not change them. Every sample
+    here shares one task, hence identical length and clusters/probes. It does
+    blur the per-request ``prefill_ms``/``decode_ms`` (requests share a step);
+    the authoritative latency/timing come from the A/B matrix, not this sweep.
+    """
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+    def _one(ex: dict) -> dict:
+        body = {
+            "model": "glm",
+            "messages": [{"role": "user", "content": ex["input"]}],
+            "max_tokens": max_tokens,
+            "temperature": 0 if greedy else 1.0,
+        }
+        if seed is not None:
+            body["seed"] = seed
         ttft, dec_s, text, usage = _post_stream(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            {
-                "model": "glm",
-                "messages": [{"role": "user", "content": ex["input"]}],
-                "max_tokens": max_tokens,
-                "temperature": 0,
-            },
-            timeout=request_timeout,
+            url, body, timeout=request_timeout,
         )
-        otk = usage.get("completion_tokens")
-        samples.append({
+        return {
             "idx": ex["index"],
             "gold": ex["outputs"],
             "recall": recall(ex["outputs"], text),
             "prefill_ms": round(ttft * 1000, 1),
             "decode_ms": round(dec_s * 1000, 1),
             "in_tok": usage.get("prompt_tokens"),
-            "out_tok": otk,
-        })
-    return samples
+            "out_tok": usage.get("completion_tokens"),
+        }
+
+    if concurrency <= 1:
+        return [_one(ex) for ex in rows]
+    with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(_one, rows))
 
 
 def run_cell(
@@ -239,7 +261,7 @@ def run_cell(
     os.makedirs(lost_dir, exist_ok=True)
     os.makedirs(timing_dir, exist_ok=True)
 
-    max_len = length + max(TASKS[t]["max_tokens"] for t in tasks) + _LEN_MARGIN
+    max_len = length + args.max_tokens + _LEN_MARGIN
     cmd = _serve(
         args.model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
     )
@@ -257,7 +279,10 @@ def run_cell(
             rows = [json.loads(line) for line in open(jsonl)][:cap]
             if not rows:
                 raise RuntimeError(f"no samples in {jsonl}")
-            samples = _run_task(args.port, task, rows, args.request_timeout)
+            samples = _run_task(
+                args.port, task, rows, args.request_timeout, args.concurrency,
+                args.max_tokens, args.seed, args.greedy,
+            )
             rmean = sum(s["recall"] for s in samples) / len(samples)
             per_task[task] = {"recall_mean": rmean, "samples": samples}
             print(f"[{tag}] {task:16s} recall_mean={rmean:.3f} n={len(samples)}",
@@ -312,6 +337,18 @@ def _load_sweep(path: str) -> dict:
     return {"n": n, "tasks": list(tasks), "grid": cells["grid"]}
 
 
+def _load_fairness(path: str) -> dict:
+    """Read the shared ``fairness`` block from runs.yaml.
+
+    These request-level knobs (generation budget, seed, decoding) are the same
+    for both benchmark arms, so the fidelity sweep derives them here instead of
+    hardcoding them or reading the per-task caps in ``tasks.py``.
+    """
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("fairness", {}) or {}
+
+
 def main() -> None:
     default_yaml = os.path.join(BENCH_DIR, "runs.yaml")
     p = argparse.ArgumentParser(description=__doc__)
@@ -323,6 +360,13 @@ def main() -> None:
                    help="source of the explicit ivf sweep.cells grid")
     p.add_argument("--task", help="restrict to one task (default: all ruler tasks)")
     p.add_argument("--n", type=int, help="override samples per task per cell")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="generation cap per request; default from runs.yaml "
+                        "fairness.max_tokens (overrides tasks.py per-task caps)")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="requests in flight per task (ThreadPool); the server "
+                        "batches them. >1 speeds the sweep and leaves recall and "
+                        "key/mass_lost unchanged, but blurs per-request latency.")
     p.add_argument("--lengths", help="comma list to restrict to a subset of cells")
     p.add_argument("--force", action="store_true",
                    help="re-run every cell even if its verdict.json exists "
@@ -335,6 +379,12 @@ def main() -> None:
     args = p.parse_args()
 
     sweep = _load_sweep(args.runs_yaml)
+    fairness = _load_fairness(args.runs_yaml)
+    if args.max_tokens is None:
+        args.max_tokens = int(fairness.get("max_tokens", 2048))
+    seed = fairness.get("seed")
+    args.seed = int(seed) if seed is not None else None
+    args.greedy = bool(fairness.get("greedy", True))
     tasks = [args.task] if args.task else sweep["tasks"]
     n = args.n or sweep["n"]
     bad = [t for t in tasks if t not in TASKS]
@@ -347,6 +397,8 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"==== IVF lost-attention: tasks={len(tasks)} n={n} tp={args.tp} "
+          f"concurrency={args.concurrency} max_tokens={args.max_tokens} "
+          f"seed={args.seed} greedy={args.greedy} "
           f"cells={sum(len(c['probes']) for c in grid)} (from {args.runs_yaml}) ====",
           flush=True)
 
