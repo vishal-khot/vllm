@@ -56,6 +56,17 @@ export PATH="${HOME}/.local/bin:${PATH}"   # uv installs here
 export HF_HOME="${HF_HOME:-${NODE_SCRATCH}/hf}"   # keep a caller-set HF_HOME
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
+# The fp8 DeepGEMM path (TensorRT-LLM) JIT-compiles gemm_swapAB with nvcc at
+# request time. Compute nodes ship the CUDA toolkit but not on PATH, so nvcc is
+# "not found" -> empty cubin -> runtime assertion. Put it on PATH.
+if [ -z "${CUDA_HOME:-}" ]; then
+  for c in /usr/local/cuda /usr/local/cuda-13.* /usr/local/cuda-13 /usr/local/cuda-12.*; do
+    [ -x "${c}/bin/nvcc" ] && { export CUDA_HOME="${c}"; break; }
+  done
+fi
+[ -n "${CUDA_HOME:-}" ] && export PATH="${CUDA_HOME}/bin:${PATH}"
+command -v nvcc >/dev/null && echo "[$(date +%T)] nvcc: $(command -v nvcc)" || echo "[$(date +%T)] WARNING: nvcc not found (fp8 DeepGEMM will fail)"
+
 # ---- 1. vLLM + fork venv (built once; .venv lives in the persistent repo) ----
 if ! "${VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
   echo "[$(date +%T)] building vLLM venv (VLLM_USE_PRECOMPILED) ..."
@@ -131,5 +142,8 @@ python "${RUNNER}" \
   --out-dir "${OUT_ROOT}" \
   --runs-yaml "${RUNS_YAML}" \
   --tp "${GLM5_TP}" \
-  --port "${PORT}"
+  --port "${PORT}" \
+  --concurrency "${GLM5_CONCURRENCY:-1}" \
+  ${GLM5_N:+--n "${GLM5_N}"} \
+  ${GLM5_LENGTHS:+--lengths "${GLM5_LENGTHS}"}
 echo "[$(date +%T)] done. results in ${OUT_ROOT}"
