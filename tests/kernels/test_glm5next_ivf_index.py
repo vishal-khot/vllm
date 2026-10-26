@@ -21,8 +21,8 @@ pytestmark = [
 ]
 
 from vllm.models.glm5next.common.ivf_backend import (  # noqa: E402
+    Glm5NextIvfIndexerBackend,
     IvfIndexerMetadata,
-    IvfIndexerMetadataBuilder,
     IvfStateMetadata,
 )
 from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig  # noqa: E402
@@ -53,6 +53,9 @@ from vllm.models.glm5next.nvidia.ops.ivf_index import REC_BYTES  # noqa: E402
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
     expand_pools_and_append_tail,
     kpool_compress_and_write_cache,
+)
+from vllm.v1.attention.backends.mla.indexer import (  # noqa: E402
+    Glm5NextIndexerBackend,
 )
 
 DEV = "cuda"
@@ -1018,24 +1021,13 @@ def _check_row(got, t, scores, recall=True):
             assert tie_aware_recall(selected, exact, scores) > 0.999
 
 
-def test_page_table_counts_cache_pages():
-    """The group's block table counts kernel blocks (64 tokens), smaller than
-    the pooled cache's pages (128 tokens = 32 pools); IVF reads and writes
-    through the page table, as the kpool indexer does."""
-    pages = torch.tensor([[7, 2, 5], [0, 9, 4]], dtype=torch.int32, device=DEV)
-    kernel_blocks = torch.stack([2 * pages, 2 * pages + 1], dim=2).flatten(1)
-    builder = SimpleNamespace(
-        kv_cache_spec=SimpleNamespace(block_size=128),
-        kernel_block_size=64,
-        page_table_buffer=None,
-        max_num_seqs=4,
-    )
-    cam = SimpleNamespace(block_table_tensor=kernel_blocks)
-    got = IvfIndexerMetadataBuilder._page_table(builder, cam)
-    assert torch.equal(got, pages)
-    # A persistent buffer: decode CUDA graphs keep its address.
-    again = IvfIndexerMetadataBuilder._page_table(builder, cam)
-    assert again.data_ptr() == got.data_ptr()
+def test_key_cache_pages_match_kpool_indexer():
+    """IVF reads the kpool indexer's pooled cache through the group's block
+    table, so its kernel blocks (the cache's pages) must be stock's."""
+    spec = SimpleNamespace(tokens_per_state=KPOOL)
+    assert Glm5NextIvfIndexerBackend.get_supported_kernel_block_sizes(
+        spec
+    ) == Glm5NextIndexerBackend.get_supported_kernel_block_sizes(spec)
 
 
 @pytest.mark.parametrize(("num_probes", "exact_pools"), [(C, 0), (4, 0), (4, 512)])

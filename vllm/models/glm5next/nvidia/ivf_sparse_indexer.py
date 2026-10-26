@@ -61,7 +61,7 @@ from vllm.models.glm5next.nvidia.ops.ivf_index import (
 )
 from vllm.models.glm5next.nvidia.sparse_indexer import _kpool_compress_insert
 from vllm.triton_utils import triton
-from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.deep_gemm import get_paged_mqa_page_sizes
 from vllm.v1.worker.workspace import current_workspace_manager
 
 
@@ -1118,7 +1118,7 @@ def _reserve_profile_memory(config: IvfIndexerConfig, device: torch.device) -> N
     # Run layout of one maximal context: packed keys, scales, positions and
     # cluster ids (144 B/key), the per-tile count/offset tables and the
     # k-means segment sums. A tile is a kernel page, at least the smallest one.
-    min_page = min(PAGED_MQA_PAGE_SIZES)
+    min_page = min(get_paged_mqa_page_sizes())
     tiles = triton.cdiv(max_len, min_page)
     segs = triton.cdiv(tiles, TUNING.kmeans_min_segment_tiles)
     build_bytes += max_len * 144 + tiles * C * 8 + segs * C * 128 * 4

@@ -21,7 +21,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerBackend,
+    Glm5NextIndexerBackend,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
@@ -76,36 +79,6 @@ class IvfIndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int64,
             device=device,
         )
-        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self.page_table_buffer: torch.Tensor | None = None
-
-    def _page_table(self, cam: CommonAttentionMetadata) -> torch.Tensor:
-        """The block table in the cache's page units, as the kpool indexer
-        builder derives it: the group's table counts kernel blocks, smaller
-        than the pooled cache's storage pages. A persistent buffer, so decode
-        CUDA graphs keep its address."""
-        block_table = cam.block_table_tensor
-        spec_block = self.kv_cache_spec.block_size
-        kernel_block = self.kernel_block_size
-        if (
-            kernel_block is None
-            or spec_block == kernel_block
-            or spec_block % kernel_block
-        ):
-            return block_table
-        factor = spec_block // kernel_block
-        pages = block_table[:, ::factor] // factor
-        rows, cols = pages.shape
-        if self.page_table_buffer is None:
-            self.page_table_buffer = torch.zeros(
-                (max(rows, self.max_num_seqs), cols),
-                dtype=block_table.dtype,
-                device=block_table.device,
-            )
-        assert rows <= self.page_table_buffer.shape[0]
-        out = self.page_table_buffer[:rows, :cols]
-        out.copy_(pages)
-        return out
 
     def _pool_slot_mapping(
         self, cam: CommonAttentionMetadata, block_table: torch.Tensor
@@ -151,10 +124,9 @@ class IvfIndexerMetadataBuilder(AttentionMetadataBuilder):
                         prefill_seq_lens, cam.prefill_lens_cpu[rows].tolist()
                     )
                 ]
-        page_table = self._page_table(cam)
         return IvfIndexerMetadata(
-            slot_mapping=self._pool_slot_mapping(cam, page_table),
-            block_table=page_table,
+            slot_mapping=self._pool_slot_mapping(cam, cam.block_table_tensor),
+            block_table=cam.block_table_tensor,
             seq_lens=cam.seq_lens,
             query_start_loc=cam.query_start_loc,
             num_reqs=cam.num_reqs,
@@ -191,7 +163,7 @@ class IvfStateMetadataBuilder(AttentionMetadataBuilder):
         return IvfStateMetadata(block_table=common_attn_metadata.block_table_tensor)
 
 
-class Glm5NextIvfIndexerBackend(DeepseekV32IndexerBackend):
+class Glm5NextIvfIndexerBackend(Glm5NextIndexerBackend):
     @staticmethod
     def get_name() -> str:
         return "GLM5_IVF_INDEXER"
@@ -206,7 +178,7 @@ class Glm5NextIvfStateBackend(DeepseekV32IndexerBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.LBHNC,)
+        return (KVCacheLayout.BLHNC,)
 
     @staticmethod
     def get_name() -> str:
