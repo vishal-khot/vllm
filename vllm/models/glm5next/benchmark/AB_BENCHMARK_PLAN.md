@@ -71,7 +71,7 @@ memory vs L; the regime where sparse selection pays off).
 vs latency and vs memory Pareto from the P/cluster sweeps; (iii) per-layer time +
 peak memory bars; (iv) fidelity (recall IVF-vs-k-pool) per layer (optional).
 
-## Arms & toggle (fork `vishal-vllm`, branch `benchmarking`)
+## Arms & toggle (fork `vishal-vllm`, branch `benchmarking-v0.32.0`)
 
 IVF is implemented, pure Python/Triton (no CUDA rebuild). Gated by env
 `VLLM_ENABLE_DSA_IVF_INDEXER`; knobs from model config: `index_num_clusters`

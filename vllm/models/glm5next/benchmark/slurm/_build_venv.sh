@@ -19,6 +19,7 @@ fi
 echo "[build] building ${VENV} (VLLM_USE_PRECOMPILED; IVF is pure Python/Triton)"
 uv venv --python 3.12 "${VENV}"
 ( cd "${REPO}" && VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://wheels.vllm.ai/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl}" \
     uv pip install --python "${VENV}/bin/python" -e . \
       --torch-backend="${TORCH_BACKEND}" )
 "${VENV}/bin/python" -c "import vllm; print('[build] vllm', vllm.__version__)"

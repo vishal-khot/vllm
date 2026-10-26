@@ -6,12 +6,13 @@
 PARTITION=<p> QOS=<q> GRES=gpu:<type>:8 bash run_benchmark.sh
 ```
 
-`run_benchmark.sh` does everything: ensures the fork is on the `benchmarking`
-branch, installs `uv`, downloads the model to `./model`, generates RULER data to
-`./ruler`, builds the vLLM venv once (a short GPU job), then submits both
-experiments (each waits for the build). The **number of GPUs in `GRES` becomes
-the tensor-parallel size**, so pick 8 (or 4 for `MODE=preempt`); the GPUs must
-together hold ~306 GB. Run it under `tmux`/`nohup` — the model download is large.
+`run_benchmark.sh` does everything: ensures the fork is on the
+`benchmarking-v0.32.0` branch (vLLM v0.32.0 + IVF), installs `uv`, downloads
+the model to `./model`, generates RULER data to `./ruler`, builds the vLLM
+venv once (a short GPU job), then submits both experiments (each waits for the
+build). The **number of GPUs in `GRES` becomes the tensor-parallel size**, so
+pick 8 (or 4 for `MODE=preempt`); the GPUs must together hold ~306 GB. Run it
+under `tmux`/`nohup` — the model download is large.
 
 Inputs:
 - **Required:** `PARTITION`, `QOS`, `GRES` (e.g. `gpu:A100_80GB:8`) — your
@@ -29,12 +30,12 @@ preempts every hour, each slice of walltime makes real progress and the sweep
 eventually finishes. (`SLURM_JOB_ID` is preserved across requeue, so the job
 resumes into its own output dir.)
 
-**Torch wheel / CUDA.** No CUDA compile happens — `VLLM_USE_PRECOMPILED=1` pulls
-vLLM's prebuilt sm90 `.so` and the IVF fork is pure Python/Triton, so only the
-GPU **driver** matters (a CUDA 13.x driver runs the CUDA 12.x wheels fine).
-`--torch-backend=auto` picks the torch wheel from the driver; if that build's
-`import vllm` fails with an ABI mismatch, set `TORCH_BACKEND=cu128` (or your
-driver's variant) and re-run.
+**Torch wheel / CUDA.** No CUDA compile happens: `VLLM_USE_PRECOMPILED=1` pulls
+the vLLM v0.32.0 release wheel (pinned by `VLLM_PRECOMPILED_WHEEL_LOCATION`,
+overridable) and the IVF fork is pure Python/Triton. That wheel is built for
+CUDA 13, so the GPU **driver** must support CUDA 13. `--torch-backend=auto`
+picks the torch wheel from the driver; if `import vllm` then fails with an ABI
+mismatch, set `TORCH_BACKEND=cu130` and re-run.
 
 The two experiments it launches (both driven by `../runs.yaml`):
 1. **A/B matrix** — kpool vs IVF: accuracy, latency, throughput, memory.

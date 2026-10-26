@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ONE command to run the whole GLM-5.3-Flash RULER benchmark on a Slurm cluster.
 # It does everything:
-#   1. ensure the fork is cloned and on the `benchmarking` branch,
+#   1. ensure the fork is cloned and on the `benchmarking-v0.32.0` branch,
 #   2. install uv,
 #   3. download the model to ./model (current dir),
 #   4. generate RULER data to ./ruler (current dir),
@@ -20,7 +20,7 @@
 #            NUM_SAMPLES (RULER samples/task, default 100), GLM5_ONLY=<run ids>,
 #            TORCH_BACKEND (default auto; set e.g. cu128 if the venv build picks
 #            a torch that ABI-mismatches the precompiled vLLM wheel),
-#            REPO_URL, BRANCH (default benchmarking), CLONE_DEST.
+#            REPO_URL, BRANCH (default benchmarking-v0.32.0), CLONE_DEST.
 #
 # Preemption: the preempt wrappers set --requeue, and the runners resume --
 # a requeued job re-runs only the runs/cells that have not yet written
@@ -31,7 +31,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/vishal-khot/vllm.git}"
-BRANCH="${BRANCH:-benchmarking}"
+BRANCH="${BRANCH:-benchmarking-v0.32.0}"
 MODE="${MODE:-normal}"
 SETUP_ONLY="${SETUP_ONLY:-0}"   # 1 = stage repo/uv/model/RULER then stop (no sbatch)
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
