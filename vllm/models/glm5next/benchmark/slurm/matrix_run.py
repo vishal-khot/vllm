@@ -60,6 +60,12 @@ def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
         ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )
     env.update(run.env)  # VLLM_ENABLE_DSA_IVF_INDEXER, measure flag
+    if run.indexer == "kpool":
+        # The stock arm runs entirely inside the stock venv, which has no IVF.
+        env.pop("VLLM_ENABLE_DSA_IVF_INDEXER", None)
+        stock_bin = os.path.dirname(_stock_vllm())
+        env["VIRTUAL_ENV"] = os.path.dirname(stock_bin)
+        env["PATH"] = stock_bin + os.pathsep + env.get("PATH", "")
     if run.eager:
         env["GLM5_INSTRUMENT"] = "1"
         env["GLM5_TIMING_DIR"] = timing_dir
@@ -70,11 +76,28 @@ def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
     return env
 
 
+def _stock_vllm() -> str:
+    """The unmodified vLLM release's `vllm` (GLM5_STOCK_VLLM), for kpool."""
+    path = os.environ.get("GLM5_STOCK_VLLM")
+    if not path or not os.access(path, os.X_OK):
+        raise RuntimeError(
+            "kpool runs serve stock vLLM: set GLM5_STOCK_VLLM to the stock "
+            f"venv's bin/vllm (got {path!r}); see _build_venv.sh"
+        )
+    return path
+
+
 def _serve_cmd(run, model: str, tp: int, port: int, gpu_mem_util: float) -> list:
     """`vllm serve` for a run: fixed flags plus the run's own serve_args
-    (max-model-len, seed, eager, prefix-caching, hf-overrides)."""
+    (max-model-len, seed, eager, prefix-caching, hf-overrides). kpool runs
+    serve the stock release; IVF runs serve the fork."""
+    vllm_bin = (
+        _stock_vllm()
+        if run.indexer == "kpool"
+        else shutil.which("vllm") or "vllm"
+    )
     return [
-        shutil.which("vllm") or "vllm", "serve", model,
+        vllm_bin, "serve", model,
         "--served-model-name", "glm",
         "--tensor-parallel-size", str(tp),
         "--gpu-memory-utilization", str(gpu_mem_util),
@@ -105,7 +128,7 @@ def _one_request(port: int, meta: dict, request_timeout: float) -> dict:
 
 def run_one(run, args) -> dict:
     """Serve one run, run its datasets, store results under its own id."""
-    base_out = os.path.join(args.out_dir, run.id)
+    base_out = os.path.abspath(os.path.join(args.out_dir, run.id))
     # Drop any partial dir from a preempted attempt so stale instrument dumps
     # (globbed by the summarizers) don't bleed into this run's numbers.
     if os.path.isdir(base_out):
@@ -115,9 +138,17 @@ def run_one(run, args) -> dict:
     for d in (base_out, timing_dir, lost_dir):
         os.makedirs(d, exist_ok=True)
 
-    cmd = _serve_cmd(run, args.model, args.tp, args.port, args.gpu_mem_util)
+    # A local model path must survive the stock server's cwd change.
+    model = os.path.abspath(args.model) if os.path.exists(args.model) else args.model
+    cmd = _serve_cmd(run, model, args.tp, args.port, args.gpu_mem_util)
     print(f"[{run.id}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, env=_serve_env(run, timing_dir, lost_dir))
+    # Start the stock server outside the repo: a cwd on sys.path (python -c
+    # children) would otherwise import the fork's vllm/ package.
+    proc = subprocess.Popen(
+        cmd,
+        env=_serve_env(run, timing_dir, lost_dir),
+        cwd=base_out if run.indexer == "kpool" else None,
+    )
 
     accuracy: dict = {}
     latency = None

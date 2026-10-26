@@ -164,8 +164,12 @@ is the single source of truth.
   and the jobs serve from it (`SHARED_MODEL_DIR`). Run a `.sbatch` directly with
   neither `SHARED_MODEL_DIR` nor the model present and it falls back to a
   node-local download under `/scratch/$USER/glm5` (~306 GB, resumable per node).
-- **venv** (`$REPO/.venv`) builds once via `VLLM_USE_PRECOMPILED=1 uv pip install
-  -e .` (works because `.git` is present); reused afterwards.
+- **venvs.** The IVF arm serves from `$REPO/.venv` (`VLLM_USE_PRECOMPILED=1 uv
+  pip install -e .`, works because `.git` is present). The kpool arm serves
+  **unmodified stock vLLM** from `$REPO/.venv-stock` (`vllm==0.32.0` from PyPI,
+  `STOCK_VLLM_VERSION` to change), so none of this branch's commits are in the
+  baseline; only the timing/memory instrument is injected on eager runs, in both
+  arms alike. Both build once and are reused.
 - **Eager runs run every sample** (`n: all` / the base pair); graph runs use
   `n=20`. The eager path is single-stream and slow, so the full-sample fidelity
   sweep can take a long time — restrict with `lost_attention_run.py --n <k>` or

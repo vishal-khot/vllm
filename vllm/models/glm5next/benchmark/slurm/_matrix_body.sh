@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Shared body for the A/B matrix Slurm jobs (normal + preempt).
 #
-# Stages GLM-5.3-Flash and the RULER jsonl to node-local NVMe, ensures a
-# vLLM+fork venv, then runs slurm/matrix_run.py over every run in runs.yaml.
+# Stages GLM-5.3-Flash and the RULER jsonl to node-local NVMe, ensures the
+# vLLM+fork venv (IVF arm) and the stock vLLM venv (kpool arm), then runs
+# slurm/matrix_run.py over every run in runs.yaml.
 # The run matrix (indexer arms, lengths, clusters/probes, concurrency) is read
 # from runs.yaml via bench_config -- nothing is computed here. The sbatch
 # wrappers set GLM5_TP and the #SBATCH resource lines.
@@ -68,6 +69,19 @@ if ! "${VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
 fi
 source "${VENV}/bin/activate"
 python -c "import vllm; print('vllm', vllm.__version__)"
+
+# ---- 1b. stock vLLM venv for the kpool arm (unmodified PyPI release) ----
+STOCK_VENV="${GLM5_STOCK_VENV:-${REPO}/.venv-stock}"
+STOCK_VLLM_VERSION="${STOCK_VLLM_VERSION:-0.32.0}"
+if ! "${STOCK_VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
+  echo "[$(date +%T)] building stock venv (vllm==${STOCK_VLLM_VERSION}) ..."
+  uv venv --python 3.12 "${STOCK_VENV}"
+  ( cd / && uv pip install --python "${STOCK_VENV}/bin/python" \
+      "vllm==${STOCK_VLLM_VERSION}" --torch-backend="${TORCH_BACKEND:-auto}" )
+fi
+( cd / && "${STOCK_VENV}/bin/python" -c "import vllm; print('stock vllm', vllm.__version__, vllm.__file__)" )
+# matrix_run.py serves kpool runs with this binary and IVF runs with the fork.
+export GLM5_STOCK_VLLM="${STOCK_VENV}/bin/vllm"
 
 # ---- 2. tasks + lengths to stage: union over every ruler run in the matrix ----
 read -r TASKS LENGTHS < <(python - "${RUNS_YAML}" "${REPO}" <<'PY'
