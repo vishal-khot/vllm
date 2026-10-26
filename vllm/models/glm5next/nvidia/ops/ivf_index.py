@@ -57,6 +57,17 @@ def _kth_largest(sorted_desc, k, SIZE: tl.constexpr):
 
 
 @triton.jit
+def _probes_holding(sorted_desc, count, k, n, need):
+    """Fewest best clusters, at least ``k`` of the ``n`` eligible, whose
+    ``count`` sums to ``need`` (``n`` if all of them do not). ``sorted_desc``
+    are the clusters' unique keys, ``65535 - id`` in their low 16 bits."""
+    ids = (65535 - (sorted_desc & 65535)).to(tl.int32)
+    held = tl.cumsum(tl.gather(count, ids, 0), axis=0)
+    short = tl.sum((held < need).to(tl.int32), axis=0)
+    return tl.maximum(k, tl.minimum(short + 1, n))
+
+
+@triton.jit
 def _cluster_count(n_keys, num_clusters, C: tl.constexpr):
     """Clusters of a request: num_clusters within [1, min(n_keys, C)]. Mirrors
     ``cluster_count``."""
@@ -848,9 +859,6 @@ def ivf_probe_score_kernel(
     cen_bt_ptr,
     cen_bt_stride,
     cpb,
-    run_start_ptr,
-    run_pos_ptr,
-    run_size_ptr,
     cen_desc,
     cen_size_ptr,
     score_ws_ptr,
@@ -873,10 +881,9 @@ def ivf_probe_score_kernel(
     the build's dense copy); fp8 is exact in bf16, so all
     ``BLOCK_R * H`` heads, gathered once and head-major (column h * BLOCK_R +
     r), take one ``[BLOCK_C, 128] x [128, BLOCK_R * H]`` bf16 MMA with fp32
-    sums per centroid tile. Visible counts: the
-    cluster size at decode; at prefill the run size if the run has a key at or
-    before the row's position, else 0 (``ivf_probe_select_kernel`` makes it
-    exact for the probed runs). -1 marks a disabled cluster.
+    sums per centroid tile. At decode also the
+    visible key counts, the cluster sizes (-1: disabled); prefill's are exact
+    in ``ivf_probe_select_kernel``.
     """
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     c_begin = tl.program_id(1) * c_per_program
@@ -918,28 +925,19 @@ def ivf_probe_score_kernel(
             per_head = tl.maximum(tl.dot(cf, q_t), 0.0) * w[None, :]
             # [BLOCK_C, BLOCK_R], stored as computed.
             score = tl.sum(tl.reshape(per_head, (BLOCK_C, H, BLOCK_R)), axis=1)
-            if IS_DECODE:
-                # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
-                vis = tl.where((t >= 0)[:, None], size[None, :], 0)
-            else:
-                # Runs hold positions ascending: a run has a visible key iff
-                # its first key is. The probe select counts the probed runs'
-                # visible prefixes.
-                size = tl.load(run_size_ptr + b * C + offs_c, mask=live, other=0)
-                run_start = tl.load(run_start_ptr + b * C + offs_c, mask=live, other=0)
-                has = size > 0
-                first = tl.load(run_pos_ptr + run_start, mask=has, other=0)
-                vis = tl.where(
-                    has[None, :] & (first[None, :] <= t[:, None]), size[None, :], 0
-                )
-            out = offs_r[:, None] * C + offs_c[None, :]
-            m = mine[:, None] & in_c[None, :]
             tl.store(
                 score_ws_ptr + offs_r[None, :] * C + offs_c[:, None],
                 score,
                 mask=mine[None, :] & in_c[:, None],
             )
-            tl.store(vis_ws_ptr + out, tl.where(live[None, :], vis, -1), mask=m)
+            if IS_DECODE:
+                # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
+                vis = tl.where((t >= 0)[:, None], size[None, :], 0)
+                tl.store(
+                    vis_ws_ptr + offs_r[:, None] * C + offs_c[None, :],
+                    tl.where(live[None, :], vis, -1),
+                    mask=mine[:, None] & in_c[None, :],
+                )
         pending = pending & ~mine
 
 
@@ -948,7 +946,10 @@ def ivf_probe_select_kernel(
     pos_ptr,
     row_batch_ptr,
     run_start_ptr,
-    run_pos_ptr,
+    tile_off_ptr,
+    packed_cid_ptr,
+    row_tile0_ptr,
+    row_key0_ptr,
     score_ws_ptr,
     vis_ws_ptr,
     sel_out_ptr,
@@ -966,31 +967,50 @@ def ivf_probe_select_kernel(
     C: tl.constexpr,
     C_PAD: tl.constexpr,
     P_PAD: tl.constexpr,
+    PAGE: tl.constexpr,
     IS_DECODE: tl.constexpr,
 ):
-    """Probe a fixed number of clusters per row and lay out its candidates.
+    """Probe at least ``num_probes`` clusters per row and lay out its candidates.
 
-    A row probes the ``num_probes`` best clusters among those with a key
-    visible to it, by their score (``ivf_probe_score_kernel``), ties to the
-    lower cluster id; a row that sees at most TOPK keys probes all of them, so
+    A row probes, among the clusters with a key visible to it and by their
+    score (``ivf_probe_score_kernel``, ties to the lower cluster id), the
+    ``num_probes`` best and then the next best until its probed clusters hold
+    TOPK visible keys; a row that sees at most TOPK keys probes all of them, so
     it keeps every visible key. A row whose candidates would exceed
     ``max_count`` (its score buffer width) drops its lowest-scoring probed
     clusters until they fit. Writes which clusters are probed, the
     inclusive candidate end of every cluster (cluster-id order), the candidate
     count (every visible key of the probed clusters) and the top-k length (0
-    when the row keeps every candidate). At prefill, ``vis_ws`` holds run sizes
-    on entry; the probed runs' visible prefixes are searched here and written
-    back for the grouped score, and the probed clusters are listed in cluster
-    order for the emit, P_PAD per row: each one's exclusive candidate end
-    (``probe_end``, padded with int32 max) and the run-layout offset of its
-    slots (``probe_base``: slot j maps to ``run_pos[probe_base + j]``).
+    when the row keeps every candidate). Visible counts come from ``vis_ws`` at
+    decode; at prefill they are exact here, from the build's per-page cluster
+    counts (``tile_off``: a request's keys of each cluster before each page)
+    and the cluster ids of the row's partial page, and the probed clusters'
+    are written to ``vis_ws`` for the grouped score. Prefill also lists the
+    probed clusters in cluster order for the emit, P_PAD per row: each one's
+    exclusive candidate end (``probe_end``, padded with int32 max) and the
+    run-layout offset of its slots (``probe_base``: slot j maps to
+    ``run_pos[probe_base + j]``).
     """
     row = tl.program_id(0)
     t = tl.load(pos_ptr + row).to(tl.int32)
     offs_all = tl.arange(0, C_PAD)
     in_range = offs_all < C
     score = tl.load(score_ws_ptr + row * C + offs_all, mask=in_range, other=0.0)
-    vis = tl.load(vis_ws_ptr + row * C + offs_all, mask=in_range, other=-1)
+    if IS_DECODE:
+        vis = tl.load(vis_ws_ptr + row * C + offs_all, mask=in_range, other=-1)
+    else:
+        b = tl.load(row_batch_ptr + row)
+        page = tl.maximum(t, 0) // PAGE
+        vis = tl.load(
+            tile_off_ptr + (tl.load(row_tile0_ptr + b) + page) * C + offs_all,
+            mask=in_range,
+            other=0,
+        )
+        pos = page * PAGE + tl.arange(0, PAGE)
+        cid = tl.load(
+            packed_cid_ptr + tl.load(row_key0_ptr + b) + pos, mask=pos <= t, other=-1
+        )
+        vis += tl.sum((cid[:, None] == offs_all[None, :]).to(tl.int32), axis=0)
     eligible = vis > 0
     n_eligible = tl.sum(eligible.to(tl.int32), axis=0)
     none = -1099511627776  # below every float order key
@@ -998,28 +1018,16 @@ def ivf_probe_select_kernel(
     keys = tl.where(eligible, _float_order_key(score), none) * 65536 + (
         65535 - offs_all
     )
-    k = tl.where(t < TOPK, n_eligible, tl.minimum(num_probes, n_eligible))
     sorted_keys = tl.sort(keys, descending=True)
+    k = tl.where(t < TOPK, n_eligible, tl.minimum(num_probes, n_eligible))
+    held = tl.where(eligible, vis, 0)
+    k = _probes_holding(sorted_keys, held, k, n_eligible, TOPK)
     tau = _kth_largest(sorted_keys, tl.maximum(k, 1), C_PAD)
     selected = eligible & (keys >= tau) & (k > 0)
-    take = tl.where(selected, vis, 0)
     if not IS_DECODE:
-        # Positions ascend within a run and its first key is visible: search
-        # the visible prefix of each probed run, unless the whole run is.
-        b = tl.load(row_batch_ptr + row)
         start = tl.load(run_start_ptr + b * C + offs_all, mask=selected, other=0)
-        last = tl.load(run_pos_ptr + start + take - 1, mask=selected, other=0)
-        partial = selected & (last > t)
-        lo = tl.where(partial, 1, take)
-        hi = tl.where(partial, take - 1, take)
-        while tl.max((lo < hi).to(tl.int32), axis=0) > 0:
-            active = lo < hi
-            mid = (lo + hi) // 2
-            p = tl.load(run_pos_ptr + start + mid, mask=active, other=0)
-            lo = tl.where(active & (p <= t), mid + 1, lo)
-            hi = tl.where(active & (p > t), mid, hi)
-        take = lo
-        tl.store(vis_ws_ptr + row * C + offs_all, take, mask=selected)
+        tl.store(vis_ws_ptr + row * C + offs_all, held, mask=selected)
+    take = tl.where(selected, held, 0)
     if tl.sum(take, axis=0) > max_count:
         # Keep the most best-scoring probes whose candidates fit (bisection on
         # their number: the best ``fit`` fit, the best ``over`` do not).

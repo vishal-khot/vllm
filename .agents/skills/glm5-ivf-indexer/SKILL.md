@@ -13,17 +13,22 @@ sum over indexer heads h of w_h * ReLU(q_h . k). That costs O(pools) per query.
 
 The IVF indexer replaces only the brute-force scoring. Per request and layer it
 clusters the pooled keys with cosine k-means into C clusters. Each query
-probes the P clusters whose unit centroid scores best, scores every visible
-pool in them and takes the top 512. Key writes, the tail pool and the
+probes the P clusters whose unit centroid scores best (more if they hold
+fewer than 512 visible pools), scores every visible pool in them and takes
+the top 512. Key writes, the tail pool and the
 pool-to-token expansion are the stock kpool indexer's. With P = C every pool
 is a candidate, so the selection equals stock's exactly. Use that as the
-correctness anchor.
+correctness anchor. A prefill request with at most `index_exact_pools` pools
+(default 4096, 16k tokens) skips probing and scores every pool densely as
+stock does (DeepGEMM logits, per-row top-k): exact, and faster while its
+clusters are small. k-means still builds for it.
 
 Enable it with `VLLM_ENABLE_DSA_IVF_INDEXER=1`. Set the counts with
 `--hf-overrides '{"index_num_clusters": C, "index_num_probes": P}'`. Other
 override keys are `index_kmeans_iters`, `index_kmeans_warm_iters`,
-`index_kmeans_stop_fraction`, `index_kmeans_seed` and
-`index_kmeans_incremental`; see `IvfIndexerConfig.from_hf_config`.
+`index_kmeans_stop_fraction`, `index_kmeans_seed`,
+`index_kmeans_incremental` and `index_exact_pools` (0 probes every
+request); see `IvfIndexerConfig.from_hf_config`.
 
 ## File map
 
@@ -61,7 +66,7 @@ override keys are `index_kmeans_iters`, `index_kmeans_warm_iters`,
    scores the centroids. `ivf_probe_select_kernel` picks the probes and counts
    candidates. The group kernels plan a persistent grouped GEMM, and
    `ivf_grouped_score_kernel` scores candidates with TMA plus wgmma. Then
-   radix top-k runs, and `ivf_emit_runs_kernel` writes expanded token indices
+   per-row top-k runs, and `ivf_emit_runs_kernel` writes expanded token indices
    (pools x kpool plus the tail) straight into `topk_indices_buffer`.
 4. **Decode.** A step that completes a pool assigns it to the nearest fixed
    centroid (`ivf_decode_append_kernel`). Select scans cluster ids for
@@ -124,11 +129,6 @@ Tests need an sm90 GPU (H200). Run them with the repo's venv:
 
 ## Known issues (as of 2026-10)
 
-- **Fixed P under-fills early chunks.** With few pools (for example 2048 in a
-  first chunk), P/C = 1/8 finds about 256 candidates, under 512. Rows seeing
-  513-2048 pools then select only about 35-45% of what stock does, at
-  0.20-0.34 recall. Planned fix: adaptive probing (probe until candidates
-  reach topk).
 - **Recall at P/C = 1/8 is 0.6-0.85** against exact top-k on later chunks.
 - **P = C/8 keeps total cost O(n^2).** A probed fraction of 1/8 is linear per
   query. Subquadratic needs C ~ sqrt(pools) with P fixed or slowly growing.

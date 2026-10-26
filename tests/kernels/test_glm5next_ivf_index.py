@@ -162,12 +162,12 @@ class Queries(NamedTuple):
     w_cpu: torch.Tensor
 
 
-def _queries(num_rows, seed=0) -> Queries:
+def _queries(num_rows, seed=0, heads=HEADS) -> Queries:
     """fp8 query heads and signed head weights with the query scales folded
     in, as the indexer forward builds them."""
     g = torch.Generator().manual_seed(seed)
-    q, scale = quantize_rows_fp8(torch.randn(num_rows, HEADS, 128, generator=g), True)
-    w = torch.randn(num_rows, HEADS, generator=g) * scale
+    q, scale = quantize_rows_fp8(torch.randn(num_rows, heads, 128, generator=g), True)
+    w = torch.randn(num_rows, heads, generator=g) * scale
     return Queries(q.to(torch.float8_e4m3fn).to(DEV), w.to(DEV), q, w)
 
 
@@ -847,6 +847,8 @@ def test_decode_cuda_graph_matches_eager():
 
 
 KPOOL = 4
+# GLM-5.3's indexer heads, which the dense (DeepGEMM) prefill path supports.
+POOL_HEADS = 32
 POOL_PAGE = 32  # the pooled cache's kernel page at block_size 1152
 POOL_TOPK = TOPK // KPOOL
 # Requests with more pools than top-k and fewer, plus ones whose last row sees
@@ -863,9 +865,12 @@ POOLED_LENGTHS = [
 class PooledSetup:
     """Caches and metadata for ``sparse_attn_indexer_ivf`` on pooled keys."""
 
-    def __init__(self, num_probes: int):
+    def __init__(self, num_probes: int, exact_pools: int = 0):
         self.config = dataclasses.replace(
-            _config(num_probes=num_probes), topk=POOL_TOPK, kpool=KPOOL
+            _config(num_probes=num_probes),
+            topk=POOL_TOPK,
+            kpool=KPOOL,
+            exact_pools=exact_pools,
         )
         g = torch.Generator().manual_seed(11)
         rows = len(POOLED_LENGTHS)
@@ -1005,10 +1010,9 @@ def _check_row(got, t, scores, recall=True):
     if num_pools <= POOL_TOPK:
         assert pools == set(range(num_pools))
     else:
-        # Few probes can see fewer than top-k pools; every candidate is kept.
-        assert 0 < len(pools) <= POOL_TOPK
+        # Probing continues until the candidates hold top-k pools.
+        assert len(pools) == POOL_TOPK
         if recall:
-            assert len(pools) == POOL_TOPK
             exact = exact_topk_reference(scores, num_pools - 1, POOL_TOPK)
             selected = torch.tensor(sorted(pools))
             assert tie_aware_recall(selected, exact, scores) > 0.999
@@ -1034,16 +1038,18 @@ def test_page_table_counts_cache_pages():
     assert again.data_ptr() == got.data_ptr()
 
 
-@pytest.mark.parametrize("num_probes", [C, 4])
-def test_pooled_prefill_and_decode(monkeypatch, num_probes):
+@pytest.mark.parametrize(("num_probes", "exact_pools"), [(C, 0), (4, 0), (4, 512)])
+def test_pooled_prefill_and_decode(monkeypatch, num_probes, exact_pools):
     """IVF on the kpool indexer's pools: stock-written pools are what the IVF
     key view reads; probing every cluster gives the exact top pools; rows
     seeing at most top-k pools keep them all; every row keeps its tail; decode
-    appends a pool exactly when it completes."""
-    setup = PooledSetup(num_probes)
+    appends a pool exactly when it completes. A prefill request with at most
+    ``exact_pools`` pools scores them densely (here the middle two of a batch
+    whose outer two probe), so it selects the exact top pools."""
+    setup = PooledSetup(num_probes, exact_pools)
     rows = len(POOLED_LENGTHS)
     total = sum(POOLED_LENGTHS)
-    qb = _queries(total, seed=5)
+    qb = _queries(total, seed=5, heads=POOL_HEADS)
     out, tokens = setup.step(monkeypatch, [0] * rows, POOLED_LENGTHS, qb)
 
     for b, n in enumerate(POOLED_LENGTHS):
@@ -1057,7 +1063,8 @@ def test_pooled_prefill_and_decode(monkeypatch, num_probes):
             continue
         got = out[r][out[r] >= 0].tolist()
         scores = key_scores_reference(qb.q[r], qb.w_cpu[r], *keys[b])
-        _check_row(got, t, scores, recall=num_probes == C)
+        exact = POOLED_LENGTHS[b] // KPOOL <= exact_pools
+        _check_row(got, t, scores, recall=num_probes == C or exact)
     assert int(out.min()) >= -1
 
     def live_size(b):
@@ -1071,7 +1078,7 @@ def test_pooled_prefill_and_decode(monkeypatch, num_probes):
     lens = list(POOLED_LENGTHS)
     for completes in (False, True):
         before = [live_size(b) for b in range(rows)]
-        dq = _queries(rows, seed=6 + completes)
+        dq = _queries(rows, seed=6 + completes, heads=POOL_HEADS)
         out, _ = setup.step(monkeypatch, lens, [n + 1 for n in lens], dq)
         lens = [n + 1 for n in lens]
         for b, n in enumerate(lens):

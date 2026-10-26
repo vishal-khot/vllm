@@ -146,20 +146,31 @@ def test_probing_every_cluster_is_exact_topk(decode):
         assert tie_aware_recall(trace.selected, exact, scores) == 1.0
 
 
-def test_fixed_probes_take_every_visible_key_of_them():
+@pytest.mark.parametrize("want_probes", [1, 16])
+def test_probes_fill_topk_and_take_every_visible_key_of_them(want_probes):
+    """A query probes its ``num_probes`` best clusters, then the next best
+    until they hold top-k visible keys, and no more."""
     num_keys = 3000
     k_fp8, k_scale = quantize_rows_fp8(_keys(num_keys), True)
     km = _kmeans(k_fp8, k_scale, num_clusters=C_MAX)
-    want_probes = 16
-    for seed, t in enumerate([0, 40, 63, 500, 2999]):
+    for seed, t in enumerate([0, 40, 63, 64, 100, 500, 2999]):
         trace = _select(
             k_fp8, k_scale, km, t, num_probes=want_probes, decode=False, seed=seed
         )
         visible = torch.bincount(km.cluster_of_pos[: t + 1], minlength=C_MAX)
         eligible = int((visible > 0).sum())
-        # A query seeing at most top-k keys probes every cluster.
-        probes = eligible if t < TOPK else min(want_probes, eligible)
-        assert int(trace.probed.sum()) == probes
+        probes = int(trace.probed.sum())
+        if t < TOPK:
+            # A query seeing at most top-k keys probes every cluster.
+            assert probes == eligible
+        else:
+            assert probes >= min(want_probes, eligible)
+            assert trace.total >= TOPK
+            if probes > want_probes:
+                score = probe_scores_reference(*_query(seed), km.centroids)
+                ids = torch.nonzero(trace.probed).flatten()
+                weakest = ids[torch.argmin(score[ids])]
+                assert trace.total - int(visible[weakest]) < TOPK
         cand = trace.candidates
         # Uncapped: every visible key of every probed cluster, nothing else.
         assert cand.numel() == trace.total == int(visible[trace.probed].sum())

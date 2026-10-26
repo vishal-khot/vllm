@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
@@ -80,8 +81,10 @@ class IvfKernelTuning:
     scan_block_c: int = 16
     emit_block: int = 256
     probe_num_warps: int = 4
+    # One probe-select program per row, over at most C_PAD clusters.
+    select_num_warps: int = 2
     # Query rows per probe-score tile; its MMA has probe_rows x heads rows.
-    probe_rows: int = 8
+    probe_rows: int = 4
     # Fused k-means: programs per SM (its register-held [C, 128] member sums
     # fit one), warps, and clusters per seed/update unit. A request's keys
     # split into about kmeans_segments assign units of at least
@@ -244,6 +247,13 @@ class IvfRunLayout:
     # requests built this step, densely for the prefill probe's TMA loads.
     cen_dense: torch.Tensor
     cen_size: torch.Tensor
+    # Exact visible counts: [tiles, C] int32 keys of each cluster in a
+    # request's pages before each page, [sum keys] int32 cluster ids, and per
+    # batch row [B] the request's first page and first key.
+    tile_off: torch.Tensor
+    packed_cid: torch.Tensor
+    row_tile0: torch.Tensor
+    row_key0: torch.Tensor
 
 
 def build_ivf_index(
@@ -319,6 +329,10 @@ def build_ivf_index(
     cu_keys = firsts(n)
     num_tiles, total_keys = int(tile_first[-1]), int(cu_keys[-1])
     tile_item = np.repeat(np.arange(num_items), tiles)
+    row_tile0 = np.zeros(num_batch_rows, dtype=np.int64)
+    row_key0 = np.zeros(num_batch_rows, dtype=np.int64)
+    row_tile0[batch_rows_cpu] = tile_first[:-1]
+    row_key0[batch_rows_cpu] = cu_keys[:-1]
     parts = [
         tile_item,
         (np.arange(num_tiles) - tile_first[tile_item]) * page,
@@ -329,6 +343,8 @@ def build_ivf_index(
         tile_first,
         seg_first,
         new_tile_first,
+        row_tile0,
+        row_key0,
     ]
     host = torch.empty((sum(map(len, parts)),), dtype=torch.int32, pin_memory=True)
     np.concatenate(parts, out=host.numpy(), casting="unsafe")
@@ -343,6 +359,8 @@ def build_ivf_index(
         tile_first_t,
         seg_first_t,
         new_tile_first_t,
+        row_tile0_t,
+        row_key0_t,
     ) = host.split(
         [
             num_tiles,
@@ -354,6 +372,8 @@ def build_ivf_index(
             num_items + 1,
             num_items + 1,
             num_items + 1,
+            num_batch_rows,
+            num_batch_rows,
         ]
     )
 
@@ -530,6 +550,10 @@ def build_ivf_index(
         run_scales=run_scales,
         cen_dense=cen_dense,
         cen_size=cen_size,
+        tile_off=tile_off,
+        packed_cid=packed_cid,
+        row_tile0=row_tile0_t,
+        row_key0=row_key0_t,
     )
 
 
@@ -582,8 +606,7 @@ def select_ivf_topk(
     of batch row row_batch[r]. Prefill passes ``layout``; decode passes
     ``seq_lens`` (rows are its batch rows).
 
-    Candidates are every visible key of the probed clusters (at prefill, only
-    the probed runs are searched for their visible prefix). Prefill scores
+    Candidates are every visible key of the probed clusters. Prefill scores
     every row in one pass into a buffer [rows, width]: ``width`` is
     ``max_width``, a host-known bound on any row's candidate count (such as
     its longest visible prefix), capped so the buffer fits
@@ -614,7 +637,8 @@ def select_ivf_topk(
 
     score_ws = torch.empty((num_rows, C), dtype=torch.float32, device=device)
     sel = torch.empty((num_rows, C), dtype=torch.int8, device=device)
-    # A row seeing at most top-k keys probes every cluster with one of them.
+    # Every probed cluster holds a visible key and a row stops probing once
+    # it holds top-k keys: at most max(num_probes, top-k) probes.
     P_PAD = triton.next_power_of_2(max(min(max(config.num_probes, topk), C), 1))
     probe_rows = 0 if layout is None else num_rows
     vis_ws, ends, counts, totals, topk_lens, probe_end, probe_base = _alloc(
@@ -640,10 +664,16 @@ def select_ivf_topk(
         if max_width is not None:
             max_count = min(max_count, max_width)
 
-    run_args = (
-        (counts, counts, counts)
+    vis_args = (
+        (counts,) * 5
         if is_decode
-        else (layout.run_start, layout.run_pos, layout.run_size)
+        else (
+            layout.run_start,
+            layout.tile_off,
+            layout.packed_cid,
+            layout.row_tile0,
+            layout.row_key0,
+        )
     )
     # One wgmma covers at most 256 query-head columns.
     assert tune.probe_rows * num_heads <= 256, "probe_rows * heads > 256"
@@ -668,7 +698,6 @@ def select_ivf_topk(
         row_batch,
         query_pos,
         *state.cen_args(),
-        *run_args,
         cen_desc,
         cen_size,
         score_ws,
@@ -685,7 +714,7 @@ def select_ivf_topk(
     ivf_probe_select_kernel[(num_rows,)](
         query_pos,
         row_batch,
-        *run_args[:2],
+        *vis_args,
         score_ws,
         vis_ws,
         sel,
@@ -703,8 +732,9 @@ def select_ivf_topk(
         C=C,
         C_PAD=triton.next_power_of_2(C),
         P_PAD=P_PAD,
+        PAGE=key.page,
         IS_DECODE=is_decode,
-        num_warps=tune.probe_num_warps,
+        num_warps=tune.select_num_warps,
     )
     if is_decode:
         _collect_by_scan(
@@ -799,6 +829,10 @@ def _topk_and_emit(
     assert (cand is None) != (runs is None)
     num_rows, width = scores.shape
     selected = torch.empty((num_rows, topk), dtype=torch.int32, device=out.device)
+    if runs is not None and topk_backend == "auto":
+        # Prefill rows hold a few thousand candidates: one block per row beats
+        # the persistent radix kernel there (1.3-1.9x on H100).
+        topk_backend = "per_row"
     get_indexer_topk(topk_backend)(scores, topk_lens, 1, selected, topk, width)
     block = TUNING.emit_block
     if runs is not None:
@@ -1241,6 +1275,9 @@ def sparse_attn_indexer_ivf(
 
     if meta.num_prefills > 0:
         device = q_fp8.device
+        # A request without pools always takes the dense path, so every IVF
+        # segment's requests are built.
+        layout = None
         if built:
             layout = build_ivf_index(
                 key=key,
@@ -1256,7 +1293,6 @@ def sparse_attn_indexer_ivf(
                 ],
                 final_cpu=[meta.prefill_final_cpu[i] for i in built],
             )
-        num_rows = end - start
         row_batch, pool_pos, token_lens = _prefill_rows(
             meta.prefill_seq_lens_cpu,
             meta.prefill_query_lens_cpu,
@@ -1264,30 +1300,135 @@ def sparse_attn_indexer_ivf(
             kpool,
             device,
         )
-        if built:
+        query_lens = meta.prefill_query_lens_cpu
+        row_off = np.concatenate([[0], np.cumsum(query_lens)])
+        for first, last, dense in _prefill_segments(
+            num_pools_cpu, query_lens, config.exact_pools, max_scratch_bytes
+        ):
+            lo, hi = int(row_off[first]), int(row_off[last])
+            rows = slice(start + lo, start + hi)
+            if dense:
+                _dense_prefill_topk(
+                    key_cache=key_cache,
+                    block_table=meta.block_table[nd + first : nd + last],
+                    num_pools=num_pools_cpu[first:last],
+                    query_lens=query_lens[first:last],
+                    q_fp8=q_fp8[rows],
+                    weights=weights[rows],
+                    token_lens=token_lens[lo:hi],
+                    out=topk_indices_buffer[rows],
+                    topk=config.topk,
+                    kpool=kpool,
+                )
+                continue
             select_ivf_topk(
                 key=key,
                 state=state,
-                q_fp8=q_fp8[start:end],
-                weights=weights[start:end],
-                row_batch=row_batch,
-                query_pos=pool_pos,
+                q_fp8=q_fp8[rows],
+                weights=weights[rows],
+                row_batch=row_batch[lo:hi],
+                query_pos=pool_pos[lo:hi],
                 config=config,
-                out=topk_indices_buffer[start:end],
+                out=topk_indices_buffer[rows],
                 topk_backend=topk_backend,
                 layout=layout,
                 max_scratch_bytes=max_scratch_bytes,
                 # A query sees at most its request's pools: no width read-back.
-                max_width=max(num_pools_cpu),
-                token_lens=token_lens,
+                max_width=max(num_pools_cpu[first:last]),
+                token_lens=token_lens[lo:hi],
             )
-        else:
-            pools = torch.full(
-                (num_rows, config.topk), -1, dtype=torch.int32, device=device
-            )
-            tokens = kpool_ops.expand_pools_and_append_tail(pools, token_lens, kpool)
-            topk_indices_buffer[start:end, : tokens.shape[1]] = tokens
     return topk_indices_buffer
+
+
+def _prefill_segments(
+    num_pools: list[int], query_lens: list[int], exact_pools: int, max_bytes: int
+) -> list[tuple[int, int, bool]]:
+    """Runs [first, last) of consecutive prefill requests that take the same
+    path: dense (at most ``exact_pools`` pools, its fp32 logits within
+    ``max_bytes``) or IVF probing."""
+    segments: list[tuple[int, int, bool]] = []
+    rows = pools = 0
+    for i, (n, q) in enumerate(zip(num_pools, query_lens)):
+        dense = n <= exact_pools and q * n * 4 <= max_bytes
+        if (
+            segments
+            and segments[-1][2] == dense
+            and (not dense or (rows + q) * (pools + n) * 4 <= max_bytes)
+        ):
+            segments[-1] = (segments[-1][0], i + 1, dense)
+        else:
+            segments.append((i, i + 1, dense))
+            rows = pools = 0
+        rows += q
+        pools += n
+    return segments
+
+
+def _dense_prefill_topk(
+    *,
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    num_pools: list[int],
+    query_lens: list[int],
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    token_lens: torch.Tensor,
+    out: torch.Tensor,
+    topk: int,
+    kpool: int,
+) -> None:
+    """The kpool indexer's prefill selection for consecutive requests: every
+    visible pool scored (DeepGEMM), the top-k pools expanded to tokens."""
+    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+    num_rows = q_fp8.shape[0]
+    total = sum(num_pools)
+    if total == 0:
+        pool_ids = torch.full(
+            (num_rows, topk), -1, dtype=torch.int32, device=q_fp8.device
+        )
+    else:
+        num_reqs = len(num_pools)
+        cu = np.concatenate([[0], np.cumsum(num_pools)])
+        host = torch.empty(
+            (num_reqs + 1 + num_rows,), dtype=torch.int32, pin_memory=True
+        )
+        host_np = host.numpy()
+        host_np[: num_reqs + 1] = cu
+        # Row r scores its request's pools [ks, ks + visible) of the gather.
+        host_np[num_reqs + 1 :] = np.repeat(cu[:-1], query_lens)
+        dev = host.to(q_fp8.device, non_blocking=True)
+        cu_seq_lens, ks = dev[: num_reqs + 1], dev[num_reqs + 1 :]
+        ke = ks + token_lens // kpool
+        k_fp8 = torch.empty(
+            (total, q_fp8.shape[2]), dtype=q_fp8.dtype, device=q_fp8.device
+        )
+        k_scale = torch.empty((total, 4), dtype=torch.uint8, device=q_fp8.device)
+        ops.cp_gather_indexer_k_quant_cache(
+            key_cache, k_fp8, k_scale, block_table, cu_seq_lens
+        )
+        logits = fp8_fp4_mqa_logits(
+            (q_fp8, None),
+            (k_fp8, k_scale.view(torch.float32).squeeze(-1)),
+            weights,
+            ks,
+            ke,
+            clean_logits=False,
+        )
+        pool_ids = torch.empty((num_rows, topk), dtype=torch.int32, device=q_fp8.device)
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            ks,
+            ke,
+            pool_ids,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk,
+        )
+    tokens = kpool_ops.expand_pools_and_append_tail(pool_ids, token_lens, kpool)
+    out[:, : tokens.shape[1]] = tokens
+    out[:, tokens.shape[1] :] = -1
 
 
 @CustomOp.register("sparse_attn_indexer_ivf")

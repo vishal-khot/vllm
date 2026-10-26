@@ -11,12 +11,13 @@ from vllm.platforms import current_platform
 
 @dataclass(frozen=True)
 class IvfIndexerConfig:
-    """Fixed IVF counts (no adaptive probing).
+    """IVF counts.
 
     The keys are the kpool indexer's pools (``kpool`` tokens each) and
     ``topk`` counts pools. A request has ``num_clusters`` clusters (fewer only
-    while it has fewer pools) and a query probes ``num_probes`` of those with a
-    pool visible to it. A prefill row with more candidates than its scratch
+    while it has fewer pools) and a query probes at least ``num_probes`` of
+    those with a pool visible to it, more until they hold ``topk`` visible
+    pools. A prefill row with more candidates than its scratch
     holds drops its lowest-scoring probes.
     """
 
@@ -36,6 +37,10 @@ class IvfIndexerConfig:
     # from running sums; a chunk whose key count crosses a power of two
     # rebuilds all keys instead.
     kmeans_incremental: bool = True
+    # A prefill request with at most this many pools scores all of them
+    # densely, as the kpool indexer does: exact, and faster than probing
+    # while its clusters are small.
+    exact_pools: int = 0
 
     @classmethod
     def from_hf_config(cls, config, max_model_len: int) -> "IvfIndexerConfig":
@@ -45,6 +50,7 @@ class IvfIndexerConfig:
         kmeans_iters = getattr(config, "index_kmeans_iters", 10)
         warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
+        exact_pools = getattr(config, "index_exact_pools", 4096)
         if not 1 <= num_clusters <= 32767:
             raise ValueError(
                 f"index_num_clusters must be in [1, 32767], got {num_clusters}"
@@ -53,6 +59,8 @@ class IvfIndexerConfig:
             raise ValueError(
                 f"index_num_probes must be in [1, index_num_clusters], got {num_probes}"
             )
+        if exact_pools < 0:
+            raise ValueError(f"index_exact_pools must be >= 0, got {exact_pools}")
         if kmeans_iters < 0:
             raise ValueError(f"index_kmeans_iters must be >= 0, got {kmeans_iters}")
         if warm_iters < 0:
@@ -72,6 +80,7 @@ class IvfIndexerConfig:
             kmeans_stop_fraction=stop_fraction,
             kmeans_warm_iters=warm_iters,
             kmeans_incremental=bool(getattr(config, "index_kmeans_incremental", True)),
+            exact_pools=exact_pools,
         )
 
 

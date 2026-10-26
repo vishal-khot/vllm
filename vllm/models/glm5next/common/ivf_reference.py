@@ -257,19 +257,24 @@ def probe_reference(
     kmeans: KmeansResult,
     visible: torch.Tensor,
     num_probes: int,
+    min_keys: int = 0,
 ) -> torch.Tensor:
     """Bool [C] of probed clusters; ``visible`` [C] is each cluster's visible size.
 
-    Scores the live centroids by ``probe_scores_reference`` and probes the best
-    ``num_probes`` of those with a visible key, ties to the lower cluster id.
+    Scores the live centroids by ``probe_scores_reference`` and probes, among
+    those with a visible key, the best ``num_probes`` and then the next best
+    until the probed clusters hold ``min_keys`` visible keys; ties to the lower
+    cluster id.
     """
     C = kmeans.sizes.shape[0]
     score = probe_scores_reference(q_fp8, weights, kmeans.centroids)
     eligible = (torch.arange(C) < kmeans.n_clusters) & (visible > 0)
     ids = torch.nonzero(eligible).flatten()
-    order = torch.argsort(score[ids], descending=True, stable=True)
+    ids = ids[torch.argsort(score[ids], descending=True, stable=True)]
+    held = visible[ids].cumsum(0)
+    k = max(num_probes, int((held < min_keys).sum()) + 1)
     probed = torch.zeros(C, dtype=torch.bool)
-    probed[ids[order[:num_probes]]] = True
+    probed[ids[:k]] = True
     return probed
 
 
@@ -348,6 +353,7 @@ def ivf_select_one_reference(
         kmeans=kmeans,
         visible=visible,
         num_probes=C if t < topk else num_probes,
+        min_keys=topk,
     )
     total = int(visible[probed].sum())
     cand = collect_reference(
