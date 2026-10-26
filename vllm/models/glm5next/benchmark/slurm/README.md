@@ -6,13 +6,15 @@
 PARTITION=<p> QOS=<q> GRES=gpu:<type>:8 bash run_benchmark.sh
 ```
 
-`run_benchmark.sh` does everything: ensures the fork is on the
-`benchmarking-v0.32.0` branch (vLLM v0.32.0 + IVF), installs `uv`, downloads
-the model to `./model`, generates RULER data to `./ruler`, builds the vLLM
-venv once (a short GPU job), then submits both experiments (each waits for the
-build). The **number of GPUs in `GRES` becomes the tensor-parallel size**, so
-pick 8 (or 4 for `MODE=preempt`); the GPUs must together hold ~306 GB. Run it
-under `tmux`/`nohup` — the model download is large.
+`run_benchmark.sh` does everything: puts this harness clone on
+`benchmarking-v0.32.0` (plain vLLM v0.32.0 + this harness) and a second clone,
+`GLM5_IVF_REPO` (default `../vllm-ivf`), on `ivf-dsa-kmeans-indexer-v0.32.0`
+(the IVF indexer), installs `uv`, downloads the model to `./model`, generates
+RULER data to `./ruler`, builds both venvs once (a short GPU job), then submits
+both experiments (each waits for the build). The **number of GPUs in `GRES`
+becomes the tensor-parallel size**, so pick 8 (or 4 for `MODE=preempt`); the
+GPUs must together hold ~306 GB. Run it under `tmux`/`nohup` — the model
+download is large.
 
 Inputs:
 - **Required:** `PARTITION`, `QOS`, `GRES` (e.g. `gpu:A100_80GB:8`) — your
@@ -164,12 +166,15 @@ is the single source of truth.
   and the jobs serve from it (`SHARED_MODEL_DIR`). Run a `.sbatch` directly with
   neither `SHARED_MODEL_DIR` nor the model present and it falls back to a
   node-local download under `/scratch/$USER/glm5` (~306 GB, resumable per node).
-- **venvs.** The IVF arm serves from `$REPO/.venv` (`VLLM_USE_PRECOMPILED=1 uv
-  pip install -e .`, works because `.git` is present). The kpool arm serves
+- **venvs.** The ivf arm serves the IVF clone from `$GLM5_IVF_REPO/.venv`
+  (`VLLM_USE_PRECOMPILED=1 uv pip install -e .` there). The kpool arm serves
   **unmodified stock vLLM** from `$REPO/.venv-stock` (`vllm==0.32.0` from PyPI,
-  `STOCK_VLLM_VERSION` to change), so none of this branch's commits are in the
-  baseline; only the timing/memory instrument is injected on eager runs, in both
-  arms alike. Both build once and are reused.
+  `STOCK_VLLM_VERSION` to change), so none of our commits are in the baseline.
+  The build job checks that each venv imports the vLLM it should. Only the
+  timing/memory instrument (from this harness) is injected, on eager runs, in
+  both arms alike. Both venvs build once and are reused. Servers start in their
+  run's output dir, outside both clones, so neither clone's `vllm/` can shadow
+  the venv's.
 - **Eager runs run every sample** (`n: all` / the base pair); graph runs use
   `n=20`. The eager path is single-stream and slow, so the full-sample fidelity
   sweep can take a long time — restrict with `lost_attention_run.py --n <k>` or

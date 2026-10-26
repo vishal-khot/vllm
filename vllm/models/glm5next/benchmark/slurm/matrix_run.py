@@ -138,16 +138,14 @@ def run_one(run, args) -> dict:
     for d in (base_out, timing_dir, lost_dir):
         os.makedirs(d, exist_ok=True)
 
-    # A local model path must survive the stock server's cwd change.
+    # A local model path must survive the server's cwd change.
     model = os.path.abspath(args.model) if os.path.exists(args.model) else args.model
     cmd = _serve_cmd(run, model, args.tp, args.port, args.gpu_mem_util)
     print(f"[{run.id}] serve: {' '.join(cmd)}", flush=True)
-    # Start the stock server outside the repo: a cwd on sys.path (python -c
-    # children) would otherwise import the fork's vllm/ package.
+    # Start the server outside both clones: a cwd on sys.path (python -c
+    # children) would otherwise import that clone's vllm/ package.
     proc = subprocess.Popen(
-        cmd,
-        env=_serve_env(run, timing_dir, lost_dir),
-        cwd=base_out if run.indexer == "kpool" else None,
+        cmd, env=_serve_env(run, timing_dir, lost_dir), cwd=base_out
     )
 
     accuracy: dict = {}

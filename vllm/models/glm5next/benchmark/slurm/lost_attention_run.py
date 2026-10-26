@@ -229,7 +229,9 @@ def run_cell(
     tasks; recall is reported per task.
     """
     tag = f"L{length} C{clusters} P{probes}({pct:g}%)"
-    cell_out = os.path.join(args.out_dir, f"L{length}", f"C{clusters}_P{probes}")
+    cell_out = os.path.abspath(
+        os.path.join(args.out_dir, f"L{length}", f"C{clusters}_P{probes}")
+    )
     # Drop any partial dir from a preempted attempt so stale per-rank dumps
     # (globbed by the summarizers) don't bleed into this cell's numbers.
     if os.path.isdir(cell_out):
@@ -240,11 +242,16 @@ def run_cell(
     os.makedirs(timing_dir, exist_ok=True)
 
     max_len = length + max(TASKS[t]["max_tokens"] for t in tasks) + _LEN_MARGIN
+    # The server runs from cell_out (outside both clones, see matrix_run.py),
+    # so a local model path must be absolute.
+    model = os.path.abspath(args.model) if os.path.exists(args.model) else args.model
     cmd = _serve(
-        args.model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
+        model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
     )
     print(f"[{tag}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, env=_serve_env(lost_dir, timing_dir))
+    proc = subprocess.Popen(
+        cmd, env=_serve_env(lost_dir, timing_dir), cwd=cell_out
+    )
     per_task: dict[str, dict] = {}
     try:
         t0 = time.time()

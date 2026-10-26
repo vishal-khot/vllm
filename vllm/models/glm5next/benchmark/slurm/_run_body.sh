@@ -28,7 +28,9 @@ MODEL_REPO="zai-org/GLM-5.3-Flash"
 # writable spot for the HF cache. Point GLM5_NODE_SCRATCH at shared storage there.
 NODE_SCRATCH="${GLM5_NODE_SCRATCH:-/scratch/${USER}/glm5}"
 MODEL_DIR="${NODE_SCRATCH}/GLM-5.3-Flash"
-VENV="${GLM5_VENV:-${REPO}/.venv}"
+# The ivf arm's vLLM lives in its own clone (see run_benchmark.sh).
+IVF_REPO="${GLM5_IVF_REPO:-$(dirname "${REPO}")/vllm-ivf}"
+VENV="${GLM5_VENV:-${IVF_REPO}/.venv}"
 RULER_SRC="${RULER_SRC:-}"
 
 : "${GLM5_TP:?set by the sbatch wrapper}"
@@ -56,19 +58,19 @@ export PATH="${HOME}/.local/bin:${PATH}"   # uv installs here
 export HF_HOME="${HF_HOME:-${NODE_SCRATCH}/hf}"   # keep a caller-set HF_HOME
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# ---- 1. vLLM + fork venv (built once; .venv lives in the persistent repo) ----
+# ---- 1. vLLM + IVF venv (built once; .venv lives in the persistent IVF clone) ----
 if ! "${VENV}/bin/python" -c "import vllm" >/dev/null 2>&1; then
   echo "[$(date +%T)] building vLLM venv (VLLM_USE_PRECOMPILED) ..."
   uv venv --python 3.12 "${VENV}"
   # .git is present on Babel, so setuptools-scm resolves the version; IVF is
   # pure Python/Triton so the precompiled .so are reused (no CUDA rebuild).
-  ( cd "${REPO}" && VLLM_USE_PRECOMPILED=1 \
+  ( cd "${IVF_REPO}" && VLLM_USE_PRECOMPILED=1 \
       VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://wheels.vllm.ai/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl}" \
       uv pip install --python "${VENV}/bin/python" -e . \
         --torch-backend="${TORCH_BACKEND:-auto}" )
 fi
 source "${VENV}/bin/activate"
-python -c "import vllm; print('vllm', vllm.__version__)"
+( cd / && python -c "import vllm; print('ivf vllm', vllm.__version__, vllm.__file__)" )
 
 # ---- 2. tasks + lengths to stage, read straight from runs.yaml ----
 read -r TASKS LENGTHS < <(python - "${RUNS_YAML}" <<'PY'

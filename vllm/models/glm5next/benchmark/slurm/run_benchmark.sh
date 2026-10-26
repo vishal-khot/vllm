@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # ONE command to run the whole GLM-5.3-Flash RULER benchmark on a Slurm cluster.
 # It does everything:
-#   1. ensure the fork is cloned and on the `benchmarking-v0.32.0` branch,
+#   1. ensure the harness clone is on `benchmarking-v0.32.0` (plain v0.32.0 +
+#      this harness) and the IVF clone (GLM5_IVF_REPO, default ../vllm-ivf) is
+#      on `ivf-dsa-kmeans-indexer-v0.32.0`,
 #   2. install uv,
 #   3. download the model to ./model (current dir),
 #   4. generate RULER data to ./ruler (current dir),
-#   5. build the vLLM venv once (a short GPU job),
+#   5. build both venvs once (a short GPU job): the IVF fork for the ivf arm and
+#      stock vllm==0.32.0 from PyPI for the kpool arm,
 #   6. submit the A/B matrix and the IVF fidelity sweep (both wait for the build).
 #
 # Usage (set your cluster's partition/qos/gres; #GPUs in GRES becomes TP):
@@ -20,7 +23,9 @@
 #            NUM_SAMPLES (RULER samples/task, default 100), GLM5_ONLY=<run ids>,
 #            TORCH_BACKEND (default auto; set e.g. cu128 if the venv build picks
 #            a torch that ABI-mismatches the precompiled vLLM wheel),
-#            REPO_URL, BRANCH (default benchmarking-v0.32.0), CLONE_DEST.
+#            REPO_URL, BRANCH (default benchmarking-v0.32.0), CLONE_DEST,
+#            GLM5_IVF_REPO, IVF_REPO_URL, IVF_BRANCH
+#            (default ivf-dsa-kmeans-indexer-v0.32.0).
 #
 # Preemption: the preempt wrappers set --requeue, and the runners resume --
 # a requeued job re-runs only the runs/cells that have not yet written
@@ -32,6 +37,7 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/vishal-khot/vllm.git}"
 BRANCH="${BRANCH:-benchmarking-v0.32.0}"
+IVF_BRANCH="${IVF_BRANCH:-ivf-dsa-kmeans-indexer-v0.32.0}"
 MODE="${MODE:-normal}"
 SETUP_ONLY="${SETUP_ONLY:-0}"   # 1 = stage repo/uv/model/RULER then stop (no sbatch)
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
@@ -68,6 +74,19 @@ say "repo: ${REPO}"
 ( cd "${REPO}" && git fetch origin "${BRANCH}" && git checkout "${BRANCH}" \
     && git pull --ff-only origin "${BRANCH}" ) \
   || say "WARNING: could not sync ${BRANCH} (continuing with the checked-out tree)"
+
+# The IVF arm builds from its own clone, so the harness tree (plain v0.32.0)
+# carries none of the IVF code.
+IVF_REPO="${GLM5_IVF_REPO:-$(dirname "${REPO}")/vllm-ivf}"
+IVF_REPO_URL="${IVF_REPO_URL:-${REPO_URL}}"
+if [ ! -d "${IVF_REPO}/.git" ]; then
+  say "cloning ${IVF_REPO_URL} (${IVF_BRANCH}) -> ${IVF_REPO}"
+  git clone --branch "${IVF_BRANCH}" "${IVF_REPO_URL}" "${IVF_REPO}"
+fi
+say "ivf repo: ${IVF_REPO}"
+( cd "${IVF_REPO}" && git fetch origin "${IVF_BRANCH}" && git checkout "${IVF_BRANCH}" \
+    && git pull --ff-only origin "${IVF_BRANCH}" ) \
+  || say "WARNING: could not sync ${IVF_BRANCH} (continuing with the checked-out tree)"
 SLURM_DIR="${REPO}/vllm/models/glm5next/benchmark/slurm"
 
 # ---- 2. uv ----
@@ -119,13 +138,13 @@ fi
 # Pass config to the jobs through the environment (carried by --export=ALL).
 # NOT via --export=k=v,... because GLM5_ONLY may contain commas, which SLURM
 # would misparse as extra assignments.
-export GLM5_REPO="${REPO}" GLM5_TP="${TP}"
+export GLM5_REPO="${REPO}" GLM5_IVF_REPO="${IVF_REPO}" GLM5_TP="${TP}"
 export SHARED_MODEL_DIR="${MODEL_DIR}" SHARED_RULER_DIR="${RULER_DIR}"
 [ -n "${HF_TOKEN:-}" ] && export HF_TOKEN
 [ -n "${GLM5_ONLY:-}" ] && export GLM5_ONLY
 [ -n "${TORCH_BACKEND:-}" ] && export TORCH_BACKEND
 
-# ---- 5. build the venv once, on a GPU node (1 GPU) ----
+# ---- 5. build both venvs once, on a GPU node (1 GPU) ----
 BUILD_GRES="${GRES%:*}:1"
 BUILD_ID=$(sbatch --parsable --job-name=glm5-build \
   --partition="${PARTITION}" --qos="${QOS}" --gres="${BUILD_GRES}" \

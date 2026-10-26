@@ -70,7 +70,8 @@ for run in matrix.runs:
 How much the IVF P-probe selection misses vs probing every cluster (exact top-k).
 Gated by `VLLM_DSA_IVF_MEASURE_LOST_ATTENTION=1` (set automatically when a run has
 `measure_lost_attention: true`); roughly doubles selection cost, so it is for
-select runs only. Code: `vllm/models/glm5next/nvidia/ivf_fidelity.py`.
+select runs only. Code: `vllm/models/glm5next/nvidia/ivf_fidelity.py` on the IVF
+branch (`ivf-dsa-kmeans-indexer-v0.32.0`, the `GLM5_IVF_REPO` clone).
 
 Two fractions, dumped at exit to `lost_attention_pid<N>.json` (dir from
 `VLLM_DSA_IVF_LOST_ATTENTION_DIR`, else cwd), per (layer, phase):
