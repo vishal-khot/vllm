@@ -125,7 +125,17 @@ class Run:
         if self.hf_overrides:
             import json
 
-            args += ["--hf-overrides", json.dumps(self.hf_overrides)]
+            # GLM-5.3 is multimodal: the indexer knobs live on the nested
+            # text_config, so index_* overrides must target it. A flat key
+            # lands on the top glm5_next config and is silently ignored
+            # (clusters/probes fall back to 64/8). Non-index keys stay top-level.
+            nested = {k: v for k, v in self.hf_overrides.items()
+                      if k.startswith("index_")}
+            payload = {k: v for k, v in self.hf_overrides.items()
+                       if not k.startswith("index_")}
+            if nested:
+                payload["text_config"] = nested
+            args += ["--hf-overrides", json.dumps(payload)]
         return args
 
     def serve_key(self) -> tuple:

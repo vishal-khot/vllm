@@ -146,8 +146,13 @@ def _serve(
         "--enforce-eager",
         "--no-enable-prefix-caching",
         "--port", str(port),
+        # GLM-5.3 is multimodal: the indexer reads the nested text_config, so
+        # the override must target text_config. A flat key lands on the top
+        # glm5_next config and is silently ignored (clusters/probes -> 64/8).
         "--hf-overrides", json.dumps(
-            {"index_num_clusters": clusters, "index_num_probes": probes}
+            {"text_config": {
+                "index_num_clusters": clusters, "index_num_probes": probes,
+            }}
         ),
     ]
 
