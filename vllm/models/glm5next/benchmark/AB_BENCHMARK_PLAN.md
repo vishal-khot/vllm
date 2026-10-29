@@ -106,7 +106,7 @@ match on stock). Only the indexer differs.
 
 ## Open items
 
-1. `--hf-overrides '{"index_num_probes":64}'` lands in `getattr(config, "index_num_probes")` — verify on Modal.
+1. Resolved: flat `--hf-overrides` keys never reached the indexer (its fields live under `text_config`). The harness now nests them and checks the counts the server logs.
 2. Modal fork-image build time/cost (first build) with precompiled artifacts.
 3. Is there a **dense** indexer path for the fidelity ceiling, or do we reference k-pool full-score?
 4. IVF + no-prefix-caching + chunked prefill at 16K — watch `ivf_config` startup refusals.

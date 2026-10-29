@@ -24,6 +24,10 @@ Everything is one of two arms, set by `VLLM_ENABLE_DSA_IVF_INDEXER`:
 
 IVF knobs come from model config via `--hf-overrides`: `index_num_clusters`
 (P in `runs.yaml` -> `index_num_probes`, `clusters` -> `index_num_clusters`).
+The serve command nests them under `text_config` (`nest_index_overrides`),
+where GLM-5.3-Flash keeps them; flat keys are silently ignored. After startup
+the runners check the counts the server logs (`IVF indexer: num_clusters=...`)
+and fail on a mismatch.
 IVF forces prefix caching off; the kpool arm matches it for fairness.
 
 ## Inspect the matrix
@@ -126,7 +130,5 @@ happens on Modal. Before any GPU run:
 - `cadence` is a **log-only label**: recorded in each run's config and printed, but
   not swept and not wired to the indexer (no `cluster_interval`; rebuild mode is
   chosen automatically in `build_ivf_index`). Don't present it as a measured variable.
-- Verify `--hf-overrides` knobs actually reach `getattr(config, "index_num_probes")`
-  on Modal — this was an open item.
 - Watch `ivf_config` startup refusals (IVF + no-prefix-caching + chunked prefill at
   16K); see `check_ivf_indexer_supported`.

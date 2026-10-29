@@ -29,7 +29,6 @@ import concurrent.futures as cf
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 
@@ -42,8 +41,10 @@ from tasks import TASKS, recall  # noqa: E402
 
 # Reuse the proven serve/HTTP/summary helpers from the fidelity runner.
 from lost_attention_run import (  # noqa: E402
+    _check_ivf_counts,
     _get,
     _post_stream,
+    _start_server,
     _summarize_lost,
     _summarize_timing,
     _wait_ready,
@@ -184,8 +185,8 @@ def run_one(run, args) -> dict:
     print(f"[{run.id}] serve: {' '.join(cmd)}", flush=True)
     # Start the server outside both clones: a cwd on sys.path (python -c
     # children) would otherwise import that clone's vllm/ package.
-    proc = subprocess.Popen(
-        cmd, env=_serve_env(run, timing_dir, lost_dir), cwd=base_out
+    proc, ivf_counts = _start_server(
+        cmd, _serve_env(run, timing_dir, lost_dir), base_out
     )
 
     accuracy: dict = {}
@@ -196,6 +197,12 @@ def run_one(run, args) -> dict:
         t0 = time.time()
         _wait_ready(proc, args.port, args.startup_timeout)
         print(f"[{run.id}] ready in {time.time() - t0:.0f}s", flush=True)
+        if run.indexer == "ivf":
+            _check_ivf_counts(
+                ivf_counts,
+                run.hf_overrides["index_num_clusters"],
+                run.hf_overrides["index_num_probes"],
+            )
 
         for ds in run.datasets:
             if ds.name != "ruler":

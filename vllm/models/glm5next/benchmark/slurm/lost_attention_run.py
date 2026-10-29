@@ -27,9 +27,11 @@ import concurrent.futures as cf
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -146,10 +148,45 @@ def _serve(
         "--enforce-eager",
         "--no-enable-prefix-caching",
         "--port", str(port),
-        "--hf-overrides", json.dumps(
-            {"index_num_clusters": clusters, "index_num_probes": probes}
-        ),
+        # GLM-5.3-Flash keeps its index_* fields under text_config.
+        "--hf-overrides", json.dumps({"text_config": {
+            "index_num_clusters": clusters, "index_num_probes": probes,
+        }}),
     ]
+
+
+# Logged once per worker by the IVF indexer at init.
+_IVF_COUNTS = re.compile(r"IVF indexer: num_clusters=(\d+), num_probes=(\d+)")
+
+
+def _start_server(cmd: list[str], env: dict, cwd: str):
+    """Start `vllm serve`, echoing its output, and collect the IVF counts it
+    logs: (proc, counts), counts filling in as the workers init."""
+    proc = subprocess.Popen(
+        cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace", bufsize=1,
+    )
+    counts: set[tuple[int, int]] = set()
+
+    def pump() -> None:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if m := _IVF_COUNTS.search(line):
+                counts.add((int(m.group(1)), int(m.group(2))))
+
+    threading.Thread(target=pump, daemon=True).start()
+    return proc, counts
+
+
+def _check_ivf_counts(counts: set, clusters: int, probes: int) -> None:
+    """Fail unless the serving indexer uses exactly the requested counts: an
+    override that misses the indexer's config is otherwise silent."""
+    if counts != {(clusters, probes)}:
+        raise RuntimeError(
+            f"IVF counts in effect {sorted(counts) or 'not logged'} != "
+            f"requested (clusters={clusters}, probes={probes})"
+        )
 
 
 def _wait_ready(proc: subprocess.Popen, port: int, timeout_s: float) -> None:
@@ -266,14 +303,15 @@ def run_cell(
         model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
     )
     print(f"[{tag}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(
-        cmd, env=_serve_env(lost_dir, timing_dir), cwd=cell_out
+    proc, ivf_counts = _start_server(
+        cmd, _serve_env(lost_dir, timing_dir), cell_out
     )
     per_task: dict[str, dict] = {}
     try:
         t0 = time.time()
         _wait_ready(proc, args.port, args.startup_timeout)
         print(f"[{tag}] ready in {time.time() - t0:.0f}s", flush=True)
+        _check_ivf_counts(ivf_counts, clusters, probes)
 
         cap = None if n in ("all", None, 0) else int(n)
         for task in tasks:

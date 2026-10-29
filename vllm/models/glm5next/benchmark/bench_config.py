@@ -37,6 +37,17 @@ class ConfigError(ValueError):
     """Raised when `runs.yaml` is internally inconsistent."""
 
 
+def nest_index_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """`--hf-overrides` for GLM-5.3-Flash: its index_* fields live under
+    text_config, and a flat key only sets the top-level config, which the
+    indexer never reads."""
+    out = {k: v for k, v in overrides.items() if not k.startswith("index_")}
+    index = {k: v for k, v in overrides.items() if k.startswith("index_")}
+    if index:
+        out["text_config"] = {**out.get("text_config", {}), **index}
+    return out
+
+
 # Every run must list all of these, so no config is ever silently defaulted.
 # Set a field to null when it does not apply to the run (e.g. P on a kpool arm).
 _REQUIRED_RUN_FIELDS = (
@@ -125,7 +136,8 @@ class Run:
         if self.hf_overrides:
             import json
 
-            args += ["--hf-overrides", json.dumps(self.hf_overrides)]
+            overrides = nest_index_overrides(self.hf_overrides)
+            args += ["--hf-overrides", json.dumps(overrides)]
         return args
 
     def serve_key(self) -> tuple:
