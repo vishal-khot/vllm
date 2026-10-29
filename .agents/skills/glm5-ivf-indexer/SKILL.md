@@ -18,17 +18,20 @@ fewer than 512 visible pools), scores every visible pool in them and takes
 the top 512. Key writes, the tail pool and the
 pool-to-token expansion are the stock kpool indexer's. With P = C every pool
 is a candidate, so the selection equals stock's exactly. Use that as the
-correctness anchor. A prefill request with at most `index_exact_pools` pools
-(default 4096, 16k tokens) skips probing and scores every pool densely as
-stock does (DeepGEMM logits, per-row top-k): exact, and faster while its
-clusters are small. k-means still builds for it.
+correctness anchor. Every prefill request probes by default. Setting
+`index_exact_pools` makes a request with at most that many pools score every
+pool densely as stock does (DeepGEMM logits, per-row top-k); k-means still
+builds for it.
 
 Enable it with `VLLM_ENABLE_DSA_IVF_INDEXER=1`. Set the counts with
-`--hf-overrides '{"index_num_clusters": C, "index_num_probes": P}'`. Other
+`--hf-overrides '{"text_config": {"index_num_clusters": C, "index_num_probes": P}}'`.
+The `index_*` fields live under `text_config`: flat keys only set the
+top-level config and are silently ignored. The server logs the counts in
+effect once (`IVF indexer: num_clusters=..., num_probes=...`). Other
 override keys are `index_kmeans_iters`, `index_kmeans_warm_iters`,
 `index_kmeans_stop_fraction`, `index_kmeans_seed`,
-`index_kmeans_incremental` and `index_exact_pools` (0 probes every
-request); see `IvfIndexerConfig.from_hf_config`.
+`index_kmeans_incremental` and `index_exact_pools` (default 0: every
+request probes); see `IvfIndexerConfig.from_hf_config`.
 
 ## File map
 

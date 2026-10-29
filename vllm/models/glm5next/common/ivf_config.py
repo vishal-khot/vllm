@@ -38,8 +38,7 @@ class IvfIndexerConfig:
     # rebuilds all keys instead.
     kmeans_incremental: bool = True
     # A prefill request with at most this many pools scores all of them
-    # densely, as the kpool indexer does: exact, and faster than probing
-    # while its clusters are small.
+    # densely, as the kpool indexer does (0: every request probes).
     exact_pools: int = 0
 
     @classmethod
@@ -50,7 +49,7 @@ class IvfIndexerConfig:
         kmeans_iters = getattr(config, "index_kmeans_iters", 10)
         warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
-        exact_pools = getattr(config, "index_exact_pools", 4096)
+        exact_pools = getattr(config, "index_exact_pools", 0)
         if not 1 <= num_clusters <= 32767:
             raise ValueError(
                 f"index_num_clusters must be in [1, 32767], got {num_clusters}"

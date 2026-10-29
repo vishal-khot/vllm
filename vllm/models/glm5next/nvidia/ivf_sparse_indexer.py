@@ -31,13 +31,13 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import get_indexer_topk
-from vllm.models.glm5next.nvidia import ivf_fidelity
 from vllm.models.glm5next.common.ivf_backend import (
     IvfIndexerMetadata,
     IvfStateMetadata,
 )
 from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig
 from vllm.models.glm5next.common.sparse_indexer import RADIX_TOPK_WORKSPACE_SIZE
+from vllm.models.glm5next.nvidia import ivf_fidelity
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.nvidia.ops.ivf_index import (
     REC_BYTES,
@@ -46,8 +46,7 @@ from vllm.models.glm5next.nvidia.ops.ivf_index import (
     ivf_emit_runs_kernel,
     ivf_group_count_kernel,
     ivf_group_fill_kernel,
-    ivf_group_offsets_kernel,
-    ivf_group_scan_kernel,
+    ivf_group_plan_kernel,
     ivf_grouped_score_kernel,
     ivf_kmeans_append_kernel,
     ivf_kmeans_append_update_kernel,
@@ -124,6 +123,11 @@ class IvfKernelTuning:
     plan_block_c: int = 64
     # Row tiles per step of the per-cluster row-tile scan.
     plan_scan_tiles: int = 16
+    # Widest score view the per_row top-k sees (0: the full width). That kernel
+    # picks its final sort by row width and its radix sort (from 12288
+    # columns) is several times slower on IVF rows; a row reads only its own
+    # length, so a narrower view of the same buffer selects the same keys.
+    topk_view_cols: int = 12287
 
 
 TUNING = IvfKernelTuning()
@@ -657,8 +661,13 @@ def select_ivf_topk(
     if is_decode:
         width = max_count = key.block_table.shape[1] * key.page
         cand = torch.empty((num_rows, width), dtype=torch.int32, device=device)
+        groups = counts  # no group tables: the probe select clears none
     else:
         width, cand = 0, counts  # prefill emits from the run layout instead
+        # The grouped score's group tables, cleared by the probe select.
+        groups = torch.empty(
+            (2, layout.run_start.shape[0] * C), dtype=torch.int32, device=device
+        )
         max_count = 2**31 - 1
         if max_scratch_bytes is not None:
             per_row = max_scratch_bytes // (num_rows * 4) - topk
@@ -730,6 +739,8 @@ def select_ivf_topk(
         probe_base,
         config.num_probes,
         max_count,
+        groups,
+        0 if is_decode else groups.numel(),
         TOPK=topk,
         C=C,
         C_PAD=triton.next_power_of_2(C),
@@ -786,6 +797,7 @@ def select_ivf_topk(
         topk_lens=topk_lens,
         scores=scores,
         num_clusters=C,
+        groups=groups,
     )
     _topk_and_emit(
         counts=counts,
@@ -850,7 +862,10 @@ def _topk_and_emit(
         # Prefill rows hold a few thousand candidates: one block per row beats
         # the persistent radix kernel there (1.3-1.9x on H100).
         topk_backend = "per_row"
-    get_indexer_topk(topk_backend)(scores, topk_lens, 1, selected, topk, width)
+    view = scores
+    if topk_backend == "per_row" and TUNING.topk_view_cols:
+        view = scores[:, : min(width, TUNING.topk_view_cols)]
+    get_indexer_topk(topk_backend)(view, topk_lens, 1, selected, topk, width)
     if score_sum_out is not None:
         # Attention mass is the non-negative DSA relevance a key carries: a head
         # score is ReLU(q.k) but weighted by w_h, which can be negative, so the
@@ -957,11 +972,14 @@ def _score_grouped_gemm(
     topk_lens: torch.Tensor,
     scores: torch.Tensor,
     num_clusters: int,
+    groups: torch.Tensor,
 ) -> None:
     """Prefill scoring as one grouped GEMM over (batch row, cluster) groups.
 
     Groups, their row lists and the work list are built on the device; the
     persistent kernel reads the work total from memory, so nothing syncs.
+    ``groups`` [2, batch rows * C] (each group's probing rows and most visible
+    keys) arrives zeroed by ``ivf_probe_select_kernel``.
     """
     from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -969,19 +987,18 @@ def _score_grouped_gemm(
     num_rows = q_fp8.shape[0]
     C = num_clusters
     device = q_fp8.device
-    num_groups = layout.run_start.shape[0] * C
+    num_groups = groups.shape[1]
+    group_m, group_vis = groups
 
     row_tiles = triton.cdiv(num_rows, tune.plan_block_r)
-    group_m, group_vis = _alloc(
-        torch.int32, device, (num_groups,), (num_groups,), zero=True
-    )
     (
         group_off,
         unit_off,
         row_list,
+        row_vis,
+        row_first,
         tile_cnt,
         tile_base,
-        cluster_total,
         cluster_base,
     ) = _alloc(
         torch.int32,
@@ -989,9 +1006,10 @@ def _score_grouped_gemm(
         (num_groups,),
         (num_groups + 2,),
         (num_rows * C,),
+        (num_rows * C,),
+        (num_rows * C,),
         (row_tiles, C),
         (row_tiles, C),
-        (C,),
         (C,),
     )
     plan_grid = (row_tiles, triton.cdiv(C, tune.plan_block_c))
@@ -1008,37 +1026,36 @@ def _score_grouped_gemm(
         BLOCK_R=tune.plan_block_r,
         BLOCK_C=tune.plan_block_c,
     )
-    ivf_group_scan_kernel[(triton.cdiv(C, tune.plan_block_c),)](
-        tile_cnt,
-        tile_base,
-        cluster_total,
-        row_tiles,
-        C=C,
-        BLOCK_T=tune.plan_scan_tiles,
-        BLOCK_C=tune.plan_block_c,
-    )
     rows = max(1, tune.gemm_mma_cols // q_fp8.shape[1])
     chunked = layout.run_keys.shape[0] >= tune.gemm_chunked_keys * C
     key_chunks = tune.gemm_key_chunks if chunked else 1
-    ivf_group_offsets_kernel[(1,)](
+    ivf_group_plan_kernel[(1,)](
+        tile_cnt,
+        tile_base,
         group_m,
         group_vis,
-        cluster_total,
         cluster_base,
         unit_off,
+        row_tiles,
         num_groups,
         C=C,
+        C_PAD=triton.next_power_of_2(C),
         UNIT_KEYS=tune.gemm_block_n * key_chunks,
         UNIT_ROWS=rows * tune.gemm_row_tiles,
+        BLOCK_T=tune.plan_scan_tiles,
         BLOCK=1024,
     )
     ivf_group_fill_kernel[plan_grid](
         sel,
+        vis_ws,
+        ends,
         topk_lens,
         row_batch,
         tile_base,
         cluster_base,
         row_list,
+        row_vis,
+        row_first,
         group_off,
         num_rows,
         C=C,
@@ -1059,13 +1076,12 @@ def _score_grouped_gemm(
         group_off,
         unit_off,
         row_list,
-        vis_ws,
-        ends,
+        row_vis,
+        row_first,
         scores,
         scores.shape[1],
         num_groups,
         num_groups.bit_length(),
-        C=C,
         H=q_fp8.shape[1],
         BLOCK_N=tune.gemm_block_n,
         KEY_CHUNKS=key_chunks,
@@ -1117,15 +1133,22 @@ def _collect_by_scan(
 
 def _select_scratch_bytes(config: IvfIndexerConfig) -> int:
     """Prefill candidate scratch the profiler reserves: every scheduled row with
-    a quarter of the longest context's pools as candidates (probing an eighth
-    of the clusters finds at most ~n/4 keys on real prompts). A row with more
-    candidates than fit drops its lowest-scoring probes."""
+    a share of the longest context's pools as candidates. Probing P of C
+    clusters finds about P / C of the pools; the share is twice that (clusters
+    are uneven), at least a quarter and at most all of them, and all of them
+    when measuring lost attention (its reference probes every cluster). A row
+    with more candidates than fit drops its lowest-scoring probes."""
     cfg = get_current_vllm_config_or_none()
     if cfg is None:
         return 1 << 30
     max_tokens = cfg.scheduler_config.max_num_batched_tokens
-    quarter = triton.cdiv(cfg.model_config.max_model_len // config.kpool, 4)
-    return max_tokens * (quarter * 4 + config.topk * 4)
+    pools = cfg.model_config.max_model_len // config.kpool
+    if ivf_fidelity.enabled():
+        width = pools
+    else:
+        share = triton.cdiv(2 * pools * config.num_probes, config.num_clusters)
+        width = min(pools, max(triton.cdiv(pools, 4), share))
+    return max_tokens * (width + config.topk) * 4
 
 
 def _reserve_profile_memory(config: IvfIndexerConfig, device: torch.device) -> None:
@@ -1140,7 +1163,7 @@ def _reserve_profile_memory(config: IvfIndexerConfig, device: torch.device) -> N
     C = config.max_clusters
     # Probe tables (prefill lists up to every cluster per row), the selected
     # pools and their expansion to tokens.
-    probe_bytes = max_tokens * (C * 25 + 16 + config.topk * 4)
+    probe_bytes = max_tokens * (C * 33 + 16 + config.topk * 4)
     probe_bytes += max_tokens * (config.topk + 1) * config.kpool * 4
     prefill_bytes = _select_scratch_bytes(config)
     # Decode rows use the full pool capacity as their candidate width.
@@ -1329,8 +1352,12 @@ def sparse_attn_indexer_ivf(
                 score_sum_out=exact_mass,
             )
             ivf_fidelity.record(
-                k_cache_prefix, "decode", pools, exact_pools,
-                real_mass, exact_mass,
+                k_cache_prefix,
+                "decode",
+                pools,
+                exact_pools,
+                real_mass,
+                exact_mass,
             )
 
     if meta.num_prefills > 0:

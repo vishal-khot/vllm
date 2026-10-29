@@ -292,6 +292,13 @@ class Indexer(nn.Module):
             self.ivf_config = IvfIndexerConfig.from_hf_config(
                 config, vllm_config.model_config.max_model_len
             )
+            # Benchmark harnesses parse this line to check their overrides.
+            logger.info_once(
+                "IVF indexer: num_clusters=%d, num_probes=%d, exact_pools=%d",
+                self.ivf_config.num_clusters,
+                self.ivf_config.num_probes,
+                self.ivf_config.exact_pools,
+            )
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128

@@ -770,6 +770,65 @@ def test_prefill_scratch_bound_drops_lowest_scoring_probes():
     assert not torch.equal(ordered, uncapped.sort(dim=1).values)
 
 
+def test_scratch_budget_covers_twice_the_probed_share(monkeypatch):
+    """The prefill score scratch scales with P / C (twice the probed share of
+    the pools, between a quarter and all of them), so a high P / C keeps every
+    probe, and the lost-attention reference (every cluster) always fits."""
+    max_tokens, max_len, kpool, topk = 8192, 135168, 4, 512
+    cfg = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
+        model_config=SimpleNamespace(max_model_len=max_len),
+    )
+    monkeypatch.setattr(
+        ivf_sparse_indexer, "get_current_vllm_config_or_none", lambda: cfg
+    )
+    pools = max_len // kpool
+
+    def width(clusters, probes):
+        config = dataclasses.replace(
+            _config(num_clusters=clusters, num_probes=probes),
+            max_clusters=clusters,
+            kpool=kpool,
+            topk=topk,
+        )
+        nbytes = ivf_sparse_indexer._select_scratch_bytes(config)
+        return nbytes // (max_tokens * 4) - topk
+
+    assert width(64, 8) == -(-pools // 4)
+    assert width(181, 45) == -(-2 * pools * 45 // 181)
+    assert width(181, 136) == pools
+    monkeypatch.setattr(ivf_sparse_indexer.ivf_fidelity, "enabled", lambda: True)
+    assert width(64, 8) == pools
+
+
+def test_per_row_topk_ranks_rows_longer_than_its_view():
+    """Top-k over a score buffer wider than the per_row kernel's view still
+    ranks each row's whole length (rows read their own length, the view only
+    picks the kernel's final sort)."""
+    rows, width, topk = 48, 20000, 512
+    g = torch.Generator().manual_seed(0)
+    lens = torch.randint(topk + 1, width + 1, (rows,), generator=g)
+    lens[0] = width
+    # Distinct scores, so the top-k is unique.
+    scores = torch.stack([torch.randperm(width, generator=g) for _ in range(rows)])
+    scores = scores.float().to(DEV)
+    counts = lens.to(torch.int32).to(DEV)
+    cand = torch.arange(width, dtype=torch.int32, device=DEV).repeat(rows, 1)
+    out = torch.full((rows, topk), -7, dtype=torch.int32, device=DEV)
+    ivf_sparse_indexer._topk_and_emit(
+        counts=counts,
+        topk_lens=counts,
+        scores=scores,
+        out=out,
+        topk=topk,
+        topk_backend="per_row",
+        cand=cand,
+    )
+    for r in range(rows):
+        want = torch.topk(scores[r, : lens[r]], topk).indices.sort().values
+        assert torch.equal(out[r].long().sort().values, want), r
+
+
 def _decode_step(setup, seq_lens, qb: Queries):
     append_ivf_decode_keys(key=setup.key, state=setup.state, seq_lens=seq_lens)
     rows = seq_lens.shape[0]

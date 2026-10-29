@@ -941,7 +941,7 @@ def ivf_probe_score_kernel(
         pending = pending & ~mine
 
 
-@triton.jit(do_not_specialize=["max_count"])
+@triton.jit(do_not_specialize=["max_count", "zero_n"])
 def ivf_probe_select_kernel(
     pos_ptr,
     row_batch_ptr,
@@ -963,6 +963,8 @@ def ivf_probe_select_kernel(
     probe_base_ptr,
     num_probes,
     max_count,
+    zero_ptr,
+    zero_n,
     TOPK: tl.constexpr,
     C: tl.constexpr,
     C_PAD: tl.constexpr,
@@ -990,8 +992,16 @@ def ivf_probe_select_kernel(
     exclusive candidate end (``probe_end``, padded with int32 max) and the
     run-layout offset of its slots (``probe_base``: slot j maps to
     ``run_pos[probe_base + j]``).
+
+    Also clears the ``zero_n`` int32 at ``zero_ptr`` (the grouped score's
+    group tables), a slice per program.
     """
     row = tl.program_id(0)
+    per = tl.cdiv(zero_n, tl.num_programs(0))
+    z_end = tl.minimum(zero_n, (row + 1) * per)
+    for z0 in range(row * per, z_end, C_PAD):
+        offs_z = z0 + tl.arange(0, C_PAD)
+        tl.store(zero_ptr + offs_z, 0, mask=offs_z < z_end)
     t = tl.load(pos_ptr + row).to(tl.int32)
     offs_all = tl.arange(0, C_PAD)
     in_range = offs_all < C
@@ -1241,20 +1251,34 @@ def ivf_group_count_kernel(
 
 
 @triton.jit
-def ivf_group_scan_kernel(
+def ivf_group_plan_kernel(
     tile_cnt_ptr,
     tile_base_ptr,
-    cluster_total_ptr,
+    group_m_ptr,
+    group_vis_ptr,
+    cluster_base_ptr,
+    unit_off_ptr,
     num_tiles,
+    num_groups,
     C: tl.constexpr,
+    C_PAD: tl.constexpr,
+    UNIT_KEYS: tl.constexpr,
+    UNIT_ROWS: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    """Per cluster: probing rows before each row tile (exclusive scan of
-    ``tile_cnt`` over tiles) and the cluster's total."""
-    offs_c = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
+    """One program: per cluster, its probing rows before each row tile
+    (``tile_base``, an exclusive scan of ``tile_cnt`` over tiles) and its first
+    row-list slot (``cluster_base``); per group, its first work unit
+    (unit_off[G] is the unit total, unit_off[G + 1] the grouped score's work
+    counter, zeroed here).
+
+    A unit is up to UNIT_KEYS keys of a group against UNIT_ROWS of its rows.
+    The row list is cluster-major, each cluster's rows ascending.
+    """
+    offs_c = tl.arange(0, C_PAD)
     in_c = offs_c < C
-    carry = tl.zeros([BLOCK_C], tl.int32)
+    carry = tl.zeros([C_PAD], tl.int32)
     for t0 in range(0, num_tiles, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
         m = (offs_t < num_tiles)[:, None] & in_c[None, :]
@@ -1262,29 +1286,7 @@ def ivf_group_scan_kernel(
         cnt = tl.load(tile_cnt_ptr + off, mask=m, other=0)
         tl.store(tile_base_ptr + off, carry[None, :] + tl.cumsum(cnt, axis=0) - cnt, m)
         carry += tl.sum(cnt, axis=0)
-    tl.store(cluster_total_ptr + offs_c, carry, mask=in_c)
-
-
-@triton.jit
-def ivf_group_offsets_kernel(
-    group_m_ptr,
-    group_vis_ptr,
-    cluster_total_ptr,
-    cluster_base_ptr,
-    unit_off_ptr,
-    num_groups,
-    C: tl.constexpr,
-    UNIT_KEYS: tl.constexpr,
-    UNIT_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """One program: each group's first work unit (unit_off[G] is the unit
-    total, unit_off[G + 1] the grouped score's work counter, zeroed here) and
-    each cluster's first row-list slot.
-
-    A unit is up to UNIT_KEYS keys of a group against UNIT_ROWS of its rows.
-    The row list is cluster-major, each cluster's rows ascending.
-    """
+    tl.store(cluster_base_ptr + offs_c, tl.cumsum(carry, axis=0) - carry, mask=in_c)
     unit_carry = tl.full([], 0, tl.int32)
     tl.store(unit_off_ptr, 0)
     tl.store(unit_off_ptr + num_groups + 1, 0)
@@ -1296,23 +1298,20 @@ def ivf_group_offsets_kernel(
         units = tl.cdiv(vis, UNIT_KEYS) * tl.cdiv(m, UNIT_ROWS)
         tl.store(unit_off_ptr + 1 + g, unit_carry + tl.cumsum(units, axis=0), mask)
         unit_carry += tl.sum(units, axis=0)
-    rows_carry = tl.full([], 0, tl.int32)
-    for c0 in range(0, C, BLOCK):
-        c = c0 + tl.arange(0, BLOCK)
-        mask = c < C
-        n = tl.load(cluster_total_ptr + c, mask=mask, other=0)
-        tl.store(cluster_base_ptr + c, rows_carry + tl.cumsum(n, axis=0) - n, mask)
-        rows_carry += tl.sum(n, axis=0)
 
 
 @triton.jit
 def ivf_group_fill_kernel(
     sel_ptr,
+    vis_ws_ptr,
+    ends_ptr,
     topk_len_ptr,
     row_batch_ptr,
     tile_base_ptr,
     cluster_base_ptr,
     row_list_ptr,
+    row_vis_ptr,
+    row_first_ptr,
     group_off_ptr,
     num_rows,
     C: tl.constexpr,
@@ -1324,7 +1323,9 @@ def ivf_group_fill_kernel(
     Each cluster's rows are in ascending row order, so a group's rows ascend
     by query position and their visible key counts ascend too (the grouped
     score skips key tiles none of a tile's rows sees). A request's first row
-    writes its groups' first slots (``group_off``).
+    writes its groups' first slots (``group_off``). Beside each slot's row go
+    its visible key count of the cluster (``row_vis``) and its first candidate
+    slot (``row_first``), so the grouped score reads them contiguously.
     """
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -1333,13 +1334,17 @@ def ivf_group_fill_kernel(
     need = tl.load(topk_len_ptr + offs_r, mask=mask_r, other=0) > 0
     b = tl.load(row_batch_ptr + offs_r, mask=mask_r, other=0)
     m = (need & mask_r)[:, None] & in_c[None, :]
-    hit = m & (tl.load(sel_ptr + offs_r[:, None] * C + offs_c[None, :], m, 0) != 0)
+    off = offs_r[:, None] * C + offs_c[None, :]
+    hit = m & (tl.load(sel_ptr + off, m, 0) != 0)
     hit_i = hit.to(tl.int32)
     base = tl.load(tile_base_ptr + tl.program_id(0) * C + offs_c, mask=in_c, other=0)
     base += tl.load(cluster_base_ptr + offs_c, mask=in_c, other=0)
     slot = base[None, :] + tl.cumsum(hit_i, axis=0) - hit_i
     rows = tl.broadcast_to(offs_r[:, None], [BLOCK_R, BLOCK_C])
     tl.store(row_list_ptr + slot, rows, mask=hit)
+    vis = tl.load(vis_ws_ptr + off, mask=hit, other=0)
+    tl.store(row_vis_ptr + slot, vis, mask=hit)
+    tl.store(row_first_ptr + slot, tl.load(ends_ptr + off, hit, 0) - vis, mask=hit)
     prev = tl.load(row_batch_ptr + offs_r - 1, mask=mask_r & (offs_r > 0), other=-1)
     first = mask_r & (b != prev)
     tl.store(
@@ -1403,13 +1408,12 @@ def ivf_grouped_score_kernel(
     group_off_ptr,
     unit_off_ptr,
     row_list_ptr,
-    vis_ws_ptr,
-    ends_ptr,
+    row_vis_ptr,
+    row_first_ptr,
     score_ptr,
     cand_cap,
     num_groups,
     log_g,
-    C: tl.constexpr,
     H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KEY_CHUNKS: tl.constexpr,
@@ -1458,10 +1462,8 @@ def ivf_grouped_score_kernel(
         m0 = (rel % n_chunks) * UNIT_KEYS
         r_begin = (rel // n_chunks) * UNIT_ROWS
         r_end = tl.minimum(tl.load(group_m_ptr + g), r_begin + UNIT_ROWS)
-        c = g % C
         row_base = tl.load(group_off_ptr + g)
-        last = tl.load(row_list_ptr + row_base + r_end - 1)
-        if m0 < tl.load(vis_ws_ptr + last * C + c):
+        if m0 < tl.load(row_vis_ptr + row_base + r_end - 1):
             key0 = tl.load(run_start_ptr + g)
             # Keys past the cluster are other runs' (or zeros past the
             # end): their slots are masked.
@@ -1492,9 +1494,10 @@ def ivf_grouped_score_kernel(
             for r0 in tl.range(r_begin, r_end, ROWS, num_stages=NUM_STAGES):
                 offs_r = r0 + tl.arange(0, ROWS)
                 mask_r = offs_r < r_end
-                rows = tl.load(row_list_ptr + row_base + offs_r, mask=mask_r, other=0)
-                vis = tl.load(vis_ws_ptr + rows * C + c, mask=mask_r, other=0)
-                first = tl.load(ends_ptr + rows * C + c, mask=mask_r, other=0) - vis
+                slots = row_base + offs_r
+                rows = tl.load(row_list_ptr + slots, mask=mask_r, other=0)
+                vis = tl.load(row_vis_ptr + slots, mask=mask_r, other=0)
+                first = tl.load(row_first_ptr + slots, mask=mask_r, other=0)
                 # Column h * ROWS + r is head h of row r.
                 heads = tl.reshape(
                     rows.to(tl.int64)[None, :] * H + tl.arange(0, H)[:, None],
