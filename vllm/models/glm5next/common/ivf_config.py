@@ -40,6 +40,11 @@ class IvfIndexerConfig:
     # A prefill request with at most this many pools scores all of them
     # densely, as the kpool indexer does (0: every request probes).
     exact_pools: int = 0
+    # Opt-in FP8 GEMMs. Centroid state and updates retain their original
+    # precision. Assignment covers full/incremental prefill, not the scalar
+    # decode append; probing covers both prefill and decode.
+    assignment_fp8: bool = False
+    probe_fp8: bool = False
 
     @classmethod
     def from_hf_config(cls, config, max_model_len: int) -> "IvfIndexerConfig":
@@ -50,6 +55,14 @@ class IvfIndexerConfig:
         warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
         exact_pools = getattr(config, "index_exact_pools", 0)
+        assignment_fp8 = getattr(config, "index_kmeans_assignment_fp8", False)
+        probe_fp8 = getattr(config, "index_kmeans_probe_fp8", False)
+        for name, value in (
+            ("index_kmeans_assignment_fp8", assignment_fp8),
+            ("index_kmeans_probe_fp8", probe_fp8),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a JSON boolean, got {value!r}")
         if not 1 <= num_clusters <= 32767:
             raise ValueError(
                 f"index_num_clusters must be in [1, 32767], got {num_clusters}"
@@ -80,6 +93,8 @@ class IvfIndexerConfig:
             kmeans_warm_iters=warm_iters,
             kmeans_incremental=bool(getattr(config, "index_kmeans_incremental", True)),
             exact_pools=exact_pools,
+            assignment_fp8=assignment_fp8,
+            probe_fp8=probe_fp8,
         )
 
 

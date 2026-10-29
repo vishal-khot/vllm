@@ -299,6 +299,11 @@ class Indexer(nn.Module):
                 self.ivf_config.num_probes,
                 self.ivf_config.exact_pools,
             )
+            logger.info_once(
+                "IVF precision: assignment_fp8=%s, probe_fp8=%s",
+                self.ivf_config.assignment_fp8,
+                self.ivf_config.probe_fp8,
+            )
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128

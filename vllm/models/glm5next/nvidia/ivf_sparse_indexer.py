@@ -461,6 +461,7 @@ def build_ivf_index(
             MIN_SEG_TILES=tune.kmeans_min_segment_tiles,
             PAGE=page,
             TILE_PAGES=tile_pages,
+            ASSIGNMENT_FP8=config.assignment_fp8,
             num_warps=tune.kmeans_num_warps,
         )
     if num_full < num_items:
@@ -491,6 +492,7 @@ def build_ivf_index(
             C=C,
             C_PAD=C_PAD,
             PAGE=page,
+            ASSIGNMENT_FP8=config.assignment_fp8,
             num_warps=tune.kmeans_num_warps,
         )
         nb = triton.cdiv(C, tune.kmeans_update_block)
@@ -720,6 +722,7 @@ def select_ivf_topk(
         BLOCK_R=tune.probe_rows,
         BLOCK_C=tune.centroid_block,
         IS_DECODE=is_decode,
+        PROBE_FP8=config.probe_fp8,
         num_warps=tune.probe_num_warps,
     )
     ivf_probe_select_kernel[(num_rows,)](

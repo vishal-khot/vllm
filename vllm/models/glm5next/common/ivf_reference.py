@@ -118,6 +118,7 @@ def kmeans_reference(
     seed: int,
     init_centroids: torch.Tensor | None = None,
     stop_fraction: float = 0.0,
+    assignment_fp8: bool = False,
 ) -> KmeansResult:
     """Cosine k-means over one request's keys (fp8 values [T, 128], scales [T]).
 
@@ -132,6 +133,8 @@ def kmeans_reference(
             same cluster count) instead of seeding.
         stop_fraction: The rounds stop once an assignment moves at most this
             fraction of the keys (0: once it repeats the previous one).
+        assignment_fp8: Quantize BF16 centroids to E4M3 with per-row
+            power-of-two scales for assignment only.
 
     """
     k_fp8 = k_fp8.float()
@@ -158,7 +161,11 @@ def kmeans_reference(
 
     def assign() -> torch.Tensor:
         # The key norm cannot change the argmax (cosine assignment).
-        sim = k_fp8 @ c_bf16.T
+        if assignment_fp8:
+            cq, cs = quantize_rows_fp8(c_bf16, True)
+            sim = (k_fp8 @ cq.T) * cs[None, :]
+        else:
+            sim = k_fp8 @ c_bf16.T
         sim[:, c_eff:] = float("-inf")
         return sim.argmax(dim=1)
 
@@ -192,7 +199,11 @@ def kmeans_reference(
 
 
 def kmeans_append_reference(
-    k_fp8: torch.Tensor, k_scale: torch.Tensor, prev: KmeansResult
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    prev: KmeansResult,
+    *,
+    assignment_fp8: bool = False,
 ) -> KmeansResult:
     """Append keys ``[len(prev.cluster_of_pos), T)`` to a request's clusters.
 
@@ -205,6 +216,8 @@ def kmeans_append_reference(
         k_fp8: All T keys' fp8 values as fp32.
         k_scale: Their scales.
         prev: The clustering of the first keys, with ``lengths``.
+        assignment_fp8: Quantize centroids for assignment, keeping member
+            sums and centroid updates in the reference's original precision.
 
     Returns:
         The clustering of all T keys, with the updated ``lengths``.
@@ -214,7 +227,11 @@ def kmeans_append_reference(
     n_prev = prev.cluster_of_pos.numel()
     C = prev.centroids.shape[0]
     new = k_fp8[n_prev:]
-    sim = new @ prev.centroids.T
+    if assignment_fp8:
+        cq, cs = quantize_rows_fp8(prev.centroids, True)
+        sim = (new @ cq.T) * cs[None, :]
+    else:
+        sim = new @ prev.centroids.T
     sim[:, prev.n_clusters :] = float("-inf")
     new_cid = sim.argmax(dim=1)
     fixed = (new * (k_scale[n_prev:].float() * _SUM_SCALE)[:, None]).to(torch.int64)
@@ -244,9 +261,17 @@ def decode_assign_reference(
 
 
 def probe_scores_reference(
-    q_fp8: torch.Tensor, weights: torch.Tensor, centroids: torch.Tensor
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    centroids: torch.Tensor,
+    *,
+    probe_fp8: bool = False,
 ) -> torch.Tensor:
     """Cluster scores Σ_h w_h ReLU(q_h · c) of unit ``centroids`` [C, 128]."""
+    if probe_fp8:
+        cq, cs = quantize_rows_fp8(centroids, True)
+        dots = (cq @ q_fp8.float().T) * cs[:, None]
+        return (torch.relu(dots) * weights.float()).sum(1)
     return (torch.relu(centroids.float() @ q_fp8.float().T) * weights.float()).sum(1)
 
 
@@ -258,6 +283,7 @@ def probe_reference(
     visible: torch.Tensor,
     num_probes: int,
     min_keys: int = 0,
+    probe_fp8: bool = False,
 ) -> torch.Tensor:
     """Bool [C] of probed clusters; ``visible`` [C] is each cluster's visible size.
 
@@ -267,7 +293,9 @@ def probe_reference(
     cluster id.
     """
     C = kmeans.sizes.shape[0]
-    score = probe_scores_reference(q_fp8, weights, kmeans.centroids)
+    score = probe_scores_reference(
+        q_fp8, weights, kmeans.centroids, probe_fp8=probe_fp8
+    )
     eligible = (torch.arange(C) < kmeans.n_clusters) & (visible > 0)
     ids = torch.nonzero(eligible).flatten()
     ids = ids[torch.argsort(score[ids], descending=True, stable=True)]
@@ -342,6 +370,7 @@ def ivf_select_one_reference(
     num_probes: int,
     decode: bool,
     scores_all: torch.Tensor | None = None,
+    probe_fp8: bool = False,
 ) -> SelectionTrace:
     """Full selection for one query (heads ``q_fp8``, ``weights``) at position ``t``."""
     cid = kmeans.cluster_of_pos
@@ -354,6 +383,7 @@ def ivf_select_one_reference(
         visible=visible,
         num_probes=C if t < topk else num_probes,
         min_keys=topk,
+        probe_fp8=probe_fp8,
     )
     total = int(visible[probed].sum())
     cand = collect_reference(

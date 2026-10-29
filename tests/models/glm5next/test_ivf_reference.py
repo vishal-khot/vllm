@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of the IVF indexer reference, the oracle for the kernel tests."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.models.glm5next.common.ivf_config import IvfIndexerConfig
 from vllm.models.glm5next.common.ivf_reference import (
     build_paged_indexer_cache,
     cluster_count,
@@ -21,6 +24,39 @@ from vllm.models.glm5next.common.ivf_reference import (
 TOPK = 64
 C_MAX = 64
 HEADS = 16
+
+
+@pytest.mark.parametrize(
+    "assignment_fp8,probe_fp8",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_fp8_overrides_are_independent(assignment_fp8, probe_fp8):
+    hf = SimpleNamespace(
+        index_topk=2048,
+        index_kpool=4,
+        index_kmeans_assignment_fp8=assignment_fp8,
+        index_kmeans_probe_fp8=probe_fp8,
+        index_exact_pools=512,
+    )
+    config = IvfIndexerConfig.from_hf_config(hf, max_model_len=16384)
+    assert config.assignment_fp8 is assignment_fp8
+    assert config.probe_fp8 is probe_fp8
+    assert config.exact_pools == 512
+    default = IvfIndexerConfig.from_hf_config(
+        SimpleNamespace(index_topk=2048, index_kpool=4), max_model_len=16384
+    )
+    assert not default.assignment_fp8 and not default.probe_fp8
+    assert default.exact_pools == 0
+
+
+@pytest.mark.parametrize(
+    "name", ["index_kmeans_assignment_fp8", "index_kmeans_probe_fp8"]
+)
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_fp8_overrides_reject_non_boolean_values(name, value):
+    hf = SimpleNamespace(index_topk=2048, index_kpool=4, **{name: value})
+    with pytest.raises(ValueError, match=name):
+        IvfIndexerConfig.from_hf_config(hf, max_model_len=16384)
 
 
 def _keys(num_keys: int, seed: int = 0, centers: int = 8) -> torch.Tensor:
@@ -50,7 +86,7 @@ def _kmeans(k_fp8, k_scale, num_clusters=32, iters=5, seed=0, stop_fraction=0.0)
     )
 
 
-def _select(k_fp8, k_scale, km, t, *, num_probes, decode, seed=0):
+def _select(k_fp8, k_scale, km, t, *, num_probes, decode, seed=0, probe_fp8=False):
     q_fp8, weights = _query(seed)
     return ivf_select_one_reference(
         q_fp8=q_fp8,
@@ -62,6 +98,7 @@ def _select(k_fp8, k_scale, km, t, *, num_probes, decode, seed=0):
         topk=TOPK,
         num_probes=num_probes,
         decode=decode,
+        probe_fp8=probe_fp8,
     )
 
 
@@ -147,7 +184,8 @@ def test_probing_every_cluster_is_exact_topk(decode):
 
 
 @pytest.mark.parametrize("want_probes", [1, 16])
-def test_probes_fill_topk_and_take_every_visible_key_of_them(want_probes):
+@pytest.mark.parametrize("probe_fp8", [False, True])
+def test_probes_fill_topk_and_take_every_visible_key_of_them(want_probes, probe_fp8):
     """A query probes its ``num_probes`` best clusters, then the next best
     until they hold top-k visible keys, and no more."""
     num_keys = 3000
@@ -155,7 +193,14 @@ def test_probes_fill_topk_and_take_every_visible_key_of_them(want_probes):
     km = _kmeans(k_fp8, k_scale, num_clusters=C_MAX)
     for seed, t in enumerate([0, 40, 63, 64, 100, 500, 2999]):
         trace = _select(
-            k_fp8, k_scale, km, t, num_probes=want_probes, decode=False, seed=seed
+            k_fp8,
+            k_scale,
+            km,
+            t,
+            num_probes=want_probes,
+            decode=False,
+            seed=seed,
+            probe_fp8=probe_fp8,
         )
         visible = torch.bincount(km.cluster_of_pos[: t + 1], minlength=C_MAX)
         eligible = int((visible > 0).sum())
@@ -167,7 +212,9 @@ def test_probes_fill_topk_and_take_every_visible_key_of_them(want_probes):
             assert probes >= min(want_probes, eligible)
             assert trace.total >= TOPK
             if probes > want_probes:
-                score = probe_scores_reference(*_query(seed), km.centroids)
+                score = probe_scores_reference(
+                    *_query(seed), km.centroids, probe_fp8=probe_fp8
+                )
                 ids = torch.nonzero(trace.probed).flatten()
                 weakest = ids[torch.argmin(score[ids])]
                 assert trace.total - int(visible[weakest]) < TOPK
