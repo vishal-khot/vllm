@@ -13,9 +13,8 @@ It assumes the model and the RULER jsonl are already staged on local disk and a
 working vLLM+fork env is active; ``_run_body.sh`` does that staging.
 
 Per cell it writes ``<out>/L<len>/C<clusters>_P<probes>/``:
-    verdict.json         per-task recall + lost-attention + memory/timing summary
+    verdict.json         per-task recall + lost-attention summary
     lost_attention/      the raw per-rank lost_attention_pid*.json dumps
-    timing/              the raw per-rank indexer_timing_pid*.json dumps
 
 and a top-level ``<out>/summary.json`` over all cells.
 """
@@ -40,9 +39,6 @@ import yaml
 BENCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BENCH_DIR)
 from tasks import TASKS, recall  # noqa: E402
-
-# Serve must cover the longest bucket's context plus the answer budget.
-_LEN_MARGIN = 4096
 
 
 class StreamError(OSError):
@@ -132,27 +128,20 @@ def _post_with_retry(url: str, body: dict, timeout: float, attempts: int):
     raise ValueError(f"attempts must be >= 1, got {attempts}")
 
 
-def _serve_env(lost_dir: str, timing_dir: str) -> dict:
-    """IVF arm with lost-attention measurement and the memory/timing instrument
-    on (the serve is eager, so the instrument can time and probe per layer)."""
+def _serve_env(lost_dir: str) -> dict:
+    """IVF arm with lost-attention measurement on. Indexer memory and time come
+    from the A/B matrix: batching here would mix requests in both numbers."""
     env = dict(os.environ)
-    env["PYTHONPATH"] = BENCH_DIR + (
-        ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
-    )
     env["VLLM_ENABLE_DSA_IVF_INDEXER"] = "1"
     env["VLLM_DSA_IVF_MEASURE_LOST_ATTENTION"] = "1"
     env["VLLM_DSA_IVF_LOST_ATTENTION_DIR"] = lost_dir
-    env["GLM5_INSTRUMENT"] = "1"
-    env["GLM5_TIMING_DIR"] = timing_dir
-    env["GLM5_MEM_PROBE"] = "1"
-    env["GLM5_RESIDENT_PROBE"] = "1"
     return env
 
 
 def _summarize_timing(timing_dir: str) -> dict:
     """Peak/resident indexer memory and per-(layer, phase) mean indexer time,
     taken across the per-rank instrument dumps."""
-    peak = resident = 0.0
+    peak = resident = resident_total = 0.0
     layers: dict[str, float] = {}
     for fn in glob.glob(os.path.join(timing_dir, "indexer_timing_pid*_r*.json")):
         try:
@@ -160,14 +149,18 @@ def _summarize_timing(timing_dir: str) -> dict:
         except Exception:
             continue
         for layer, phases in rep.get("layers", {}).items():
+            layer_resident = 0.0
             for phase, s in phases.items():
                 peak = max(peak, s.get("peak_mib", 0.0))
-                resident = max(resident, s.get("resident_mib", 0.0))
+                layer_resident = max(layer_resident, s.get("resident_mib", 0.0))
                 key = f"{layer}|{phase}"
                 layers[key] = max(layers.get(key, 0.0), s.get("mean_ms", 0.0))
+            resident = max(resident, layer_resident)
+            resident_total += layer_resident
     return {
         "peak_indexer_mib": round(peak, 2),
         "resident_state_mib": round(resident, 2),
+        "resident_total_mib": round(resident_total, 2),
         "per_layer_ms": {k: round(v, 4) for k, v in sorted(layers.items())},
     }
 
@@ -240,25 +233,32 @@ def _summarize_lost(lost_dir: str) -> dict:
     }
 
 
-def _run_task(
-    port: int, task: str, rows: list, request_timeout: float,
+def _run_tasks(
+    tag: str, port: int, rows_by_task: dict[str, list], request_timeout: float,
     concurrency: int, max_tokens: int, seed: int | None, greedy: bool,
     request_attempts: int,
-) -> list:
-    """Stream ``task``'s samples through the live serve; return per-sample recs.
+) -> dict[str, list]:
+    """Stream every task's samples through the live serve; return recs by task.
+
+    All tasks share one pool, so samples that run to ``max_tokens`` overlap
+    instead of each holding the GPUs for a whole task. Decode runs at about 6
+    tok/s per request here, so one such sample takes about 45 minutes.
 
     ``max_tokens``, ``seed`` and ``greedy`` come from the ``fairness`` block of
     ``runs.yaml`` (the single source of truth both benchmark arms share), not
     from the per-task caps in ``tasks.py``, so the fidelity sweep uses the same
     generation budget and decoding settings as the A/B matrix.
 
-    With ``concurrency`` > 1 the samples are issued through a thread pool so the
-    server's continuous batching runs them together. This is metric-neutral:
-    recall is per-request and the per-(layer, phase) key/mass_lost stats are
-    aggregated per row, so batch composition does not change them. Every sample
-    here shares one task, hence identical length and clusters/probes. It does
-    blur the per-request ``prefill_ms``/``decode_ms`` (requests share a step);
-    the authoritative latency/timing come from the A/B matrix, not this sweep.
+    With ``concurrency`` > 1 the server's continuous batching runs the samples
+    together. This is metric-neutral: recall is per-request and the per-(layer,
+    phase) key/mass_lost stats are aggregated per row, so batch composition does
+    not change them. Every sample here shares one length and clusters/probes. It
+    does blur the per-request ``prefill_ms``/``decode_ms`` (requests share a
+    step); the authoritative latency/timing come from the A/B matrix, not this
+    sweep.
+
+    The pool is not used as a context manager: on failure or SIGTERM that would
+    wait for every queued request.
     """
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
@@ -284,10 +284,21 @@ def _run_task(
             "out_tok": usage.get("completion_tokens"),
         }
 
-    if concurrency <= 1:
-        return [_one(ex) for ex in rows]
-    with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        return list(pool.map(_one, rows))
+    pairs = [(task, ex) for task, rows in rows_by_task.items() for ex in rows]
+    recs: list = [None] * len(pairs)
+    pool = cf.ThreadPoolExecutor(max_workers=max(1, concurrency))
+    futures = {pool.submit(_one, ex): i for i, (_, ex) in enumerate(pairs)}
+    try:
+        for done, fut in enumerate(cf.as_completed(futures), 1):
+            recs[futures[fut]] = fut.result()
+            if done % 20 == 0 or done == len(pairs):
+                _log(f"[{tag}] {done}/{len(pairs)} requests")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    by_task: dict[str, list] = {task: [] for task in rows_by_task}
+    for (task, _), rec in zip(pairs, recs):
+        by_task[task].append(rec)
+    return by_task
 
 
 def run_cell(
@@ -308,7 +319,7 @@ def run_cell(
     os.makedirs(cell_out, exist_ok=True)
     # The engine's per-rank instrumentation dumps go to node-local tmpfs, not
     # the shared Weka quota: a transient group-quota ENOSPC must never crash the
-    # engine mid-cell (it did once, aborting a whole sweep). The dumps are
+    # engine mid-cell (it did once, aborting a whole sweep). The dump is
     # ephemeral -- summarized into verdict.json below, then discarded.
     local_base = os.environ.get("GLM5_LOCAL_DUMP_BASE", "/dev/shm")
     if not (os.path.isdir(local_base) and os.access(local_base, os.W_OK)):
@@ -316,18 +327,16 @@ def run_cell(
     dump_root = os.path.join(
         local_base, f"glm5dump_{os.getpid()}_L{length}_P{probes}")
     lost_dir = os.path.join(dump_root, "lost_attention")
-    timing_dir = os.path.join(dump_root, "timing")
-    for d in (lost_dir, timing_dir):
-        if os.path.isdir(d):
-            shutil.rmtree(d)
-        os.makedirs(d, exist_ok=True)
+    if os.path.isdir(lost_dir):
+        shutil.rmtree(lost_dir)
+    os.makedirs(lost_dir, exist_ok=True)
 
-    max_len = length + args.max_tokens + _LEN_MARGIN
+    max_len = length + args.max_tokens + args.length_margin
     cmd = _serve(
         args.model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
     )
     print(f"[{tag}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, env=_serve_env(lost_dir, timing_dir))
+    proc = subprocess.Popen(cmd, env=_serve_env(lost_dir))
     per_task: dict[str, dict] = {}
     try:
         t0 = time.time()
@@ -335,15 +344,17 @@ def run_cell(
         print(f"[{tag}] ready in {time.time() - t0:.0f}s", flush=True)
 
         cap = None if n in ("all", None, 0) else int(n)
+        rows_by_task: dict[str, list] = {}
         for task in tasks:
             jsonl = os.path.join(args.ruler_dir, task, f"validation_{length}.jsonl")
-            rows = [json.loads(line) for line in open(jsonl)][:cap]
-            if not rows:
+            rows_by_task[task] = [json.loads(line) for line in open(jsonl)][:cap]
+            if not rows_by_task[task]:
                 raise RuntimeError(f"no samples in {jsonl}")
-            samples = _run_task(
-                args.port, task, rows, args.request_timeout, args.concurrency,
-                args.max_tokens, args.seed, args.greedy, args.request_attempts,
-            )
+        results = _run_tasks(
+            tag, args.port, rows_by_task, args.request_timeout, args.concurrency,
+            args.max_tokens, args.seed, args.greedy, args.request_attempts,
+        )
+        for task, samples in results.items():
             rmean = sum(s["recall"] for s in samples) / len(samples)
             per_task[task] = {"recall_mean": rmean, "samples": samples}
             print(f"[{tag}] {task:16s} recall_mean={rmean:.3f} n={len(samples)}",
@@ -357,7 +368,6 @@ def run_cell(
         time.sleep(5)  # let the recorder's atexit dump settle
 
     lost = _summarize_lost(lost_dir)
-    timing = _summarize_timing(timing_dir)
     shutil.rmtree(dump_root, ignore_errors=True)
     recalls = [t["recall_mean"] for t in per_task.values()]
     verdict = {
@@ -369,7 +379,6 @@ def run_cell(
         "recall_mean": sum(recalls) / len(recalls) if recalls else 0.0,
         "tasks": per_task,
         "lost_attention": lost,
-        "memory_timing": timing,
     }
     with open(os.path.join(cell_out, "verdict.json"), "w") as f:
         json.dump(verdict, f, indent=2)
@@ -446,6 +455,7 @@ def main() -> None:
     fairness, resilience = _load_shared(args.runs_yaml)
     if args.max_tokens is None:
         args.max_tokens = int(fairness["max_tokens"])
+    args.length_margin = int(fairness["length_margin"])
     args.seed = int(fairness["seed"])
     args.greedy = bool(fairness["greedy"])
     args.concurrency = args.concurrency or sweep["concurrency"]

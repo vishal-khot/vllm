@@ -52,7 +52,7 @@ _REQUIRED_RUN_FIELDS = (
 )
 
 # Optional run fields a sweep may inject (not required on the base cases).
-_OPTIONAL_RUN_FIELDS = ("length", "max_model_len")
+_OPTIONAL_RUN_FIELDS = ("length", "max_model_len", "tasks", "n")
 
 
 @dataclass(frozen=True)
@@ -237,13 +237,17 @@ def _resolve_run(
         )
 
     # A throughput-grid run pins one context length; max_model_len must hold
-    # that length plus the generated tokens. Explicit max_model_len wins; else a
+    # that length, the generated tokens and the margin for the chat template
+    # (prompts land just under their nominal length before it is applied).
+    # Explicit max_model_len wins; else a
     # pinned length derives it; else the fairness default applies.
     length = int(raw["length"]) if raw.get("length") is not None else None
     if raw.get("max_model_len") is not None:
         max_model_len = int(raw["max_model_len"])
     elif length is not None:
-        max_model_len = length + int(fairness["max_tokens"])
+        max_model_len = (
+            length + int(fairness["max_tokens"]) + int(fairness["length_margin"])
+        )
     else:
         max_model_len = int(fairness["max_model_len"])
 
@@ -252,8 +256,18 @@ def _resolve_run(
         if name not in datasets:
             raise ConfigError(f"run {rid!r}: unknown dataset {name!r}")
         ds = datasets[name]
-        if length is not None and ds.name == "ruler":
-            ds = replace(ds, lengths=[length])
+        if ds.name == "ruler":
+            if length is not None:
+                ds = replace(ds, lengths=[length])
+            if raw.get("tasks") is not None:
+                unknown_tasks = set(raw["tasks"]) - set(ds.tasks)
+                if unknown_tasks:
+                    raise ConfigError(
+                        f"run {rid!r}: unknown tasks {sorted(unknown_tasks)}"
+                    )
+                ds = replace(ds, tasks=list(raw["tasks"]))
+            if raw.get("n") is not None:
+                ds = replace(ds, n=int(raw["n"]))
         resolved_ds.append(ds)
 
     return Run(
@@ -315,6 +329,31 @@ def _expand_throughput_grid(base: dict[str, Any], spec: dict[str, Any]) -> list[
     return out
 
 
+def _expand_eager_grid(base: dict[str, Any], spec: dict[str, Any]) -> list[dict]:
+    """Expand a grid into one eager serve per (length, clusters, probes).
+
+    These runs measure indexer memory and time, so both arms must send identical
+    requests. A ``kpool`` cell lists only ``length``. Runs are named
+    ``<base id>_L<length>[_C<clusters>_P<probes>]_eager``.
+    """
+    out: list[dict] = []
+    for cell in spec["grid"]:
+        length = int(cell["length"])
+        for probes in cell.get("probes", [None]):
+            run = dict(base)
+            run.update(spec.get("with", {}))
+            run["length"] = length
+            run["datasets"] = ["ruler"]
+            tag = f"{base['id']}_L{length}"
+            if probes is not None:
+                run["clusters"] = cell["clusters"]
+                run["P"] = probes
+                tag += f"_C{cell['clusters']}_P{probes}"
+            run["id"] = f"{tag}_eager"
+            out.append(run)
+    return out
+
+
 def _expand_sweep(base: dict[str, Any], sweep: dict[str, Any]) -> list[dict]:
     """Each swept value clones ``base`` with that one knob flipped.
 
@@ -330,6 +369,9 @@ def _expand_sweep(base: dict[str, Any], sweep: dict[str, Any]) -> list[dict]:
             continue
         if knob == "throughput_grid":
             out += _expand_throughput_grid(base, spec)
+            continue
+        if knob == "eager_grid":
+            out += _expand_eager_grid(base, spec)
             continue
         if knob not in _SWEEP_KNOBS:
             raise ConfigError(f"sweep knob {knob!r} not in {list(_SWEEP_KNOBS)}")
@@ -366,12 +408,14 @@ def load_matrix(path: str | Path) -> Matrix:
     fairness, arms = raw["fairness"], raw["indexer_arms"]
 
     # A case may carry a `sweep`; the case itself plus its expanded knob-flips
-    # become runs. `sweep` is stripped before the case is resolved.
+    # become runs, unless it sets `run_base: false`. Both keys are stripped before
+    # the case is resolved.
     raw_runs: list[dict] = []
     for case in raw["runs"]:
         sweep = case.get("sweep")
-        base = {k: v for k, v in case.items() if k != "sweep"}
-        raw_runs.append(base)
+        base = {k: v for k, v in case.items() if k not in ("sweep", "run_base")}
+        if case.get("run_base", True):
+            raw_runs.append(base)
         if sweep:
             raw_runs += _expand_sweep(base, sweep)
 
