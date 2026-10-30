@@ -38,7 +38,7 @@ SLURM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH_DIR)
 sys.path.insert(0, SLURM_DIR)
 from bench_config import load_matrix  # noqa: E402
-from tasks import TASKS, recall  # noqa: E402
+from tasks import recall  # noqa: E402
 
 # Reuse the proven serve/HTTP/summary helpers from the fidelity runner.
 from lost_attention_run import (  # noqa: E402
@@ -82,15 +82,21 @@ def _serve_cmd(run, model: str, tp: int, port: int, gpu_mem_util: float) -> list
     ] + run.serve_args()
 
 
-def _one_request(port: int, meta: dict, request_timeout: float) -> dict:
+def _one_request(
+    port: int, meta: dict, request_timeout: float,
+    max_tokens: int, seed: int | None, greedy: bool,
+) -> dict:
+    body = {
+        "model": "glm",
+        "messages": [{"role": "user", "content": meta["input"]}],
+        "max_tokens": max_tokens,
+        "temperature": 0 if greedy else 1.0,
+    }
+    if seed is not None:
+        body["seed"] = seed
     ttft, dec_s, text, usage = _post_stream(
         f"http://127.0.0.1:{port}/v1/chat/completions",
-        {
-            "model": "glm",
-            "messages": [{"role": "user", "content": meta["input"]}],
-            "max_tokens": TASKS[meta["task"]]["max_tokens"],
-            "temperature": 0,
-        },
+        body,
         timeout=request_timeout,
     )
     otk = usage.get("completion_tokens")
@@ -105,7 +111,8 @@ def _one_request(port: int, meta: dict, request_timeout: float) -> dict:
 
 def _run_block(
     port: int, metas: list, request_timeout: float, concurrency: int,
-    block_path: str, force: bool = False,
+    block_path: str, max_tokens: int, seed: int | None, greedy: bool,
+    force: bool = False,
 ) -> tuple[list, bool]:
     """Run one (length, task) block and checkpoint its results to disk.
 
@@ -123,11 +130,14 @@ def _run_block(
         except Exception:
             pass  # truncated/unreadable -> re-run the block
     if concurrency <= 1:
-        res = [_one_request(port, m, request_timeout) for m in metas]
+        res = [_one_request(port, m, request_timeout, max_tokens, seed, greedy)
+               for m in metas]
     else:
         with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
             res = list(pool.map(
-                lambda m: _one_request(port, m, request_timeout), metas))
+                lambda m: _one_request(
+                    port, m, request_timeout, max_tokens, seed, greedy),
+                metas))
     tmp = block_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(res, f)
@@ -207,7 +217,8 @@ def run_one(run, args) -> dict:
                     force_block = (i == len(blocks) - 1) and not ran_any
                     block, cached = _run_block(
                         args.port, metas, args.request_timeout,
-                        run.concurrency, bpath, force=force_block)
+                        run.concurrency, bpath, run.max_tokens, run.seed,
+                        run.greedy, force=force_block)
                     ran_any = ran_any or not cached
                     results.extend(block)
                     print(f"[{run.id}] block L{length} {task}: "
@@ -218,7 +229,9 @@ def run_one(run, args) -> dict:
                          for m in _metas(length, task)]
                 with cf.ThreadPoolExecutor(max_workers=run.concurrency) as pool:
                     results = list(pool.map(
-                        lambda m: _one_request(args.port, m, args.request_timeout),
+                        lambda m: _one_request(
+                            args.port, m, args.request_timeout,
+                            run.max_tokens, run.seed, run.greedy),
                         metas,
                     ))
             wall = time.time() - wall0
