@@ -151,18 +151,24 @@ def run_one(run, args) -> dict:
     partial_dir = os.path.join(base_out, "partial")
     # Resume a preempted eager run from its per-block checkpoints: keep partial/
     # if it exists (and not --force), else start clean. The per-rank instrument
-    # dumps (timing/, lost_attention/) are always cleared so a prior attempt's
-    # dumps don't blend into this one -- they are re-measured over whatever
-    # blocks this attempt actually serves.
+    # dumps are always cleared so a prior attempt's dumps don't blend into this
+    # one -- they are re-measured over whatever blocks this attempt actually
+    # serves. They go to node-local tmpfs so a shared-quota ENOSPC can't crash
+    # the engine, and are discarded once summarized into verdict.json.
     resuming = os.path.isdir(partial_dir) and not args.force
     if os.path.isdir(base_out) and not resuming:
         shutil.rmtree(base_out)
-    timing_dir = os.path.join(base_out, "timing")
-    lost_dir = os.path.join(base_out, "lost_attention")
+    for d in (base_out, partial_dir):
+        os.makedirs(d, exist_ok=True)
+    local_base = os.environ.get("GLM5_LOCAL_DUMP_BASE", "/dev/shm")
+    if not (os.path.isdir(local_base) and os.access(local_base, os.W_OK)):
+        local_base = base_out
+    dump_root = os.path.join(local_base, f"glm5dump_{os.getpid()}_{run.id}")
+    timing_dir = os.path.join(dump_root, "timing")
+    lost_dir = os.path.join(dump_root, "lost_attention")
     for d in (timing_dir, lost_dir):
         if os.path.isdir(d):
             shutil.rmtree(d)
-    for d in (base_out, timing_dir, lost_dir, partial_dir):
         os.makedirs(d, exist_ok=True)
 
     cmd = _serve_cmd(run, args.model, args.tp, args.port, args.gpu_mem_util)
@@ -183,9 +189,7 @@ def run_one(run, args) -> dict:
                 skipped[ds.name] = "scorer_not_implemented"
                 continue
 
-            # Eager runs are the instrumented accuracy/fidelity points: every
-            # sample. Graph runs are throughput/latency: a per-task cap is fine.
-            cap = None if run.eager else (ds.n or 1)
+            cap = ds.n or 1
 
             def _metas(length, task):
                 path = os.path.join(
@@ -290,6 +294,7 @@ def run_one(run, args) -> dict:
                         for k in timing["per_layer_ms"])
             verdict["prefill_cluster_assign_split"] = "PASS" if split else "MISSING"
     lost = _summarize_lost(lost_dir) if run.measure_lost_attention else None
+    shutil.rmtree(dump_root, ignore_errors=True)
     if "lost_attention" in verdict:
         verdict["lost_attention"] = "PASS" if lost else "MISSING"
 
