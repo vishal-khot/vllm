@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import yaml
@@ -225,9 +226,18 @@ def _run_task(
         }
         if seed is not None:
             body["seed"] = seed
-        ttft, dec_s, text, usage = _post_stream(
-            url, body, timeout=request_timeout,
-        )
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                ttft, dec_s, text, usage = _post_stream(
+                    url, body, timeout=request_timeout,
+                )
+                break
+            except (urllib.error.URLError, OSError) as e:
+                last = e  # transient (e.g. a brief 500); back off and retry
+                time.sleep(2 * (attempt + 1))
+        else:
+            raise last  # exhausted: let run_cell/main skip this cell
         return {
             "idx": ex["index"],
             "gold": ex["outputs"],
@@ -257,14 +267,24 @@ def run_cell(
     """
     tag = f"L{length} C{clusters} P{probes}({pct:g}%)"
     cell_out = os.path.join(args.out_dir, f"L{length}", f"C{clusters}_P{probes}")
-    # Drop any partial dir from a preempted attempt so stale per-rank dumps
-    # (globbed by the summarizers) don't bleed into this cell's numbers.
     if os.path.isdir(cell_out):
         shutil.rmtree(cell_out)
-    lost_dir = os.path.join(cell_out, "lost_attention")
-    timing_dir = os.path.join(cell_out, "timing")
-    os.makedirs(lost_dir, exist_ok=True)
-    os.makedirs(timing_dir, exist_ok=True)
+    os.makedirs(cell_out, exist_ok=True)
+    # The engine's per-rank instrumentation dumps go to node-local tmpfs, not
+    # the shared Weka quota: a transient group-quota ENOSPC must never crash the
+    # engine mid-cell (it did once, aborting a whole sweep). The dumps are
+    # ephemeral -- summarized into verdict.json below, then discarded.
+    local_base = os.environ.get("GLM5_LOCAL_DUMP_BASE", "/dev/shm")
+    if not (os.path.isdir(local_base) and os.access(local_base, os.W_OK)):
+        local_base = cell_out
+    dump_root = os.path.join(
+        local_base, f"glm5dump_{os.getpid()}_L{length}_P{probes}")
+    lost_dir = os.path.join(dump_root, "lost_attention")
+    timing_dir = os.path.join(dump_root, "timing")
+    for d in (lost_dir, timing_dir):
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
 
     max_len = length + args.max_tokens + _LEN_MARGIN
     cmd = _serve(
@@ -302,6 +322,7 @@ def run_cell(
 
     lost = _summarize_lost(lost_dir)
     timing = _summarize_timing(timing_dir)
+    shutil.rmtree(dump_root, ignore_errors=True)
     recalls = [t["recall_mean"] for t in per_task.values()]
     verdict = {
         "length": length,
@@ -430,7 +451,17 @@ def main() -> None:
                 except Exception:
                     v = None  # truncated by a mid-write preemption -> re-run
             if v is None:
-                v = run_cell(length, clusters, probes, pct, tasks, n, args)
+                try:
+                    v = run_cell(length, clusters, probes, pct, tasks, n, args)
+                except Exception as e:
+                    # A transient serve/engine death (e.g. a shared-quota ENOSPC
+                    # crashing EngineCore) must not abort the whole sweep. Skip
+                    # this cell -- it writes no verdict.json, so a requeue or a
+                    # rerun retries only it -- and keep going.
+                    print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
+                          f"FAILED: {e!r}; skipping cell (retried on rerun)",
+                          flush=True)
+                    continue
             summary.append(v)
             print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
                   f"recall_mean={v['recall_mean']:.3f} cells_done={len(summary)}",
