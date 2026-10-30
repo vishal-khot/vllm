@@ -25,13 +25,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import glob
+import http.client
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 
 import yaml
@@ -42,6 +43,30 @@ from tasks import TASKS, recall  # noqa: E402
 
 # Serve must cover the longest bucket's context plus the answer budget.
 _LEN_MARGIN = 4096
+
+
+class StreamError(OSError):
+    """The stream ended without a complete answer, e.g. the engine died."""
+
+
+_TRANSIENT = (OSError, http.client.HTTPException, ValueError)
+
+
+def _log(msg: str) -> None:
+    """Print to the job log; a failing log (shared storage) must not kill us."""
+    try:
+        print(msg, flush=True)
+    except OSError:
+        pass
+
+
+def _exit_on_sigterm() -> None:
+    """Stop at once on preemption.
+
+    The serve dies from the same signal, so without this its failed requests
+    look like a run failure and the runner would move on to the next one.
+    """
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
 def _get(url: str, timeout: float) -> int:
@@ -63,6 +88,7 @@ def _post_stream(url: str, body: dict, timeout: float):
     t_last = t0
     content = reasoning = ""
     usage: dict = {}
+    finished = False
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode("utf-8", "ignore").strip()
@@ -70,8 +96,11 @@ def _post_stream(url: str, body: dict, timeout: float):
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
+                finished = True
                 break
             obj = json.loads(data)
+            if obj.get("error"):
+                raise StreamError(f"error in stream: {obj['error']}")
             if obj.get("usage"):
                 usage = obj["usage"]
             for ch in obj.get("choices", []):
@@ -84,8 +113,23 @@ def _post_stream(url: str, body: dict, timeout: float):
                     t_last = now
                 content += d.get("content") or ""
                 reasoning += d.get("reasoning_content") or ""
+    # A cut-off stream is not an answer; scoring it would record a false miss.
+    if not finished or "completion_tokens" not in usage:
+        raise StreamError("stream ended before the final usage chunk")
     decode_s = max(t_last - t0 - (ttft or 0), 0.0)
     return ttft or 0.0, decode_s, content + " " + reasoning, usage
+
+
+def _post_with_retry(url: str, body: dict, timeout: float, attempts: int):
+    """``_post_stream`` with backoff; re-raises once ``attempts`` are used up."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return _post_stream(url, body, timeout)
+        except _TRANSIENT:
+            if attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
+    raise ValueError(f"attempts must be >= 1, got {attempts}")
 
 
 def _serve_env(lost_dir: str, timing_dir: str) -> dict:
@@ -199,6 +243,7 @@ def _summarize_lost(lost_dir: str) -> dict:
 def _run_task(
     port: int, task: str, rows: list, request_timeout: float,
     concurrency: int, max_tokens: int, seed: int | None, greedy: bool,
+    request_attempts: int,
 ) -> list:
     """Stream ``task``'s samples through the live serve; return per-sample recs.
 
@@ -226,18 +271,9 @@ def _run_task(
         }
         if seed is not None:
             body["seed"] = seed
-        last: Exception | None = None
-        for attempt in range(3):
-            try:
-                ttft, dec_s, text, usage = _post_stream(
-                    url, body, timeout=request_timeout,
-                )
-                break
-            except (urllib.error.URLError, OSError) as e:
-                last = e  # transient (e.g. a brief 500); back off and retry
-                time.sleep(2 * (attempt + 1))
-        else:
-            raise last  # exhausted: let run_cell/main skip this cell
+        ttft, dec_s, text, usage = _post_with_retry(
+            url, body, request_timeout, request_attempts,
+        )
         return {
             "idx": ex["index"],
             "gold": ex["outputs"],
@@ -306,7 +342,7 @@ def run_cell(
                 raise RuntimeError(f"no samples in {jsonl}")
             samples = _run_task(
                 args.port, task, rows, args.request_timeout, args.concurrency,
-                args.max_tokens, args.seed, args.greedy,
+                args.max_tokens, args.seed, args.greedy, args.request_attempts,
             )
             rmean = sum(s["recall"] for s in samples) / len(samples)
             per_task[task] = {"recall_mean": rmean, "samples": samples}
@@ -358,21 +394,23 @@ def _load_sweep(path: str) -> dict:
     tasks = cells.get("tasks", "all")
     if tasks in ("all", None):
         tasks = cfg["datasets"]["ruler"]["tasks"]
-    nval = cells.get("n", 5)
+    nval = cells["n"]
     n = nval if nval in ("all", None) else int(nval)
-    return {"n": n, "tasks": list(tasks), "grid": cells["grid"]}
+    return {
+        "n": n, "tasks": list(tasks), "grid": cells["grid"],
+        "concurrency": int(cells["concurrency"]),
+    }
 
 
-def _load_fairness(path: str) -> dict:
-    """Read the shared ``fairness`` block from runs.yaml.
+def _load_shared(path: str) -> tuple[dict, dict]:
+    """Read the ``fairness`` and ``resilience`` blocks from runs.yaml.
 
-    These request-level knobs (generation budget, seed, decoding) are the same
-    for both benchmark arms, so the fidelity sweep derives them here instead of
-    hardcoding them or reading the per-task caps in ``tasks.py``.
+    Both benchmark arms and this sweep share them, so nothing here is hardcoded
+    or taken from the per-task caps in ``tasks.py``.
     """
     with open(path) as f:
         cfg = yaml.safe_load(f)
-    return cfg.get("fairness", {}) or {}
+    return cfg["fairness"], cfg["resilience"]
 
 
 def main() -> None:
@@ -389,10 +427,10 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=None,
                    help="generation cap per request; default from runs.yaml "
                         "fairness.max_tokens (overrides tasks.py per-task caps)")
-    p.add_argument("--concurrency", type=int, default=1,
-                   help="requests in flight per task (ThreadPool); the server "
-                        "batches them. >1 speeds the sweep and leaves recall and "
-                        "key/mass_lost unchanged, but blurs per-request latency.")
+    p.add_argument("--concurrency", type=int,
+                   help="override requests in flight per task (default: "
+                        "sweep.cells.concurrency in runs.yaml). >1 leaves recall "
+                        "and key/mass_lost unchanged but blurs per-request latency.")
     p.add_argument("--lengths", help="comma list to restrict to a subset of cells")
     p.add_argument("--force", action="store_true",
                    help="re-run every cell even if its verdict.json exists "
@@ -405,12 +443,14 @@ def main() -> None:
     args = p.parse_args()
 
     sweep = _load_sweep(args.runs_yaml)
-    fairness = _load_fairness(args.runs_yaml)
+    fairness, resilience = _load_shared(args.runs_yaml)
     if args.max_tokens is None:
-        args.max_tokens = int(fairness.get("max_tokens", 2048))
-    seed = fairness.get("seed")
-    args.seed = int(seed) if seed is not None else None
-    args.greedy = bool(fairness.get("greedy", True))
+        args.max_tokens = int(fairness["max_tokens"])
+    args.seed = int(fairness["seed"])
+    args.greedy = bool(fairness["greedy"])
+    args.concurrency = args.concurrency or sweep["concurrency"]
+    args.request_attempts = int(resilience["request_attempts"])
+    _exit_on_sigterm()
     tasks = [args.task] if args.task else sweep["tasks"]
     n = args.n or sweep["n"]
     bad = [t for t in tasks if t not in TASKS]
@@ -428,13 +468,17 @@ def main() -> None:
           f"cells={sum(len(c['probes']) for c in grid)} (from {args.runs_yaml}) ====",
           flush=True)
 
+    pending = [
+        (int(cell["length"]), int(cell["clusters"]), int(probes))
+        for cell in grid for probes in cell["probes"]
+    ]
     summary = []
-    for cell in grid:
-        length = int(cell["length"])
-        clusters = int(cell["clusters"])
-        for probes in cell["probes"]:
-            probes = int(probes)
+    passes = int(resilience["run_passes"])
+    for pass_no in range(1, passes + 1):
+        failed = []
+        for length, clusters, probes in pending:
             pct = round(100.0 * probes / clusters, 2)
+            tag = f"L{length} C{clusters} P{probes}({pct:g}%)"
             # Resume: a cell is finished iff it wrote a readable verdict.json
             # (run_cell's last write), so requeue after preemption re-runs only
             # the cells that did not complete. --force overrides.
@@ -446,34 +490,38 @@ def main() -> None:
                 try:
                     with open(done) as f:
                         v = json.load(f)
-                    print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
-                          "resume: already complete, skipping", flush=True)
+                    _log(f"[{tag}] resume: already complete, skipping")
                 except Exception:
                     v = None  # truncated by a mid-write preemption -> re-run
             if v is None:
                 try:
                     v = run_cell(length, clusters, probes, pct, tasks, n, args)
                 except Exception as e:
-                    # A transient serve/engine death (e.g. a shared-quota ENOSPC
-                    # crashing EngineCore) must not abort the whole sweep. Skip
-                    # this cell -- it writes no verdict.json, so a requeue or a
-                    # rerun retries only it -- and keep going.
-                    print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
-                          f"FAILED: {e!r}; skipping cell (retried on rerun)",
-                          flush=True)
+                    # A dead serve or a storage failure must not abort the sweep.
+                    # The cell wrote no verdict.json, so a later pass retries it.
+                    _log(f"[{tag}] FAILED: {e!r} (pass {pass_no}/{passes})")
+                    failed.append((length, clusters, probes))
                     continue
             summary.append(v)
-            print(f"[L{length} C{clusters} P{probes}({pct:g}%)] "
-                  f"recall_mean={v['recall_mean']:.3f} cells_done={len(summary)}",
-                  flush=True)
+            _log(f"[{tag}] recall_mean={v['recall_mean']:.3f} "
+                 f"cells_done={len(summary)}")
             for key, s in sorted(v["lost_attention"].items()):
-                print(f"    {key:16s} key_lost={s['key_lost_mean']:.4f} "
-                      f"mass_lost={s['mass_lost_mean']:.4f} rows={s['rows']}",
-                      flush=True)
+                _log(f"    {key:16s} key_lost={s['key_lost_mean']:.4f} "
+                     f"mass_lost={s['mass_lost_mean']:.4f} rows={s['rows']}")
+        pending = failed
+        if not pending:
+            break
+        if pass_no < passes:
+            _log(f"{len(pending)} cell(s) failed; retrying after "
+                 f"{resilience['pass_backoff_s']}s")
+            time.sleep(float(resilience["pass_backoff_s"]))
 
+    summary.sort(key=lambda v: (v["length"], v["probes"]))
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"\nwrote {os.path.join(args.out_dir, 'summary.json')}", flush=True)
+    _log(f"\nwrote {os.path.join(args.out_dir, 'summary.json')}")
+    if pending:
+        raise SystemExit(f"cells still failing after {passes} passes: {pending}")
 
 
 if __name__ == "__main__":

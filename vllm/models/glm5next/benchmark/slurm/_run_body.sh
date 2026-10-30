@@ -143,7 +143,5 @@ python "${RUNNER}" \
   --runs-yaml "${RUNS_YAML}" \
   --tp "${GLM5_TP}" \
   --port "${PORT}" \
-  --concurrency "${GLM5_CONCURRENCY:-1}" \
-  ${GLM5_N:+--n "${GLM5_N}"} \
   ${GLM5_LENGTHS:+--lengths "${GLM5_LENGTHS}"}
 echo "[$(date +%T)] done. results in ${OUT_ROOT}"

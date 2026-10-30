@@ -15,6 +15,14 @@ fairness:
   max_model_len: 34000
   prefix_caching: off        # IVF forces off; match on kpool
 
+# Failure handling for both runners. A failed request is retried, then its run
+# or cell is skipped and retried on a later pass in the same job; requeued jobs
+# resume from their checkpoints. The backoff lets a storage blip drain.
+resilience:
+  request_attempts: 3
+  run_passes: 4
+  pass_backoff_s: 300
+
 # serve_level needs a server restart; free axes run inside one serve.
 axes:
   serve_level: [indexer, P, clusters, cadence, concurrency, exec_mode]
@@ -115,7 +123,8 @@ runs:
       # time. Derived as clusters = round(sqrt(length/4)) = sqrt(#pools)
       # (kpool=4), probes = round(clusters * {6.25,12.5,25,50,75}%).
       cells:
-        n: all                  # eager fidelity: run every sample in each file
+        n: 20                   # samples per task per cell; `all` = whole file
+        concurrency: 32         # requests in flight; server batches them
         tasks: all              # all tasks listed in the ruler dataset above
         grid:
           - {length: 8192,   clusters: 45,  probes: [3, 6, 11, 23, 34]}

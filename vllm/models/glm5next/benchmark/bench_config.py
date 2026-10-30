@@ -170,6 +170,7 @@ class Matrix:
     gpu: str
     image: dict[str, Any]
     fairness: dict[str, Any]
+    resilience: dict[str, Any]
     metrics: dict[str, Any]
     runs: list[Run]
 
@@ -353,7 +354,8 @@ def load_matrix(path: str | Path) -> Matrix:
     with path.open() as f:
         raw = yaml.safe_load(f)
 
-    for req in ("model", "fairness", "indexer_arms", "datasets", "runs"):
+    required = ("model", "fairness", "resilience", "indexer_arms", "datasets", "runs")
+    for req in required:
         if req not in raw:
             raise ConfigError(f"{path}: missing top-level key {req!r}")
 
@@ -380,6 +382,7 @@ def load_matrix(path: str | Path) -> Matrix:
         gpu=raw.get("gpu", ""),
         image=raw.get("image", {}),
         fairness=fairness,
+        resilience=raw["resilience"],
         metrics=raw.get("metrics", {}),
         runs=runs,
     )
