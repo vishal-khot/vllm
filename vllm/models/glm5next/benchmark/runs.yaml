@@ -82,17 +82,13 @@ default: &default
 
 # Indexer memory and time, shared by both arms so they send identical requests.
 # Eager and one request at a time, so each number belongs to one request, with
-# lost-attention off so IVF doesn't pay for its exact re-run. cwe, fwe and qa are
-# left out: cwe writes 8-10K tokens (20-25 minutes at eager speed) and long
-# outputs would dominate the decode means.
+# lost-attention off so IVF doesn't pay for its exact re-run. Every ruler task
+# runs; cwe writes 8-10K tokens, 20-25 minutes each at eager speed.
 memory_timing: &memory_timing
   concurrency: 1
   exec_mode: eager
   measure_lost_attention: false
   n: 2
-  tasks: [niah_single_1, niah_single_2, niah_single_3,
-          niah_multikey_1, niah_multikey_2, niah_multikey_3,
-          niah_multivalue, niah_multiquery, vt]
 
 # The two cases. `<<: *default` pulls the default run; list only the diffs.
 # `sweep` on a case adds ablation runs: one knob flipped per value (-> [ruler],
