@@ -90,9 +90,8 @@ loses finished runs):
   collide.
 - **Fidelity sweep** → `${OUT_ROOT:-$HOME/glm5_lost_attention/<jobid>}/`
   ```
-  L<len>/C<clusters>_P<probes>/verdict.json   per-task recall + lost-attn + memory
-  L<len>/C<clusters>_P<probes>/lost_attention/  raw per-rank dumps
-  L<len>/C<clusters>_P<probes>/timing/          raw per-rank dumps
+  L<len>/C<clusters>_P<probes>/verdict.json   per-task recall + lost-attn
+  L<len>/C<clusters>_P<probes>/partial/       requests + per-attempt dumps, for resume
   summary.json                                   over all 25 cells
   ```
 

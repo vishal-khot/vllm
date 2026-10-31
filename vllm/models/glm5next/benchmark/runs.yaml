@@ -23,6 +23,7 @@ resilience:
   request_attempts: 3
   run_passes: 4
   pass_backoff_s: 300
+  lost_attention_save_s: 60  # fidelity copies its in-progress stats to Weka this often
 
 # serve_level needs a server restart; free axes run inside one serve.
 axes:

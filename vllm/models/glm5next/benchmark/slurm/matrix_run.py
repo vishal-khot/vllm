@@ -51,11 +51,14 @@ from tasks import recall  # noqa: E402
 from lost_attention_run import (  # noqa: E402
     _exit_on_sigterm,
     _get,
+    _key,
     _log,
     _post_with_retry,
+    _Results,
     _summarize_lost,
     _summarize_timing,
     _wait_ready,
+    _write_atomic,
 )
 
 _HOUR = 3600
@@ -111,58 +114,6 @@ def _one_request(port: int, meta: dict, run, args) -> dict:
         "decode_ms": round(dec_s * 1000, 1),
         "decode_s": dec_s, "out_tok": otk,
     }
-
-
-def _key(rec: dict) -> str:
-    return f"{rec['L']}|{rec['task']}|{rec['idx']}"
-
-
-def _write_atomic(path: str, text: str) -> None:
-    tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
-
-
-class _Results:
-    """Per-request checkpoint: an append-only jsonl, reloaded on resume.
-
-    Every record is written between newlines, so a line torn by a preemption or a
-    full disk is skipped on load and can't corrupt the next one. Records that
-    fail to write stay queued and go out with the next one, so a storage blip
-    costs no results while the run stays up.
-    """
-
-    def __init__(self, path: str):
-        self.path = path
-        self.done: dict[str, dict] = {}
-        self._unsynced: list[dict] = []
-        if os.path.exists(path):
-            with open(path) as f:
-                for line in f:
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    self.done[_key(rec)] = rec
-        self.attempt = 1 + max(
-            (r["attempt"] for r in self.done.values()), default=0)
-
-    def add(self, rec: dict) -> None:
-        rec["attempt"] = self.attempt
-        self.done[_key(rec)] = rec
-        self._unsynced.append(rec)
-        self.sync()
-
-    def sync(self) -> None:
-        text = "".join(f"\n{json.dumps(r)}\n" for r in self._unsynced)
-        try:
-            with open(self.path, "a") as f:
-                f.write(text)
-        except OSError as e:
-            _log(f"checkpoint write failed, will retry: {e!r}")
-            return
-        self._unsynced.clear()
 
 
 def _run_requests(port: int, metas: list, run, args, ckpt: _Results) -> None:
