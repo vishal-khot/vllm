@@ -363,6 +363,11 @@ def main() -> None:
             raise SystemExit(f"unknown run id(s): {sorted(bad)}")
         runs = [r for r in runs if r.id in want]
 
+    # Shortest length first, kpool then ivf, so whatever a slow queue finishes is a
+    # complete comparison. Order doesn't affect results: each run has its own serve.
+    runs = sorted(
+        runs, key=lambda r: (r.length or 0, not r.eager, r.indexer != "kpool"))
+
     resilience = matrix.resilience
     args.request_attempts = int(resilience["request_attempts"])
     passes = int(resilience["run_passes"])
