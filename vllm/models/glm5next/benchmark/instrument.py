@@ -10,8 +10,10 @@ same metrics whichever arm is active:
 
 Keyed by layer index (parsed from the indexer's ``k_cache`` prefix) and phase
 (prefill vs decode). Imported from ``sitecustomize`` when ``GLM5_INSTRUMENT=1``
-so it also installs inside every TP worker. Each process flushes its own JSON to
-``GLM5_TIMING_DIR`` on exit; the aggregator merges across ranks.
+so it also installs inside every TP worker. Each process rewrites its own JSON in
+``GLM5_TIMING_DIR`` every few seconds and on exit; the aggregator merges across
+ranks and attempts. Call times also go into a log-spaced histogram, so medians
+can be merged too and a slow first call (kernel compile) can't move them.
 
 The indexer exists only on the 11 DSA layers (3, 7, ..., 43 for GLM-5.3-Flash);
 no other layer is patched because no other layer has this op.
@@ -27,11 +29,13 @@ Env:
 
 import atexit
 import json
+import math
 import os
 import re
 import time
 
 _LAYER_RE = re.compile(r"layers\.(\d+)")
+_HIST_BASE = 1.05  # bin width of the call-time histogram: 5%
 
 
 def _tensor_bytes(x) -> int:
@@ -109,18 +113,26 @@ def _install():
     def _slot(layer, phase):
         return entries.setdefault(layer, {}).setdefault(
             phase,
-            {"n": 0, "ms_sum": 0.0, "tok_sum": 0, "peak_mib": 0.0, "resident_mib": 0.0},
+            {
+                "n": 0, "ms_sum": 0.0, "tok_sum": 0, "peak_mib": 0.0,
+                "resident_mib": 0.0, "hist": {},
+            },
         )
+
+    def _add_call(layer, phase, ms, n_tok):
+        s = _slot(layer, phase)
+        s["n"] += 1
+        s["ms_sum"] += ms
+        s["tok_sum"] += n_tok
+        b = math.floor(math.log(max(ms, 1e-3), _HIST_BASE))
+        s["hist"][b] = s["hist"].get(b, 0) + 1
 
     def _drain():
         if not pending:
             return
         torch.cuda.synchronize()
         for layer, phase, n_tok, start, end in pending:
-            s = _slot(layer, phase)
-            s["n"] += 1
-            s["ms_sum"] += start.elapsed_time(end)
-            s["tok_sum"] += n_tok
+            _add_call(layer, phase, start.elapsed_time(end), n_tok)
         pending.clear()
 
     def _make_timed(orig):
@@ -145,10 +157,8 @@ def _install():
 
             if mem_probe:
                 torch.cuda.synchronize()
+                _add_call(layer, phase, start.elapsed_time(end), n_tok)
                 s = _slot(layer, phase)
-                s["n"] += 1
-                s["ms_sum"] += start.elapsed_time(end)
-                s["tok_sum"] += n_tok
                 peak = (torch.cuda.max_memory_allocated() - before) / (1024**2)
                 s["peak_mib"] = max(s["peak_mib"], peak)
             else:
@@ -186,6 +196,7 @@ def _install():
             "pid": os.getpid(),
             "mem_probe": mem_probe,
             "resident_probe": resident_probe,
+            "hist_base": _HIST_BASE,
             "layers": {},
         }
         for layer in sorted(entries):
@@ -197,11 +208,13 @@ def _install():
                     "ms_per_tok": s["ms_sum"] / s["tok_sum"] if s["tok_sum"] else 0.0,
                     "peak_mib": round(s["peak_mib"], 2),
                     "resident_mib": round(s["resident_mib"], 2),
+                    "hist": {str(b): c for b, c in s["hist"].items()},
                 }
         fn = os.path.join(timing_dir, f"indexer_timing_pid{os.getpid()}_r{rank}.json")
-        with open(fn, "w") as f:
+        # Atomic: the runner copies this file while the serve is writing it.
+        with open(f"{fn}.tmp", "w") as f:
             json.dump(report, f, indent=2)
-        print(f"[glm5-instrument] wrote {fn}", flush=True)
+        os.replace(f"{fn}.tmp", fn)
 
     def _drain_and_flush():
         # atexit runs after stdout may be closed; never raise from here.

@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 import urllib.request
+from typing import NamedTuple
 
 import yaml
 
@@ -125,13 +126,57 @@ def _exit_on_sigterm() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
+class _Reply(NamedTuple):
+    ttft_s: float
+    decode_s: float
+    answer: str
+    reasoning: str
+    usage: dict
+    finish_reason: str | None
+
+
+def _split_answer(
+    content: str, reasoning: str, finish_reason: str | None,
+) -> tuple[str, str]:
+    """Return (final answer, reasoning) of a completion.
+
+    The chat template opens ``<think>`` and we serve without a reasoning parser,
+    so GLM-5.3's stream is ``reasoning</think>answer``. A stream cut by
+    ``max_tokens`` before ``</think>`` has reasoning and no answer.
+    """
+    if reasoning:
+        return content, reasoning
+    if "</think>" in content:
+        thought, answer = content.rsplit("</think>", 1)
+        return answer, thought
+    if finish_reason == "length":
+        return "", content
+    return content, ""
+
+
+def _score(gold, reply: _Reply) -> dict:
+    """Scoring fields of a request record.
+
+    ``recall`` reads the final answer only, as RULER scores it. Reasoning restates
+    the context, so counting it would credit a model that never answered.
+    ``answer`` is kept so the scoring can be re-run.
+    """
+    return {
+        "recall": recall(gold, reply.answer),
+        "recall_with_reasoning": recall(gold, f"{reply.answer} {reply.reasoning}"),
+        "finish_reason": reply.finish_reason,
+        "reasoning_chars": len(reply.reasoning),
+        "answer": reply.answer,
+    }
+
+
 def _get(url: str, timeout: float) -> int:
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return r.status
 
 
 def _post_stream(url: str, body: dict, timeout: float):
-    """POST a streamed chat completion; return (ttft_s, decode_s, text, usage)."""
+    """POST a streamed chat completion and return its ``_Reply``."""
     body = {**body, "stream": True, "stream_options": {"include_usage": True}}
     req = urllib.request.Request(
         url,
@@ -144,6 +189,7 @@ def _post_stream(url: str, body: dict, timeout: float):
     t_last = t0
     content = reasoning = ""
     usage: dict = {}
+    finish_reason = None
     finished = False
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
@@ -160,6 +206,7 @@ def _post_stream(url: str, body: dict, timeout: float):
             if obj.get("usage"):
                 usage = obj["usage"]
             for ch in obj.get("choices", []):
+                finish_reason = ch.get("finish_reason") or finish_reason
                 d = ch.get("delta") or {}
                 piece = (d.get("content") or "") + (d.get("reasoning_content") or "")
                 if piece:
@@ -173,7 +220,8 @@ def _post_stream(url: str, body: dict, timeout: float):
     if not finished or "completion_tokens" not in usage:
         raise StreamError("stream ended before the final usage chunk")
     decode_s = max(t_last - t0 - (ttft or 0), 0.0)
-    return ttft or 0.0, decode_s, content + " " + reasoning, usage
+    answer, thought = _split_answer(content, reasoning, finish_reason)
+    return _Reply(ttft or 0.0, decode_s, answer, thought, usage, finish_reason)
 
 
 def _post_with_retry(url: str, body: dict, timeout: float, attempts: int):
@@ -200,30 +248,76 @@ def _serve_env(lost_dir: str) -> dict:
     return env
 
 
+def _hist_quantile(hist: dict[int, int], base: float, q: float) -> float:
+    """``q`` quantile of a log-spaced histogram: the geometric middle of its bin."""
+    target = q * sum(hist.values())
+    seen = 0
+    for b in sorted(hist):
+        seen += hist[b]
+        if seen >= target:
+            return base ** (b + 0.5)
+    return 0.0
+
+
 def _summarize_timing(timing_dir: str) -> dict:
-    """Peak/resident indexer memory and per-(layer, phase) mean indexer time,
-    taken across the per-rank instrument dumps."""
-    peak = resident = resident_total = 0.0
-    layers: dict[str, float] = {}
-    for fn in glob.glob(os.path.join(timing_dir, "indexer_timing_pid*_r*.json")):
+    """Indexer memory and per-(layer, phase) time over the per-rank dumps,
+    including those in subdirectories (one per attempt).
+
+    Within an attempt a mean is the slowest rank's and resident state is summed
+    over layers and ranks. Across attempts means are weighted by calls and memory
+    takes the maximum, since each serve allocates the same state again. Medians
+    and p99 pool the calls of every rank and attempt.
+    """
+    peak = resident = 0.0
+    totals: dict[str, float] = {}
+    means: dict[str, dict[str, tuple[int, float]]] = {}
+    hists: dict[str, dict[int, int]] = {}
+    base = 0.0
+    pattern = os.path.join(timing_dir, "**", "indexer_timing_pid*_r*.json")
+    for fn in glob.glob(pattern, recursive=True):
         try:
-            rep = json.load(open(fn))
+            with open(fn) as f:
+                rep = json.load(f)
         except Exception:
             continue
+        attempt = os.path.dirname(fn)
+        base = rep.get("hist_base", base)
         for layer, phases in rep.get("layers", {}).items():
             layer_resident = 0.0
             for phase, s in phases.items():
                 peak = max(peak, s.get("peak_mib", 0.0))
                 layer_resident = max(layer_resident, s.get("resident_mib", 0.0))
                 key = f"{layer}|{phase}"
-                layers[key] = max(layers.get(key, 0.0), s.get("mean_ms", 0.0))
+                seen = means.setdefault(attempt, {}).get(key, (0, 0.0))
+                if s.get("mean_ms", 0.0) >= seen[1]:
+                    means[attempt][key] = (s.get("calls", 0), s.get("mean_ms", 0.0))
+                hist = hists.setdefault(key, {})
+                for b, count in s.get("hist", {}).items():
+                    hist[int(b)] = hist.get(int(b), 0) + count
             resident = max(resident, layer_resident)
-            resident_total += layer_resident
+            totals[attempt] = totals.get(attempt, 0.0) + layer_resident
+    calls: dict[str, int] = {}
+    ms_sum: dict[str, float] = {}
+    for by_key in means.values():
+        for key, (n, mean) in by_key.items():
+            calls[key] = calls.get(key, 0) + n
+            ms_sum[key] = ms_sum.get(key, 0.0) + n * mean
     return {
         "peak_indexer_mib": round(peak, 2),
         "resident_state_mib": round(resident, 2),
-        "resident_total_mib": round(resident_total, 2),
-        "per_layer_ms": {k: round(v, 4) for k, v in sorted(layers.items())},
+        "resident_total_mib": round(max(totals.values(), default=0.0), 2),
+        "per_layer_ms": {
+            k: round(ms_sum[k] / calls[k], 4) for k in sorted(calls) if calls[k]
+        },
+        "per_layer_calls": dict(sorted(calls.items())),
+        "per_layer_p50_ms": {
+            k: round(_hist_quantile(h, base, 0.5), 4)
+            for k, h in sorted(hists.items()) if h
+        },
+        "per_layer_p99_ms": {
+            k: round(_hist_quantile(h, base, 0.99), 4)
+            for k, h in sorted(hists.items()) if h
+        },
     }
 
 
@@ -273,7 +367,12 @@ def _wait_ready(proc: subprocess.Popen, port: int, timeout_s: float) -> None:
 
 def _summarize_lost(lost_dir: str) -> dict:
     """Mean key_lost / mass_lost per (layer, phase) over the per-rank dumps,
-    including those in subdirectories (one per attempt)."""
+    including those in subdirectories (one per attempt).
+
+    ``mass_lost_total`` is 1 - summed kept mass / summed exact mass. Prefer it to
+    ``mass_lost_mean``, the per-row mean, which scores a row with no attention
+    mass to lose (exact mass 0) as 100% lost.
+    """
     agg: dict[str, dict] = {}
     pattern = os.path.join(lost_dir, "**", "lost_attention_pid*.json")
     for fn in glob.glob(pattern, recursive=True):
@@ -282,37 +381,42 @@ def _summarize_lost(lost_dir: str) -> dict:
         except Exception:
             continue
         for key, s in d.items():
-            a = agg.setdefault(key, {"rows": 0, "key_lost": 0.0, "mass_lost": 0.0})
+            a = agg.setdefault(key, {
+                "rows": 0, "key_lost": 0.0, "mass_lost": 0.0, "real": 0.0, "exact": 0.0,
+            })
             rows = s.get("rows", 0)
             a["rows"] += rows
             a["key_lost"] += s.get("key_lost_mean", 0.0) * rows
             a["mass_lost"] += s.get("mass_lost_mean", 0.0) * rows
+            a["real"] += s.get("real_mass_mean", 0.0) * rows
+            a["exact"] += s.get("exact_mass_mean", 0.0) * rows
     return {
         key: {
             "rows": a["rows"],
             "key_lost_mean": a["key_lost"] / a["rows"] if a["rows"] else 0.0,
             "mass_lost_mean": a["mass_lost"] / a["rows"] if a["rows"] else 0.0,
+            "mass_lost_total": 1.0 - a["real"] / a["exact"] if a["exact"] else 0.0,
         }
         for key, a in agg.items()
     }
 
 
-def _copy_lost(lost_dir: str, kept_dir: str) -> None:
+def _copy_dumps(dump_dir: str, kept_dir: str) -> None:
     """Copy the per-rank dumps off tmpfs; a storage blip costs only this copy."""
-    for fn in glob.glob(os.path.join(lost_dir, "lost_attention_pid*.json")):
+    for fn in glob.glob(os.path.join(dump_dir, "*.json")):
         dst = os.path.join(kept_dir, os.path.basename(fn))
         try:
             shutil.copyfile(fn, f"{dst}.tmp")
             os.replace(f"{dst}.tmp", dst)
         except OSError as e:
-            _log(f"lost-attention copy failed, will retry: {e!r}")
+            _log(f"dump copy failed, will retry: {e!r}")
 
 
 def _keep_lost(
     lost_dir: str, kept_dir: str, every_s: float, stop: threading.Event,
 ) -> None:
     while not stop.wait(every_s):
-        _copy_lost(lost_dir, kept_dir)
+        _copy_dumps(lost_dir, kept_dir)
 
 
 def _run_tasks(
@@ -353,19 +457,17 @@ def _run_tasks(
         }
         if seed is not None:
             body["seed"] = seed
-        ttft, dec_s, text, usage = _post_with_retry(
-            url, body, request_timeout, request_attempts,
-        )
+        reply = _post_with_retry(url, body, request_timeout, request_attempts)
         return {
             "task": task,
             "L": length,
             "idx": ex["index"],
             "gold": ex["outputs"],
-            "recall": recall(ex["outputs"], text),
-            "prefill_ms": round(ttft * 1000, 1),
-            "decode_ms": round(dec_s * 1000, 1),
-            "in_tok": usage.get("prompt_tokens"),
-            "out_tok": usage.get("completion_tokens"),
+            **_score(ex["outputs"], reply),
+            "prefill_ms": round(reply.ttft_s * 1000, 1),
+            "decode_ms": round(reply.decode_s * 1000, 1),
+            "in_tok": reply.usage.get("prompt_tokens"),
+            "out_tok": reply.usage.get("completion_tokens"),
         }
 
     pool = cf.ThreadPoolExecutor(max_workers=max(1, concurrency))
@@ -420,7 +522,7 @@ def _serve_cell(
                 proc.kill()
             time.sleep(5)  # let the recorder's atexit dump settle
         finally:  # SIGTERM can land in the wait above
-            _copy_lost(lost_dir, kept_dir)
+            _copy_dumps(lost_dir, kept_dir)
 
 
 def _cell_config(
@@ -430,7 +532,7 @@ def _cell_config(
     return json.dumps({
         "length": length, "clusters": clusters, "probes": probes,
         "tasks": tasks, "n": n, "max_tokens": args.max_tokens,
-        "seed": args.seed, "greedy": args.greedy,
+        "seed": args.seed, "greedy": args.greedy, "scoring": "final_answer",
     }, sort_keys=True)
 
 
@@ -505,7 +607,11 @@ def run_cell(
     for task, rows in rows_by_task.items():
         samples = [ckpt.done[_rec_key(task, ex)] for ex in rows]
         rmean = sum(s["recall"] for s in samples) / len(samples)
-        per_task[task] = {"recall_mean": rmean, "samples": samples}
+        per_task[task] = {
+            "recall_mean": rmean,
+            "capped": sum(s["finish_reason"] == "length" for s in samples),
+            "samples": samples,
+        }
         print(f"[{tag}] {task:16s} recall_mean={rmean:.3f} n={len(samples)}",
               flush=True)
     lost = _summarize_lost(kept_root)
@@ -659,7 +765,7 @@ def main() -> None:
                  f"cells_done={len(summary)}")
             for key, s in sorted(v["lost_attention"].items()):
                 _log(f"    {key:16s} key_lost={s['key_lost_mean']:.4f} "
-                     f"mass_lost={s['mass_lost_mean']:.4f} rows={s['rows']}")
+                     f"mass_lost={s['mass_lost_total']:.4f} rows={s['rows']}")
         pending = failed
         if not pending:
             break

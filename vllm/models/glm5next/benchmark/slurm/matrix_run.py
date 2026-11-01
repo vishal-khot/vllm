@@ -19,9 +19,11 @@ datasets through that serve, and stores results **per run**, keyed by
 A preempted job is requeued and resumes from results.jsonl, so only unfinished
 requests are re-sent. A run that fails (dead serve, storage error) is skipped and
 retried on a later pass, per ``resilience`` in runs.yaml; the job exits non-zero
-if any run is still failing after the last pass. Instrument and lost-attention
-stats cover only the requests served by the final attempt; ``verdict.json``
-records how many as ``instrumented_requests``.
+if any run is still failing after the last pass. Instrument dumps are copied off
+tmpfs after each finished request, one directory per attempt, and merged, so
+memory and time cover every checkpointed request and not the one in flight at
+preemption. ``verdict.json`` records ``instrumented_requests`` and ``attempts``.
+Lost-attention stats, which A/B runs leave off, cover only the final attempt.
 
 Model + RULER staging and the venv are done by ``_matrix_body.sh``; this script
 assumes the model and ``<task>/validation_<len>.jsonl`` are already local and a
@@ -45,16 +47,17 @@ SLURM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH_DIR)
 sys.path.insert(0, SLURM_DIR)
 from bench_config import load_matrix  # noqa: E402
-from tasks import recall  # noqa: E402
 
 # Reuse the proven serve/HTTP/summary helpers from the fidelity runner.
 from lost_attention_run import (  # noqa: E402
+    _copy_dumps,
     _exit_on_sigterm,
     _get,
     _key,
     _log,
     _post_with_retry,
     _Results,
+    _score,
     _summarize_lost,
     _summarize_timing,
     _wait_ready,
@@ -102,21 +105,23 @@ def _one_request(port: int, meta: dict, run, args) -> dict:
         "temperature": 0 if run.greedy else 1.0,
         "seed": run.seed,
     }
-    ttft, dec_s, text, usage = _post_with_retry(
+    reply = _post_with_retry(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         body, args.request_timeout, args.request_attempts,
     )
-    otk = usage.get("completion_tokens")
     return {
         "task": meta["task"], "L": meta["L"], "idx": meta["idx"],
-        "recall": recall(meta["gold"], text),
-        "prefill_ms": round(ttft * 1000, 1),
-        "decode_ms": round(dec_s * 1000, 1),
-        "decode_s": dec_s, "out_tok": otk,
+        **_score(meta["gold"], reply),
+        "prefill_ms": round(reply.ttft_s * 1000, 1),
+        "decode_ms": round(reply.decode_s * 1000, 1),
+        "decode_s": reply.decode_s,
+        "out_tok": reply.usage.get("completion_tokens"),
     }
 
 
-def _run_requests(port: int, metas: list, run, args, ckpt: _Results) -> None:
+def _run_requests(
+    port: int, metas: list, run, args, ckpt: _Results, on_done=None,
+) -> None:
     """Send ``metas`` at the run's concurrency, checkpointing each as it finishes.
 
     The pool is not used as a context manager: on failure or SIGTERM that would
@@ -130,6 +135,8 @@ def _run_requests(port: int, metas: list, run, args, ckpt: _Results) -> None:
             rec = fut.result()
             rec["t_done"] = round(time.time() - t0, 3)
             ckpt.add(rec)
+            if on_done:
+                on_done()
             if i % 20 == 0 or i == len(metas):
                 _log(f"[{run.id}] attempt {ckpt.attempt}: {i}/{len(metas)} "
                      f"requests ({len(ckpt.done)} checkpointed)")
@@ -160,7 +167,8 @@ def _config_text(run) -> str:
     """The settings a checkpoint is valid for."""
     return json.dumps({
         "serve": run.serve_key(), "max_tokens": run.max_tokens,
-        "seed": run.seed, "greedy": run.greedy,
+        "seed": run.seed, "greedy": run.greedy, "timing": "merged_attempts",
+        "scoring": "final_answer",
         "datasets": [[d.name, d.n, d.lengths, d.tasks] for d in run.datasets],
     }, sort_keys=True)
 
@@ -178,15 +186,17 @@ def run_one(run, args) -> dict:
     base_out = os.path.join(args.out_dir, run.id)
     partial_dir = os.path.join(base_out, "partial")
     # Resume from the checkpoints unless --force or runs.yaml changed for this
-    # run. The per-rank instrument dumps always start empty and cover only this
-    # attempt. They go to node-local tmpfs so a shared-quota ENOSPC can't crash
-    # the engine, and are discarded once summarized into verdict.json.
+    # run. The per-rank instrument dumps go to node-local tmpfs so a shared-quota
+    # ENOSPC can't crash the engine; kept_dir holds this attempt's copy of them.
     resuming = not args.force and _config_matches(run, base_out)
     if os.path.isdir(base_out) and not resuming:
         _log(f"[{run.id}] no valid checkpoint for this config, starting clean")
         shutil.rmtree(base_out)
-    os.makedirs(partial_dir, exist_ok=True)
+    kept_root = os.path.join(partial_dir, "timing")
+    os.makedirs(kept_root, exist_ok=True)
     _write_atomic(os.path.join(base_out, "config.json"), _config_text(run))
+    kept_dir = os.path.join(kept_root, f"attempt{1 + len(os.listdir(kept_root))}")
+    os.makedirs(kept_dir, exist_ok=True)
     local_base = os.environ.get("GLM5_LOCAL_DUMP_BASE", "/dev/shm")
     if not (os.path.isdir(local_base) and os.access(local_base, os.W_OK)):
         local_base = base_out
@@ -235,17 +245,14 @@ def run_one(run, args) -> dict:
             os.makedirs(ds_partial, exist_ok=True)
             ckpt = _Results(os.path.join(ds_partial, "results.jsonl"))
             todo = [m for m in metas if _key(m) not in ckpt.done]
-            if run.eager and not todo:
-                # Everything was checkpointed but the verdict was not written.
-                # Repeat the last task so this attempt's dumps aren't empty.
-                todo = metas[-cap:]
             if ckpt.done:
                 _log(f"[{run.id}] resume: {len(ckpt.done)}/{len(metas)} "
                      f"checkpointed, attempt {ckpt.attempt}")
-            _run_requests(args.port, todo, run, args, ckpt)
-            instrumented += len(todo)
+            keep = (lambda: _copy_dumps(timing_dir, kept_dir)) if run.eager else None
+            _run_requests(args.port, todo, run, args, ckpt, keep)
             ckpt.sync()
             results = [ckpt.done[_key(m)] for m in metas]
+            instrumented += len(results)
 
             per_task = {}
             for t in ds.tasks:
@@ -255,7 +262,8 @@ def run_one(run, args) -> dict:
             mean = (round(sum(per_task.values()) / len(per_task), 4)
                     if per_task else None)
             accuracy[ds.name] = {
-                "per_task": per_task, "mean": mean, "n_req": len(results)}
+                "per_task": per_task, "mean": mean, "n_req": len(results),
+                "capped": sum(r["finish_reason"] == "length" for r in results)}
 
             if run.concurrency <= 1:
                 pf = [r["prefill_ms"] for r in results]
@@ -277,13 +285,16 @@ def run_one(run, args) -> dict:
             proc.kill()
         time.sleep(5)  # let the instrument + ivf_fidelity atexit dumps settle
 
+    # Only here on a clean finish: a preempted attempt keeps its last copy, so the
+    # request in flight is not counted and then measured again on resume.
+    _copy_dumps(timing_dir, kept_dir)
     verdict = {m: "expected_but_missing" for m in run.metrics()}
     verdict["accuracy"] = "PASS" if accuracy else "MISSING"
     if "latency_ttft" in verdict:
         verdict["latency_ttft"] = "PASS" if latency else "MISSING"
     if "throughput" in verdict:
         verdict["throughput"] = "PASS" if throughput else "MISSING"
-    timing = _summarize_timing(timing_dir) if run.eager else None
+    timing = _summarize_timing(kept_root) if run.eager else None
     if run.eager:
         verdict["per_layer_indexer_ms"] = (
             "PASS" if timing["per_layer_ms"] else "MISSING")
@@ -315,6 +326,7 @@ def run_one(run, args) -> dict:
         "accuracy": accuracy, "latency": latency, "throughput": throughput,
         "memory_timing": timing, "lost_attention": lost,
         "instrumented_requests": instrumented if run.eager else None,
+        "attempts": len(os.listdir(kept_root)),
         "skipped": skipped, "verdict": verdict,
     }
     _write_atomic(os.path.join(base_out, "verdict.json"),
