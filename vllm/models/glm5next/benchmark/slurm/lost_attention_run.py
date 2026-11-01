@@ -69,6 +69,11 @@ def _key(rec: dict) -> str:
     return f"{rec['L']}|{rec['task']}|{rec['idx']}"
 
 
+def _sample_key(rec: dict) -> str:
+    """Like ``_key`` with the gold answer: RULER repeats ``index`` across samples."""
+    return f"{_key(rec)}|{json.dumps(rec['gold'], sort_keys=True)}"
+
+
 def _write_atomic(path: str, text: str) -> None:
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w") as f:
@@ -85,8 +90,9 @@ class _Results:
     costs no results while the run stays up.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, key=_key):
         self.path = path
+        self._key = key
         self.done: dict[str, dict] = {}
         self._unsynced: list[dict] = []
         if os.path.exists(path):
@@ -96,13 +102,13 @@ class _Results:
                         rec = json.loads(line)
                     except ValueError:
                         continue
-                    self.done[_key(rec)] = rec
+                    self.done[key(rec)] = rec
         self.attempt = 1 + max(
             (r["attempt"] for r in self.done.values()), default=0)
 
     def add(self, rec: dict) -> None:
         rec["attempt"] = self.attempt
-        self.done[_key(rec)] = rec
+        self.done[self._key(rec)] = rec
         self._unsynced.append(rec)
         self.sync()
 
@@ -581,9 +587,10 @@ def run_cell(
             raise RuntimeError(f"no samples in {jsonl}")
 
     def _rec_key(task: str, ex: dict) -> str:
-        return _key({"L": length, "task": task, "idx": ex["index"]})
+        return _sample_key(
+            {"L": length, "task": task, "idx": ex["index"], "gold": ex["outputs"]})
 
-    ckpt = _Results(os.path.join(cell_out, "partial", "results.jsonl"))
+    ckpt = _Results(os.path.join(cell_out, "partial", "results.jsonl"), _sample_key)
     todo = [(task, ex) for task, rows in rows_by_task.items() for ex in rows
             if _rec_key(task, ex) not in ckpt.done]
     if ckpt.done:

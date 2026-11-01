@@ -241,6 +241,8 @@ def run_one(run, args) -> dict:
 
             metas = [m for length in ds.lengths for task in ds.tasks
                      for m in _metas(length, task)]
+            if len({_key(m) for m in metas}) != len(metas):
+                raise SystemExit(f"{run.id}: samples share a checkpoint key")
             ds_partial = os.path.join(partial_dir, ds.name)
             os.makedirs(ds_partial, exist_ok=True)
             ckpt = _Results(os.path.join(ds_partial, "results.jsonl"))
