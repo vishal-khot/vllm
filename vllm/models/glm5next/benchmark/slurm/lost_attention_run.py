@@ -245,6 +245,10 @@ def _serve_env(lost_dir: str) -> dict:
     env["VLLM_DSA_IVF_LOST_ATTENTION_DIR"] = lost_dir
     # The recorder logs every forward; the job log can't take that for 25 cells.
     env["VLLM_LOGGING_CONFIG_PATH"] = LOGGING_CONFIG
+    env["GLM5_FIDELITY_PATCH"] = "1"
+    env["PYTHONPATH"] = BENCH_DIR + (
+        ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
     return env
 
 
@@ -533,6 +537,7 @@ def _cell_config(
         "length": length, "clusters": clusters, "probes": probes,
         "tasks": tasks, "n": n, "max_tokens": args.max_tokens,
         "seed": args.seed, "greedy": args.greedy, "scoring": "final_answer",
+        "mass": "all_rows_scored",
     }, sort_keys=True)
 
 
@@ -738,13 +743,16 @@ def main() -> None:
             pct = round(100.0 * probes / clusters, 2)
             tag = f"L{length} C{clusters} P{probes}({pct:g}%)"
             # Resume: a cell is finished iff it wrote a readable verdict.json
-            # (run_cell's last write), so requeue after preemption re-runs only
-            # the cells that did not complete. --force overrides.
-            done = os.path.join(
-                args.out_dir, f"L{length}", f"C{clusters}_P{probes}",
-                "verdict.json")
+            # (run_cell's last write) for the current config, so requeue after
+            # preemption re-runs only the cells that did not complete. --force
+            # overrides.
+            cell_out = os.path.join(
+                args.out_dir, f"L{length}", f"C{clusters}_P{probes}")
+            done = os.path.join(cell_out, "verdict.json")
+            config = _cell_config(length, clusters, probes, tasks, n, args)
             v = None
-            if not args.force and os.path.exists(done):
+            if (not args.force and os.path.exists(done)
+                    and _config_matches(cell_out, config)):
                 try:
                     with open(done) as f:
                         v = json.load(f)
