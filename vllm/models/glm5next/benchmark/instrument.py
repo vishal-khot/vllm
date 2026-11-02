@@ -13,7 +13,9 @@ Keyed by layer index (parsed from the indexer's ``k_cache`` prefix) and phase
 so it also installs inside every TP worker. Each process rewrites its own JSON in
 ``GLM5_TIMING_DIR`` every few seconds and on exit; the aggregator merges across
 ranks and attempts. Call times also go into a log-spaced histogram, so medians
-can be merged too and a slow first call (kernel compile) can't move them.
+can be merged too and a slow first call (kernel compile) can't move them. On the
+IVF arm, prefill also reports its parts: ``prefill_cluster`` (k-means and layout)
+and ``prefill_assign_score`` (probe, score, top-k).
 
 The indexer exists only on the 11 DSA layers (3, 7, ..., 43 for GLM-5.3-Flash);
 no other layer is patched because no other layer has this op.
@@ -104,6 +106,7 @@ def _install():
     entries: dict[int, dict[str, dict]] = {}
     last_flush = [0.0]
     pending: list = []  # (layer, phase, n_tok, start_event, end_event)
+    current_layer = [-1]
 
     def _layer_of(indexer) -> int:
         prefix = getattr(getattr(indexer, "k_cache", None), "prefix", "") or ""
@@ -137,7 +140,7 @@ def _install():
 
     def _make_timed(orig):
         def timed_forward_cuda(self, *args, **kw):
-            layer = _layer_of(self)
+            layer = current_layer[0] = _layer_of(self)
             # args[0] is hidden_states for both indexer classes.
             n_tok = int(args[0].shape[0])
             # Decode carries ~one query token per running sequence (+MTP spec);
@@ -157,6 +160,7 @@ def _install():
 
             if mem_probe:
                 torch.cuda.synchronize()
+                _drain()
                 _add_call(layer, phase, start.elapsed_time(end), n_tok)
                 s = _slot(layer, phase)
                 peak = (torch.cuda.max_memory_allocated() - before) / (1024**2)
@@ -181,10 +185,33 @@ def _install():
 
         return timed_forward_cuda
 
+    def _make_part_timed(orig, phase, wanted):
+        def timed_part(*args, **kw):
+            if not wanted(kw):
+                return orig(*args, **kw)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            out = orig(*args, **kw)
+            end.record()
+            pending.append((current_layer[0], phase, 0, start, end))
+            return out
+
+        return timed_part
+
     patched = []
     for cls in classes:
         cls.forward_cuda = _make_timed(cls.forward_cuda)
         patched.append(cls.__name__)
+    if "SparseAttnIndexerIVF" in patched:
+        from vllm.models.glm5next.nvidia import ivf_sparse_indexer as ivf
+
+        ivf.build_ivf_index = _make_part_timed(
+            ivf.build_ivf_index, "prefill_cluster", lambda kw: True)
+        # Decode selects without a layout.
+        ivf.select_ivf_topk = _make_part_timed(
+            ivf.select_ivf_topk, "prefill_assign_score",
+            lambda kw: kw.get("layout") is not None)
 
     def _flush():
         try:
