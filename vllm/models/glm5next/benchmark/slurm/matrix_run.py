@@ -47,6 +47,7 @@ SLURM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH_DIR)
 sys.path.insert(0, SLURM_DIR)
 from bench_config import load_matrix  # noqa: E402
+from tasks import recall  # noqa: E402
 
 # Reuse the proven serve/HTTP/summary helpers from the fidelity runner.
 from lost_attention_run import (  # noqa: E402
@@ -111,7 +112,7 @@ def _one_request(port: int, meta: dict, run, args) -> dict:
     )
     return {
         "task": meta["task"], "L": meta["L"], "idx": meta["idx"],
-        **_score(meta["gold"], reply),
+        **_score(meta["gold"], reply, meta["task"]),
         "prefill_ms": round(reply.ttft_s * 1000, 1),
         "decode_ms": round(reply.decode_s * 1000, 1),
         "decode_s": reply.decode_s,
@@ -254,6 +255,9 @@ def run_one(run, args) -> dict:
             _run_requests(args.port, todo, run, args, ckpt, keep)
             ckpt.sync()
             results = [ckpt.done[_key(m)] for m in metas]
+            # Rescored from the saved answers, so older checkpoints stay valid.
+            for m, r in zip(metas, results):
+                r["recall"] = recall(m["gold"], r["answer"], m["task"])
             instrumented += len(results)
 
             per_task = {}

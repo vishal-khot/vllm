@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RULER task definitions and recall scoring for the DSA-indexer benchmark.
 
-Each task scores by recall: the fraction of gold answer strings that appear
-(case-insensitive) in the generation. Single-answer NIAH/QA tasks collapse to
-hit/miss; aggregation tasks (cwe/fwe/vt/multivalue/multiquery) get partial
-recall, matching RULER's ``string_match_all``.
+Each task scores by recall, as RULER's ``constants.py`` does. Most tasks use the
+fraction of gold strings that appear (case-insensitive) in the generation,
+``string_match_all``. QA gold strings are alternative answers, so any one of them
+scores 1, ``string_match_part``.
 """
 
 # max_new_tokens per task. GLM-5.3-Flash reasoning is always-on and consumes the
@@ -29,11 +29,13 @@ TASKS = {
 ALL_TASKS = tuple(TASKS)
 
 
-def recall(gold, text) -> float:
-    """Fraction of gold strings present in text (case-insensitive)."""
+def recall(gold, text, task: str | None = None) -> float:
+    """RULER's score of ``text`` for ``task``; see the module docstring."""
     golds = gold if isinstance(gold, list) else [gold]
     if not golds:
         return 0.0
     low = text.lower()
-    hit = sum(1 for g in golds if str(g).lower() in low)
-    return hit / len(golds)
+    hits = [str(g).lower() in low for g in golds]
+    if TASKS.get(task, {}).get("group") == "qa":
+        return float(any(hits))
+    return sum(hits) / len(hits)

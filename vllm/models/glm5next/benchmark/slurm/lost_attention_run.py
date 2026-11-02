@@ -160,7 +160,7 @@ def _split_answer(
     return content, ""
 
 
-def _score(gold, reply: _Reply) -> dict:
+def _score(gold, reply: _Reply, task: str) -> dict:
     """Scoring fields of a request record.
 
     ``recall`` reads the final answer only, as RULER scores it. Reasoning restates
@@ -168,8 +168,9 @@ def _score(gold, reply: _Reply) -> dict:
     ``answer`` is kept so the scoring can be re-run.
     """
     return {
-        "recall": recall(gold, reply.answer),
-        "recall_with_reasoning": recall(gold, f"{reply.answer} {reply.reasoning}"),
+        "recall": recall(gold, reply.answer, task),
+        "recall_with_reasoning": recall(
+            gold, f"{reply.answer} {reply.reasoning}", task),
         "finish_reason": reply.finish_reason,
         "reasoning_chars": len(reply.reasoning),
         "answer": reply.answer,
@@ -473,7 +474,7 @@ def _run_tasks(
             "L": length,
             "idx": ex["index"],
             "gold": ex["outputs"],
-            **_score(ex["outputs"], reply),
+            **_score(ex["outputs"], reply, task),
             "prefill_ms": round(reply.ttft_s * 1000, 1),
             "decode_ms": round(reply.decode_s * 1000, 1),
             "in_tok": reply.usage.get("prompt_tokens"),
@@ -618,6 +619,9 @@ def run_cell(
     per_task: dict[str, dict] = {}
     for task, rows in rows_by_task.items():
         samples = [ckpt.done[_rec_key(task, ex)] for ex in rows]
+        # Rescored from the saved answers, so older checkpoints stay valid.
+        for s in samples:
+            s["recall"] = recall(s["gold"], s["answer"], task)
         rmean = sum(s["recall"] for s in samples) / len(samples)
         per_task[task] = {
             "recall_mean": rmean,
