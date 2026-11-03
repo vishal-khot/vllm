@@ -54,10 +54,10 @@ from lost_attention_run import (  # noqa: E402
     _copy_dumps,
     _exit_on_sigterm,
     _get,
-    _key,
     _log,
     _post_with_retry,
     _Results,
+    _sample_key,
     _score,
     _summarize_lost,
     _summarize_timing,
@@ -112,6 +112,7 @@ def _one_request(port: int, meta: dict, run, args) -> dict:
     )
     return {
         "task": meta["task"], "L": meta["L"], "idx": meta["idx"],
+        "gold": meta["gold"],
         **_score(meta["gold"], reply, meta["task"]),
         "prefill_ms": round(reply.ttft_s * 1000, 1),
         "decode_ms": round(reply.decode_s * 1000, 1),
@@ -242,19 +243,20 @@ def run_one(run, args) -> dict:
 
             metas = [m for length in ds.lengths for task in ds.tasks
                      for m in _metas(length, task)]
-            if len({_key(m) for m in metas}) != len(metas):
+            if len({_sample_key(m) for m in metas}) != len(metas):
                 raise SystemExit(f"{run.id}: samples share a checkpoint key")
             ds_partial = os.path.join(partial_dir, ds.name)
             os.makedirs(ds_partial, exist_ok=True)
-            ckpt = _Results(os.path.join(ds_partial, "results.jsonl"))
-            todo = [m for m in metas if _key(m) not in ckpt.done]
+            ckpt = _Results(
+                os.path.join(ds_partial, "results.jsonl"), _sample_key)
+            todo = [m for m in metas if _sample_key(m) not in ckpt.done]
             if ckpt.done:
                 _log(f"[{run.id}] resume: {len(ckpt.done)}/{len(metas)} "
                      f"checkpointed, attempt {ckpt.attempt}")
             keep = (lambda: _copy_dumps(timing_dir, kept_dir)) if run.eager else None
             _run_requests(args.port, todo, run, args, ckpt, keep)
             ckpt.sync()
-            results = [ckpt.done[_key(m)] for m in metas]
+            results = [ckpt.done[_sample_key(m)] for m in metas]
             # Rescored from the saved answers, so older checkpoints stay valid.
             for m, r in zip(metas, results):
                 r["recall"] = recall(m["gold"], r["answer"], m["task"])
