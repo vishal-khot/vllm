@@ -6,7 +6,10 @@ from dataclasses import dataclass
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,11 @@ class IvfIndexerConfig:
             raise ValueError(
                 f"index_kmeans_stop_fraction must be in [0, 1), got {stop_fraction}"
             )
+        logger.info(
+            "IVF indexer config: num_clusters=%d num_probes=%d (defaults 64/8 "
+            "mean no --hf-overrides reached text_config)",
+            num_clusters, num_probes,
+        )
         return cls(
             num_clusters=num_clusters,
             num_probes=num_probes,

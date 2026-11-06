@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Generate RULER data for the GLM-5.3-Flash benchmark, using the official
+# NVIDIA/RULER synthetic pipeline and the GLM tokenizer (so token lengths are
+# correct for this model). Output layout matches what the runners read:
+#   <OUT>/<task>/validation_<len>.jsonl
+#
+#   MODEL_DIR=./model OUT=./ruler NUM_SAMPLES=100 bash prepare_ruler.sh
+#
+# Network: fetches the RULER source tarball (no git) and its source corpora
+# (Paul Graham essays, SQuAD, HotpotQA). Idempotent: skips (task,length) pairs
+# already generated. Run on a node with internet (a login node) -- NOT inside a
+# compute job that may lack egress.
+#
+# NOTE: GLM-5.3-Flash ships a custom tokenizer; RULER loads it with
+# AutoTokenizer. If that needs trust_remote_code and RULER's loader rejects it,
+# set RULER_DIR to pre-generated data instead and skip this script.
+set -euo pipefail
+
+MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the GLM model/tokenizer dir}"
+OUT="${OUT:-./ruler}"
+NUM_SAMPLES="${NUM_SAMPLES:-100}"
+RULER_REF="${RULER_REF:-main}"
+WORK="${RULER_WORK:-./_ruler_src}"
+TASKS="${RULER_TASKS:-niah_single_1 niah_single_2 niah_single_3 niah_multikey_1 niah_multikey_2 niah_multikey_3 niah_multivalue niah_multiquery vt cwe fwe qa_1 qa_2}"
+LENGTHS="${RULER_LENGTHS:-4096 8192 16384 32768 65536 131072}"
+
+export PATH="${HOME}/.local/bin:${PATH}"
+mkdir -p "${OUT}"
+OUT="$(cd "${OUT}" && pwd)"
+MODEL_DIR="$(cd "${MODEL_DIR}" && pwd)"
+
+# RULER's prepare.py deps, in an ephemeral uv env (no global installs).
+# --no-project: never treat the surrounding vLLM (or RULER) tree as a project to
+# build -- these are standalone scripts and a build would need a CUDA toolkit.
+UVW=(--no-project --with transformers --with nltk --with wonderwords --with html2text
+     --with tenacity --with numpy --with scipy --with tqdm --with pyyaml
+     --with beautifulsoup4 --with sentencepiece --with huggingface_hub)
+
+# ---- 1. fetch RULER source (tarball; no git clone) ----
+SRC="${WORK}/RULER-${RULER_REF}"
+if [ ! -d "${SRC}/scripts/data" ]; then
+  mkdir -p "${WORK}"
+  echo "[ruler] downloading RULER (${RULER_REF}) ..."
+  curl -fsSL "https://codeload.github.com/NVIDIA/RULER/tar.gz/refs/heads/${RULER_REF}" \
+    | tar -xz -C "${WORK}"
+fi
+DATA="${SRC}/scripts/data"
+[ -d "${DATA}" ] || { echo "[ruler] ERROR: unexpected RULER layout at ${DATA}" >&2; exit 2; }
+
+# ---- 2. source corpora (essays for NIAH/VT/aggregation; QA sets for qa_*) ----
+# Check the SPECIFIC required files, not "any *.json": RULER ships
+# english_words.json + the downloader scripts, so a glob always matches and
+# would wrongly skip the real downloads. The downloaders use relative paths
+# (read URLs, write <name>.json), so they must run from synthetic/json/.
+cd "${DATA}"
+uv run "${UVW[@]}" python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')" || true
+# english_words.json is Git-LFS tracked; the codeload tarball ships only the
+# pointer (cwe does json.load on it and crashes). Fetch the real blob from the
+# LFS media endpoint when the on-disk file is still a pointer.
+if head -c 64 synthetic/json/english_words.json 2>/dev/null | grep -q "git-lfs"; then
+  echo "[ruler] fetching LFS english_words.json from media endpoint ..."
+  curl -fsSL \
+    "https://media.githubusercontent.com/media/NVIDIA/RULER/${RULER_REF}/scripts/data/synthetic/json/english_words.json" \
+    -o synthetic/json/english_words.json
+fi
+if [ ! -f synthetic/json/PaulGrahamEssays.json ]; then
+  echo "[ruler] downloading Paul Graham essays ..."
+  ( cd synthetic/json && uv run "${UVW[@]}" python download_paulgraham_essay.py )
+fi
+if [ ! -f synthetic/json/squad.json ] || [ ! -f synthetic/json/hotpotqa.json ]; then
+  echo "[ruler] downloading QA datasets (squad, hotpotqa) ..."
+  ( cd synthetic/json && bash download_qa_dataset.sh )
+fi
+
+# ---- 3. generate each (task, length) ----
+for L in ${LENGTHS}; do
+  for T in ${TASKS}; do
+    dst="${OUT}/${T}/validation_${L}.jsonl"
+    if [ -s "${dst}" ]; then
+      echo "[ruler] have ${T}@${L}"
+      continue
+    fi
+    echo "[ruler] generating ${T}@${L} (n=${NUM_SAMPLES}) ..."
+    sd="$(mktemp -d)"
+    uv run "${UVW[@]}" python prepare.py \
+      --save_dir "${sd}" --benchmark synthetic --task "${T}" \
+      --tokenizer_path "${MODEL_DIR}" --tokenizer_type hf \
+      --max_seq_length "${L}" --model_template_type base \
+      --num_samples "${NUM_SAMPLES}" --random_seed 42
+    mkdir -p "${OUT}/${T}"
+    # RULER writes <save_dir>/<task>/validation.jsonl; find it defensively.
+    gen="$(find "${sd}" -name 'validation.jsonl' | head -1)"
+    [ -n "${gen}" ] || { echo "[ruler] ERROR: no validation.jsonl for ${T}@${L}" >&2; exit 2; }
+    cp "${gen}" "${dst}"
+    rm -rf "${sd}"
+  done
+done
+echo "[ruler] done -> ${OUT}"
