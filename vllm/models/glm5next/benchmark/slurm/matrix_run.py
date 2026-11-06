@@ -35,9 +35,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -83,7 +85,61 @@ def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
         env["GLM5_RESIDENT_PROBE"] = "1"
     if run.measure_lost_attention:
         env["VLLM_DSA_IVF_LOST_ATTENTION_DIR"] = lost_dir
+    env["GLM5_STACK_DUMP"] = "1"
     return env
+
+
+def _stop_serve(proc: subprocess.Popen, dump_stacks: bool) -> None:
+    """Stop the serve and every TP worker in its process group, then wait for
+    the GPUs to free, so a hung serve can't starve the next run of memory.
+    With dump_stacks, each process first prints its Python stacks to the log."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None
+
+    def _signal(sig) -> bool:
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+
+    if dump_stacks and _signal(signal.SIGUSR1):
+        time.sleep(15)
+    if _signal(signal.SIGTERM):
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=90)
+        for sig in (0, signal.SIGKILL):
+            _signal(sig)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                proc.poll()  # reap the serve so its zombie isn't counted
+                if not _signal(0):
+                    break
+                time.sleep(2)
+    proc.wait()
+    _wait_gpus_free()
+
+
+def _wait_gpus_free(limit_mib: int = 4096, timeout_s: float = 300) -> None:
+    deadline = time.time() + timeout_s
+    used: list[int] = []
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=30).stdout
+            used = [int(x) for x in out.split()]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return
+        if all(u < limit_mib for u in used):
+            return
+        time.sleep(5)
+    _log(f"GPUs still hold {used} MiB after stopping the serve")
 
 
 def _serve_cmd(run, model: str, tp: int, port: int, gpu_mem_util: float) -> list:
@@ -212,16 +268,22 @@ def run_one(run, args) -> dict:
 
     cmd = _serve_cmd(run, args.model, args.tp, args.port, args.gpu_mem_util)
     print(f"[{run.id}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, env=_serve_env(run, timing_dir, lost_dir))
+    proc = subprocess.Popen(
+        cmd, env=_serve_env(run, timing_dir, lost_dir), start_new_session=True)
 
     accuracy: dict = {}
     latency = None
     throughput = None
     skipped: dict = {}
     instrumented = 0
+    hung = False
     try:
         t0 = time.time()
-        _wait_ready(proc, args.port, args.startup_timeout)
+        try:
+            _wait_ready(proc, args.port, args.startup_timeout)
+        except TimeoutError:
+            hung = True
+            raise
         print(f"[{run.id}] ready in {time.time() - t0:.0f}s", flush=True)
 
         for ds in run.datasets:
@@ -286,11 +348,7 @@ def run_one(run, args) -> dict:
             else:
                 throughput = _throughput(results, run.concurrency)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=90)
-        except Exception:
-            proc.kill()
+        _stop_serve(proc, dump_stacks=hung)
         time.sleep(5)  # let the instrument + ivf_fidelity atexit dumps settle
 
     # Only here on a clean finish: a preempted attempt keeps its last copy, so the
@@ -371,10 +429,11 @@ def main() -> None:
             raise SystemExit(f"unknown run id(s): {sorted(bad)}")
         runs = [r for r in runs if r.id in want]
 
-    # Shortest length first, kpool then ivf, so whatever a slow queue finishes is a
-    # complete comparison. Order doesn't affect results: each run has its own serve.
+    # Eager runs first, then shortest length, kpool before ivf, so whatever a slow
+    # queue finishes is a complete comparison and a graph-mode failure can't block
+    # the eager timing. Order doesn't affect results: each run has its own serve.
     runs = sorted(
-        runs, key=lambda r: (r.length or 0, not r.eager, r.indexer != "kpool"))
+        runs, key=lambda r: (not r.eager, r.length or 0, r.indexer != "kpool"))
 
     resilience = matrix.resilience
     args.request_attempts = int(resilience["request_attempts"])

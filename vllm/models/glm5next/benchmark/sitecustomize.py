@@ -11,6 +11,12 @@ can't load the correction exits, since it would report wrong numbers.
 
 import os
 
+if os.environ.get("GLM5_STACK_DUMP") == "1":
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+
 if os.environ.get("GLM5_INSTRUMENT") == "1":
     try:
         import instrument  # noqa: F401  (import triggers _install)
