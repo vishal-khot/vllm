@@ -48,6 +48,7 @@ from vllm.models.glm5next.nvidia.ops.ivf_index import (
     ivf_group_fill_kernel,
     ivf_group_plan_kernel,
     ivf_grouped_score_kernel,
+    ivf_append_old_pages_kernel,
     ivf_kmeans_append_kernel,
     ivf_kmeans_append_update_kernel,
     ivf_kmeans_kernel,
@@ -76,13 +77,30 @@ class IvfKernelTuning:
     # Score programs per SM to aim for; a row splits its tiles until reached.
     score_programs_per_sm: int = 4
     scan_block: int = 2048
-    # Key tiles per step, and clusters per program, of the run-layout scan.
-    scan_tiles: int = 128
-    scan_block_c: int = 16
+    # Key tiles per step, and clusters per program, of the run-layout scan:
+    # narrow cluster blocks give it more programs, long steps fewer serial
+    # passes (H200: 512 / 4 is about half the time of 128 / 16 at 512k).
+    scan_tiles: int = 512
+    scan_block_c: int = 4
     emit_block: int = 256
+    emit_num_warps: int = 2
+    # Probe ends the prefill emit holds in registers to start its search.
+    emit_coarse: int = 4
     probe_num_warps: int = 4
-    # One probe-select program per row, over at most C_PAD clusters.
+    # One probe-select program per row, over at most C_PAD clusters. Its sort
+    # is the kernel's main cost from C_PAD 512 on, where more warps pay.
     select_num_warps: int = 2
+    select_wide_num_warps: int = 4
+    select_wide_clusters: int = 512
+    # Prefill's (many rows, partial-page counts one key at a time): fewer
+    # warps pay (H200: 1 below C_PAD 512, 2 from it).
+    select_prefill_num_warps: int = 1
+    select_prefill_wide_num_warps: int = 2
+    # Prefill from C_PAD select_bisect_clusters on: find each row's cut by
+    # bisection, sorting only rows that need the order. A smaller sort is
+    # cheaper than the bisection, and decode's single row waits on its loop.
+    select_bisect: bool = True
+    select_bisect_clusters: int = 256
     # Query rows per probe-score tile; its MMA has probe_rows x heads rows.
     probe_rows: int = 4
     # Fused k-means: programs per SM (its register-held [C, 128] member sums
@@ -102,6 +120,13 @@ class IvfKernelTuning:
     # which pays off only while the [C, 128] member sums leave registers.
     kmeans_tile_keys: int = 64
     kmeans_wide_tile_clusters: int = 128
+    # Pages per program, and warps, of the append's old-page pass.
+    append_old_pages: int = 8
+    append_old_num_warps: int = 4
+    # The old-page pass is one more launch (about 7 us on H200); below this
+    # many old pages the append kernel takes them itself (break-even about
+    # 850 pages of 32 keys on H200).
+    append_split_min_old_pages: int = 1024
     # Prefill grouped GEMM: a work unit is 1 or gemm_key_chunks TMA-loaded
     # chunks of gemm_block_n keys of a cluster against up to gemm_row_tiles
     # tiles of gemm_mma_cols // heads of its query rows (gemm_mma_cols MMA
@@ -111,6 +136,9 @@ class IvfKernelTuning:
     # least gemm_chunked_keys keys on average take the chunked units, which
     # hold more shared memory (fewer programs per SM).
     gemm_block_n: int = 64
+    # "cute": the warp-specialized CuTe DSL kernel (ops/ivf_gscore_cute.py)
+    # where it applies (32 heads of 128, 4-row tiles, sm90), else Triton.
+    gemm_impl: str = "cute"
     gemm_key_chunks: int = 4
     gemm_chunked_keys: int = 96
     gemm_mma_cols: int = 128
@@ -119,15 +147,38 @@ class IvfKernelTuning:
     gemm_num_stages: int = 5
     gemm_programs_per_sm: int = 3
     gemm_chunked_programs_per_sm: int = 2
+    # Row and cluster block of the group count and fill. Fill programs are
+    # cluster-major (adjacent slots per warp). From plan_short_rows_clusters
+    # clusters on, row tiles of plan_short_block_r split the rows over more
+    # programs (H200: 0.6x at 128k/8 and 512k/4; slower at C 128).
     plan_block_r: int = 64
+    plan_short_block_r: int = 32
+    plan_short_rows_clusters: int = 160
     plan_block_c: int = 64
-    # Row tiles per step of the per-cluster row-tile scan.
-    plan_scan_tiles: int = 16
+    # Row tiles per step, and clusters per program, of the per-cluster
+    # row-tile scan.
+    plan_scan_tiles: int = 64
+    plan_scan_clusters: int = 8
     # Widest score view the per_row top-k sees (0: the full width). That kernel
     # picks its final sort by row width and its radix sort (from 12288
     # columns) is several times slower on IVF rows; a row reads only its own
     # length, so a narrower view of the same buffer selects the same keys.
     topk_view_cols: int = 12287
+    # Prefill top-k: "cute" runs the CuTe DSL top-k (ops/ivf_topk_cute.py)
+    # when the widest row has at most topk_cute_max_width candidates (it
+    # loses to the shared kernel on longer rows), else the shared per_row
+    # kernel. Its launch shape follows; its buffer (topk_cute_cap scores,
+    # a multiple of 32 * warps * unroll) must hold the widest row it takes.
+    topk_impl: str = "cute"
+    topk_cute_max_width: int = 3584
+    topk_cute_warps: int = 8
+    topk_cute_cap: int = 4096
+    topk_cute_unroll: int = 8
+    topk_cute_ctas_per_sm: int = 3
+    # Programmatic dependent launch on the prefill Triton kernels: each waits
+    # for the previous grid (``gdc_wait``) and then lets the next one launch,
+    # so launch latency overlaps the previous kernel's tail. Same arithmetic.
+    pdl: bool = True
 
 
 TUNING = IvfKernelTuning()
@@ -154,6 +205,57 @@ def _alloc(
 @functools.cache
 def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@functools.cache
+def _cute_dsl_available(device_index: int) -> bool:
+    if torch.cuda.get_device_capability(device_index) != (9, 0):
+        return False
+    try:
+        import cutlass.cute  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _cute_topk_ok(
+    scores: torch.Tensor, selected: torch.Tensor, topk: int, tune: "IvfKernelTuning"
+) -> bool:
+    max_width = min(tune.topk_cute_max_width, tune.topk_cute_cap)
+    if tune.topk_impl != "cute" or scores.shape[1] > max_width:
+        return False
+    if not _cute_dsl_available(scores.device.index or 0):
+        return False
+    from vllm.models.glm5next.nvidia.ops import ivf_topk_cute
+
+    return ivf_topk_cute.supported(scores, selected, topk)
+
+
+def _cute_gscore_tiles(key_chunks: int, tune: "IvfKernelTuning") -> dict:
+    """Units of one key chunk (the smaller clusters) run 8-row tiles, one
+    m64n256 MMA per chunk (H200: 0.77-0.94 of the 4-row tiles' time); chunked
+    units keep 4-row tiles, whose two consumer warpgroups take turns issuing
+    MMAs (8-row tiles tie or lose there). Same unit rows."""
+    rows = tune.gemm_row_tiles * (tune.gemm_mma_cols // 32)
+    if key_chunks == 1 and rows % 8 == 0 and rows // 8 <= 32:
+        return {"row_tiles": rows // 8, "tile_rows": 8, "q_stages": 4}
+    return {"row_tiles": tune.gemm_row_tiles}
+
+
+def _cute_gscore_ok(
+    q_fp8: torch.Tensor, scores: torch.Tensor, tune: "IvfKernelTuning"
+) -> bool:
+    if not _cute_dsl_available(q_fp8.device.index or 0):
+        return False
+    from vllm.models.glm5next.nvidia.ops import ivf_gscore_cute
+
+    return (
+        tune.gemm_block_n == ivf_gscore_cute.BN
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and ivf_gscore_cute.supported(
+            q_fp8, scores, tune.gemm_row_tiles, tune.gemm_mma_cols
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -334,13 +436,22 @@ def build_ivf_index(
     cu_keys = firsts(n)
     num_tiles, total_keys = int(tile_first[-1]), int(cu_keys[-1])
     tile_item = np.repeat(np.arange(num_items), tiles)
+    # Pages of appending requests that hold new keys (the append kernel's
+    # grid); the rest take the light old-page pass.
+    tile_start = (np.arange(num_tiles) - tile_first[tile_item]) * page
+    new_tiles = np.flatnonzero(
+        grew[tile_item] & (tile_start + page > n_prev[tile_item])
+    )
+    tile0 = int(tile_first[num_full])
+    if num_tiles - tile0 - len(new_tiles) < tune.append_split_min_old_pages:
+        new_tiles = np.arange(tile0, num_tiles)
     row_tile0 = np.zeros(num_batch_rows, dtype=np.int64)
     row_key0 = np.zeros(num_batch_rows, dtype=np.int64)
     row_tile0[batch_rows_cpu] = tile_first[:-1]
     row_key0[batch_rows_cpu] = cu_keys[:-1]
     parts = [
         tile_item,
-        (np.arange(num_tiles) - tile_first[tile_item]) * page,
+        tile_start,
         np.asarray(batch_rows_cpu),
         n,
         n_prev,
@@ -350,6 +461,7 @@ def build_ivf_index(
         new_tile_first,
         row_tile0,
         row_key0,
+        new_tiles,
     ]
     host = torch.empty((sum(map(len, parts)),), dtype=torch.int32, pin_memory=True)
     np.concatenate(parts, out=host.numpy(), casting="unsafe")
@@ -366,6 +478,7 @@ def build_ivf_index(
         new_tile_first_t,
         row_tile0_t,
         row_key0_t,
+        new_tiles_t,
     ) = host.split(
         [
             num_tiles,
@@ -379,6 +492,7 @@ def build_ivf_index(
             num_items + 1,
             num_batch_rows,
             num_batch_rows,
+            len(new_tiles),
         ]
     )
 
@@ -462,13 +576,37 @@ def build_ivf_index(
             PAGE=page,
             TILE_PAGES=tile_pages,
             num_warps=tune.kmeans_num_warps,
+            PDL=tune.pdl,
+            launch_pdl=tune.pdl,
         )
     if num_full < num_items:
-        tile0 = int(tile_first[num_full])
         sums = torch.empty(
             (int(new_tile_first[-1]), C, 128), dtype=torch.float32, device=device
         )
-        ivf_kmeans_append_kernel[(num_tiles - tile0,)](
+        if len(new_tiles) < num_tiles - tile0:
+            per = tune.append_old_pages
+            ivf_append_old_pages_kernel[(triton.cdiv(num_tiles - tile0, per),)](
+                *state.cid_args(),
+                tile_item_t,
+                tile_start_t,
+                req_t,
+                n_keys_t,
+                n_prev_t,
+                cu_keys_t,
+                packed_cid,
+                tile_counts,
+                tile0,
+                num_tiles,
+                C=C,
+                C_PAD=C_PAD,
+                PAGE=page,
+                PAGES=per,
+                num_warps=tune.append_old_num_warps,
+                PDL=tune.pdl,
+                launch_pdl=tune.pdl,
+            )
+    if num_full < num_items and len(new_tiles):
+        ivf_kmeans_append_kernel[(len(new_tiles),)](
             key.u8,
             key.f32,
             key.page_stride,
@@ -486,13 +624,16 @@ def build_ivf_index(
             packed_cid,
             tile_counts,
             sums,
-            tile0,
+            new_tiles_t,
             config.num_clusters,
             C=C,
             C_PAD=C_PAD,
             PAGE=page,
             num_warps=tune.kmeans_num_warps,
+            PDL=tune.pdl,
+            launch_pdl=tune.pdl,
         )
+    if num_full < num_items:
         nb = triton.cdiv(C, tune.kmeans_update_block)
         ivf_kmeans_append_update_kernel[((num_items - num_full) * nb,)](
             *state.cen_args(),
@@ -505,6 +646,8 @@ def build_ivf_index(
             C=C,
             BLOCK_U=tune.kmeans_update_block,
             BLOCK_S=tune.kmeans_update_segments,
+            PDL=tune.pdl,
+            launch_pdl=tune.pdl,
         )
 
     # Stable counting sort of every request's keys into (request, cluster) runs.
@@ -524,6 +667,8 @@ def build_ivf_index(
         C_PAD=triton.next_power_of_2(C),
         BLOCK_C=tune.scan_block_c,
         TILES=tune.scan_tiles,
+        PDL=tune.pdl,
+        launch_pdl=tune.pdl,
     )
     run_keys = torch.empty((total_keys, 128), dtype=torch.uint8, device=device)
     ivf_run_scatter_kernel[(num_tiles,)](
@@ -546,6 +691,8 @@ def build_ivf_index(
         C=C,
         BLOCK_C=tune.centroid_block,
         PAGE=page,
+        PDL=tune.pdl,
+        launch_pdl=tune.pdl,
     )
     return IvfRunLayout(
         run_pos=run_pos,
@@ -640,6 +787,8 @@ def select_ivf_topk(
     topk = config.topk
     is_decode = layout is None
     tune = TUNING
+    # PDL on the prefill launches only (decode runs as CUDA graphs).
+    pdl = tune.pdl and not is_decode
 
     score_ws = torch.empty((num_rows, C), dtype=torch.float32, device=device)
     sel = torch.empty((num_rows, C), dtype=torch.int8, device=device)
@@ -721,6 +870,8 @@ def select_ivf_topk(
         BLOCK_C=tune.centroid_block,
         IS_DECODE=is_decode,
         num_warps=tune.probe_num_warps,
+        PDL=pdl,
+        launch_pdl=pdl,
     )
     ivf_probe_select_kernel[(num_rows,)](
         query_pos,
@@ -747,7 +898,26 @@ def select_ivf_topk(
         P_PAD=P_PAD,
         PAGE=key.page,
         IS_DECODE=is_decode,
-        num_warps=tune.select_num_warps,
+        BISECT=(
+            tune.select_bisect
+            and not is_decode
+            and triton.next_power_of_2(C) >= tune.select_bisect_clusters
+        ),
+        num_warps=(
+            (
+                tune.select_wide_num_warps
+                if is_decode
+                else tune.select_prefill_wide_num_warps
+            )
+            if triton.next_power_of_2(C) >= tune.select_wide_clusters
+            else (
+                tune.select_num_warps
+                if is_decode
+                else tune.select_prefill_num_warps
+            )
+        ),
+        PDL=pdl,
+        launch_pdl=pdl,
     )
     if is_decode:
         _collect_by_scan(
@@ -857,15 +1027,38 @@ def _topk_and_emit(
     """
     assert (cand is None) != (runs is None)
     num_rows, width = scores.shape
+    tune = TUNING
     selected = torch.empty((num_rows, topk), dtype=torch.int32, device=out.device)
-    if runs is not None and topk_backend == "auto":
-        # Prefill rows hold a few thousand candidates: one block per row beats
-        # the persistent radix kernel there (1.3-1.9x on H100).
-        topk_backend = "per_row"
-    view = scores
-    if topk_backend == "per_row" and TUNING.topk_view_cols:
-        view = scores[:, : min(width, TUNING.topk_view_cols)]
-    get_indexer_topk(topk_backend)(view, topk_lens, 1, selected, topk, width)
+    if (
+        runs is not None
+        and topk_backend == "auto"
+        and _cute_topk_ok(scores, selected, topk, tune)
+    ):
+        from vllm.models.glm5next.nvidia.ops import ivf_topk_cute
+
+        if score_sum_out is not None:
+            selected.fill_(-1)  # rows under budget are not written
+        ivf_topk_cute.topk(
+            scores=scores,
+            lens=topk_lens,
+            out=selected,
+            k=topk,
+            num_sms=_num_sms(scores.device.index or 0),
+            warps=tune.topk_cute_warps,
+            group=tune.topk_cute_warps,
+            cap=tune.topk_cute_cap,
+            unroll=tune.topk_cute_unroll,
+            ctas_per_sm=tune.topk_cute_ctas_per_sm,
+        )
+    else:
+        if runs is not None and topk_backend == "auto":
+            # Prefill rows hold a few thousand candidates: one block per row
+            # beats the persistent radix kernel there (1.3-1.9x on H100).
+            topk_backend = "per_row"
+        view = scores
+        if topk_backend == "per_row" and tune.topk_view_cols:
+            view = scores[:, : min(width, tune.topk_view_cols)]
+        get_indexer_topk(topk_backend)(view, topk_lens, 1, selected, topk, width)
     if score_sum_out is not None:
         # Attention mass is the non-negative DSA relevance a key carries: a head
         # score is ReLU(q.k) but weighted by w_h, which can be negative, so the
@@ -904,6 +1097,10 @@ def _topk_and_emit(
             BLOCK=block,
             TAIL_BLOCK=triton.next_power_of_2(tail),
             HAS_TAIL=has_tail,
+            COARSE=min(TUNING.emit_coarse, runs.probe_end.shape[1]),
+            num_warps=TUNING.emit_num_warps,
+            PDL=TUNING.pdl,
+            launch_pdl=TUNING.pdl,
         )
         return
     grid = (num_rows, triton.cdiv(out.shape[1], block))
@@ -990,7 +1187,12 @@ def _score_grouped_gemm(
     num_groups = groups.shape[1]
     group_m, group_vis = groups
 
-    row_tiles = triton.cdiv(num_rows, tune.plan_block_r)
+    block_r = (
+        tune.plan_short_block_r
+        if C >= tune.plan_short_rows_clusters
+        else tune.plan_block_r
+    )
+    row_tiles = triton.cdiv(num_rows, block_r)
     (
         group_off,
         unit_off,
@@ -1023,13 +1225,15 @@ def _score_grouped_gemm(
         tile_cnt,
         num_rows,
         C=C,
-        BLOCK_R=tune.plan_block_r,
+        BLOCK_R=block_r,
         BLOCK_C=tune.plan_block_c,
+        PDL=tune.pdl,
+        launch_pdl=tune.pdl,
     )
     rows = max(1, tune.gemm_mma_cols // q_fp8.shape[1])
     chunked = layout.run_keys.shape[0] >= tune.gemm_chunked_keys * C
     key_chunks = tune.gemm_key_chunks if chunked else 1
-    ivf_group_plan_kernel[(1,)](
+    ivf_group_plan_kernel[(triton.cdiv(C, tune.plan_scan_clusters) + 1,)](
         tile_cnt,
         tile_base,
         group_m,
@@ -1044,6 +1248,9 @@ def _score_grouped_gemm(
         UNIT_ROWS=rows * tune.gemm_row_tiles,
         BLOCK_T=tune.plan_scan_tiles,
         BLOCK=1024,
+        BLOCK_C=tune.plan_scan_clusters,
+        PDL=tune.pdl,
+        launch_pdl=tune.pdl,
     )
     ivf_group_fill_kernel[plan_grid](
         sel,
@@ -1059,9 +1266,34 @@ def _score_grouped_gemm(
         group_off,
         num_rows,
         C=C,
-        BLOCK_R=tune.plan_block_r,
+        BLOCK_R=block_r,
         BLOCK_C=tune.plan_block_c,
+        PDL=tune.pdl,
+        launch_pdl=tune.pdl,
     )
+    if tune.gemm_impl == "cute" and _cute_gscore_ok(q_fp8, scores, tune):
+        from vllm.models.glm5next.nvidia.ops import ivf_gscore_cute
+
+        ivf_gscore_cute.grouped_score(
+            q_fp8=q_fp8,
+            weights=weights,
+            run_keys=layout.run_keys,
+            run_scales=layout.run_scales,
+            run_start=layout.run_start,
+            group_m=group_m,
+            group_vis=group_vis,
+            group_off=group_off,
+            unit_off=unit_off,
+            row_list=row_list,
+            row_vis=row_vis,
+            row_first=row_first,
+            scores=scores,
+            num_groups=num_groups,
+            key_chunks=key_chunks,
+            num_sms=_num_sms(device.index or 0),
+            **_cute_gscore_tiles(key_chunks, tune),
+        )
+        return
     per_sm = tune.gemm_chunked_programs_per_sm if chunked else tune.gemm_programs_per_sm
     num_programs = per_sm * _num_sms(device.index or 0)
     key_desc = TensorDescriptor.from_tensor(layout.run_keys, [tune.gemm_block_n, 128])

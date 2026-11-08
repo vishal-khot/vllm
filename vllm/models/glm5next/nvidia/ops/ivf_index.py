@@ -68,6 +68,27 @@ def _probes_holding(sorted_desc, count, k, n, need):
 
 
 @triton.jit
+def _top_k_threshold(keys, eligible, k):
+    """A threshold that exactly the ``k`` largest of the eligible ``keys`` reach
+    (unique keys, 0 < k <= their number; otherwise any value).
+
+    Bisection on the key's value, stopping once the count is exactly k: there
+    is no need to find a key itself, so this takes about as many steps as it
+    takes to separate the k-th key from its neighbour.
+    """
+    lo = tl.min(tl.where(eligible, keys, 9223372036854775807), axis=0)
+    hi = tl.max(tl.where(eligible, keys, -9223372036854775807), axis=0) + 1
+    tau = lo
+    n = tl.sum(eligible.to(tl.int32), axis=0)
+    while (k > 0) & (n != k):
+        tau = lo + ((hi - lo) >> 1)
+        n = tl.sum((eligible & (keys >= tau)).to(tl.int32), axis=0)
+        lo = tl.where(n >= k, tau, lo)
+        hi = tl.where(n >= k, hi, tau)
+    return tau
+
+
+@triton.jit
 def _cluster_count(n_keys, num_clusters, C: tl.constexpr):
     """Clusters of a request: num_clusters within [1, min(n_keys, C)]. Mirrors
     ``cluster_count``."""
@@ -219,6 +240,7 @@ def ivf_kmeans_kernel(
     MIN_SEG_TILES: tl.constexpr,
     PAGE: tl.constexpr,
     TILE_PAGES: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """The whole cosine k-means of every listed request in one launch.
 
@@ -253,6 +275,11 @@ def ivf_kmeans_kernel(
     (``num_items + 3`` int32, zeroed by the caller). ``part`` is
     ``[segments, C, 128]`` fp32.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     NB: tl.constexpr = (C + BLOCK_U - 1) // BLOCK_U
     HALF: tl.constexpr = C_PAD // 2
     offs_d = tl.arange(0, 128)
@@ -317,10 +344,10 @@ def ivf_kmeans_kernel(
                             best_c = _nearest_centroid(
                                 kb, cf_lo, cf_hi, live_lo, live_hi, HALF
                             )
-                            hit = (best_c[:, None] == offs_cp[None, :]) & mask_t[
-                                :, None
-                            ]
                             if final:
+                                hit = (best_c[:, None] == offs_cp[None, :]) & mask_t[
+                                    :, None
+                                ]
                                 page_count = tl.sum(
                                     tl.reshape(
                                         hit.to(tl.int32), (TILE_PAGES, PAGE, C_PAD)
@@ -371,6 +398,9 @@ def ivf_kmeans_kernel(
                                 k_scale = _load_key_scales(
                                     k_f32_ptr, k_page_stride, page, pos, PAGE, mask_t
                                 )
+                                hit = (
+                                    best_c[:, None] == offs_cp[None, :]
+                                ) & mask_t[:, None]
                                 onehot = tl.where(hit, k_scale[:, None], 0.0)
                                 acc = tl.dot(tl.trans(onehot.to(tl.bfloat16)), kb, acc)
                         if not final:
@@ -480,6 +510,17 @@ def ivf_kmeans_kernel(
 
 
 @triton.jit
+def _append_sums(best, new, k_scale, kb, cols, part_ptr, row, C, offs_d):
+    """The new keys' sums for clusters ``cols``, stored to ``part`` row
+    ``row`` (bf16 one-hot weights: exact, ue8m0 scales)."""
+    hit = (best[:, None] == cols[None, :]) & new[:, None]
+    onehot = tl.where(hit, k_scale[:, None], 0.0).to(tl.bfloat16)
+    acc = tl.dot(tl.trans(onehot), kb)
+    dst = (row * C + cols).to(tl.int64)[:, None] * 128 + offs_d[None, :]
+    tl.store(part_ptr + dst, acc, mask=(cols < C)[:, None])
+
+
+@triton.jit
 def ivf_kmeans_append_kernel(
     k_u8_ptr,
     k_f32_ptr,
@@ -507,14 +548,17 @@ def ivf_kmeans_append_kernel(
     packed_cid_ptr,
     tile_counts_ptr,
     part_ptr,
-    tile0,
+    new_tiles_ptr,
     num_clusters,
     C: tl.constexpr,
     C_PAD: tl.constexpr,
     PAGE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
-    """One key page of an appending request: the first ``n_prev`` keys keep
-    their clusters, the chunk's keys join their nearest current centroid.
+    """One key page holding new keys of an appending request (``new_tiles``
+    lists them; ``ivf_append_old_pages_kernel`` does the others): the first
+    ``n_prev`` keys keep their clusters, the chunk's keys join their nearest
+    current centroid.
 
     Writes the page's cluster ids (cache for new keys, ``packed_cid`` for all)
     and per-cluster key counts (``tile_counts``) for the run layout, adds the
@@ -522,8 +566,13 @@ def ivf_kmeans_append_kernel(
     as row ``new_tile_first[i] + j`` of ``part [rows, C, 128]`` for the j-th
     page holding new keys, which ``ivf_kmeans_append_update_kernel`` adds.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     HALF: tl.constexpr = C_PAD // 2
-    t = tile0 + tl.program_id(0)
+    t = tl.load(new_tiles_ptr + tl.program_id(0))
     i = tl.load(tile_item_ptr + t)
     start = tl.load(tile_start_ptr + t)
     b = tl.load(req_ptr + i)
@@ -571,12 +620,9 @@ def ivf_kmeans_append_kernel(
         # ue8m0 scales are powers of two: the bf16 one-hot weights and every
         # product are exact, as in the full k-means accumulation.
         k_scale = _load_key_scales(k_f32_ptr, k_page_stride, page, pos, PAGE, new)
-        onehot = tl.where(hit_new, k_scale[:, None], 0.0).to(tl.bfloat16)
-        acc = tl.dot(tl.trans(onehot), kb)
         row = tl.load(new_tile_first_ptr + i) + (start - n_prev // PAGE * PAGE) // PAGE
         offs_d = tl.arange(0, 128)
-        dst = (row * C + offs_cp).to(tl.int64)[:, None] * 128 + offs_d[None, :]
-        tl.store(part_ptr + dst, acc, mask=(offs_cp < C)[:, None])
+        _append_sums(best, new, k_scale, kb, offs_cp, part_ptr, row, C, offs_d)
     hit = (cl[:, None] == offs_cp[None, :]) & valid[:, None]
     tl.store(
         tile_counts_ptr + t * C + offs_cp,
@@ -584,6 +630,67 @@ def ivf_kmeans_append_kernel(
         mask=offs_cp < C,
     )
     tl.store(packed_cid_ptr + cu + pos, cl, mask=valid)
+
+
+@triton.jit
+def ivf_append_old_pages_kernel(
+    cid_ptr,
+    cid_stride,
+    cid_bt_ptr,
+    cid_bt_stride,
+    cid_bs,
+    tile_item_ptr,
+    tile_start_ptr,
+    req_ptr,
+    n_keys_ptr,
+    n_prev_ptr,
+    cu_keys_ptr,
+    packed_cid_ptr,
+    tile_counts_ptr,
+    tile0,
+    num_tiles,
+    C: tl.constexpr,
+    C_PAD: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGES: tl.constexpr,
+    PDL: tl.constexpr = False,
+):
+    """The pages of appending requests that hold no new key, PAGES per program:
+    their cluster ids into ``packed_cid`` and per-cluster key counts into
+    ``tile_counts``, as ``ivf_kmeans_append_kernel`` writes them. These pages
+    need only their ids, and are most of an append's pages.
+    """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    offs_cp = tl.arange(0, C_PAD)
+    for p in range(PAGES):
+        t = tile0 + tl.program_id(0) * PAGES + p
+        if t < num_tiles:
+            i = tl.load(tile_item_ptr + t)
+            start = tl.load(tile_start_ptr + t)
+            n_keys = tl.load(n_keys_ptr + i)
+            n_prev = tl.load(n_prev_ptr + i)
+            if (start + PAGE <= n_prev) | (n_prev >= n_keys):
+                b = tl.load(req_ptr + i)
+                cu = tl.load(cu_keys_ptr + i)
+                pos = start + tl.arange(0, PAGE)
+                valid = pos < n_keys
+                cblk = tl.load(
+                    cid_bt_ptr + b * cid_bt_stride + pos // cid_bs, mask=valid, other=0
+                ).to(tl.int64)
+                cl = tl.load(
+                    cid_ptr + cblk * cid_stride + pos % cid_bs, mask=valid, other=0
+                ).to(tl.int32)
+                # Counted with atomics into the page's zeroed row, not as a
+                # [PAGE, C_PAD] one-hot sum (several times slower).
+                row = tile_counts_ptr + t * C
+                tl.store(row + offs_cp, 0, mask=offs_cp < C)
+                tl.debug_barrier()
+                tl.atomic_add(row + cl, 1, mask=valid, sem="relaxed")
+                tl.store(packed_cid_ptr + cu + pos, cl, mask=valid)
 
 
 @triton.jit
@@ -603,6 +710,7 @@ def ivf_kmeans_append_update_kernel(
     C: tl.constexpr,
     BLOCK_U: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Fold an appending request's new-key sums into one block of centroids.
 
@@ -611,6 +719,11 @@ def ivf_kmeans_append_update_kernel(
     order), stored normalized with its length. A cluster that gained nothing
     is unchanged; a zero sum keeps the centroid.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     NB: tl.constexpr = (C + BLOCK_U - 1) // BLOCK_U
     u = tl.program_id(0)
     i = item0 + u // NB
@@ -672,6 +785,7 @@ def ivf_run_scan_kernel(
     C_PAD: tl.constexpr,
     BLOCK_C: tl.constexpr,
     TILES: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Per (request, block of clusters): where each tile's keys of a cluster
     start inside the cluster's run, and the run sizes. The request's last
@@ -679,6 +793,11 @@ def ivf_run_scan_kernel(
     in packed key order, a prefix over every cluster. Also copies the
     clusters' centroids and sizes (-1: disabled) to the dense ``cen_dense``
     [B * C, 128] and ``cen_size`` [B, C] that the prefill probe reads."""
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0)
     t0 = tl.load(tile_first_ptr + i)
     t1 = tl.load(tile_first_ptr + i + 1)
@@ -739,12 +858,18 @@ def ivf_run_scatter_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
     PAGE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Stable counting-sort scatter of one page of keys into cluster runs.
 
     Writes each key's position, fp8 bytes and scale at its slot of the
     (request, cluster) run, positions ascending within a run.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     tile = tl.program_id(0)
     i = tl.load(tile_item_ptr + tile)
     start = tl.load(tile_start_ptr + tile)
@@ -754,15 +879,16 @@ def ivf_run_scatter_kernel(
     pos = start + tl.arange(0, PAGE)
     mask_t = pos < n_keys
     cl = tl.load(packed_cid_ptr + cu + pos, mask=mask_t, other=-1)
-    dest = tl.zeros([PAGE], tl.int32)
-    for c0 in range(0, C, BLOCK_C):
-        offs_c = c0 + tl.arange(0, BLOCK_C)
-        mask_c = offs_c < C
-        hit = cl[:, None] == offs_c[None, :]
-        rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
-        base = tl.load(run_start_ptr + b * C + offs_c, mask=mask_c, other=0)
-        base += tl.load(tile_off_ptr + tile * C + offs_c, mask=mask_c, other=0)
-        dest += tl.sum(tl.where(hit, rank + base[None, :], 0), axis=1)
+    # A key's slot: its cluster's run start, the page's offset in that run, and
+    # how many earlier keys of the page share its cluster (a [PAGE, PAGE]
+    # compare, not a [PAGE, C] one-hot scan).
+    offs_k = tl.arange(0, PAGE)
+    earlier = (cl[:, None] == cl[None, :]) & (offs_k[None, :] < offs_k[:, None])
+    rank = tl.sum(earlier.to(tl.int32), axis=1)
+    c_safe = tl.where(mask_t, cl, 0)
+    base = tl.load(run_start_ptr + b * C + c_safe, mask=mask_t, other=0)
+    base += tl.load(tile_off_ptr + tile * C + c_safe, mask=mask_t, other=0)
+    dest = base + rank
     tl.store(run_pos_ptr + dest, pos, mask=mask_t)
 
     offs_d = tl.arange(0, 128)
@@ -870,6 +996,7 @@ def ivf_probe_score_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
     IS_DECODE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Centroid scores and visible key counts of BLOCK_R rows against
     ``c_per_program`` clusters (``program_id(1)``-th share), BLOCK_C at a time.
@@ -885,6 +1012,11 @@ def ivf_probe_score_kernel(
     visible key counts, the cluster sizes (-1: disabled); prefill's are exact
     in ``ivf_probe_select_kernel``.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     c_begin = tl.program_id(1) * c_per_program
     c_end = tl.minimum(C, c_begin + c_per_program)
@@ -971,6 +1103,8 @@ def ivf_probe_select_kernel(
     P_PAD: tl.constexpr,
     PAGE: tl.constexpr,
     IS_DECODE: tl.constexpr,
+    BISECT: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Probe at least ``num_probes`` clusters per row and lay out its candidates.
 
@@ -995,7 +1129,17 @@ def ivf_probe_select_kernel(
 
     Also clears the ``zero_n`` int32 at ``zero_ptr`` (the grouped score's
     group tables), a slice per program.
+
+    With BISECT a row finds its cut without sorting (``_top_k_threshold``).
+    Only a row whose best ``k`` clusters hold fewer than TOPK keys, and which has
+    more eligible clusters, needs them in order: it sorts. The selected set is
+    the same, since the keys are unique.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     per = tl.cdiv(zero_n, tl.num_programs(0))
     z_end = tl.minimum(zero_n, (row + 1) * per)
@@ -1016,11 +1160,13 @@ def ivf_probe_select_kernel(
             mask=in_range,
             other=0,
         )
-        pos = page * PAGE + tl.arange(0, PAGE)
-        cid = tl.load(
-            packed_cid_ptr + tl.load(row_key0_ptr + b) + pos, mask=pos <= t, other=-1
-        )
-        vis += tl.sum((cid[:, None] == offs_all[None, :]).to(tl.int32), axis=0)
+        # The row's own keys of its partial page, positions page * PAGE .. t,
+        # one at a time: cheaper than a [PAGE, C_PAD] one-hot over the whole
+        # page (H200), with the same counts.
+        key0 = tl.load(row_key0_ptr + b)
+        for p in range(page * PAGE, t + 1):
+            c1 = tl.load(packed_cid_ptr + key0 + p).to(tl.int32)
+            vis += (offs_all == c1).to(tl.int32)
     eligible = vis > 0
     n_eligible = tl.sum(eligible.to(tl.int32), axis=0)
     none = -1099511627776  # below every float order key
@@ -1028,11 +1174,22 @@ def ivf_probe_select_kernel(
     keys = tl.where(eligible, _float_order_key(score), none) * 65536 + (
         65535 - offs_all
     )
-    sorted_keys = tl.sort(keys, descending=True)
     k = tl.where(t < TOPK, n_eligible, tl.minimum(num_probes, n_eligible))
     held = tl.where(eligible, vis, 0)
-    k = _probes_holding(sorted_keys, held, k, n_eligible, TOPK)
-    tau = _kth_largest(sorted_keys, tl.maximum(k, 1), C_PAD)
+    if BISECT:
+        # A row whose best k clusters likely hold too few keys (by the average
+        # cluster) would sort anyway: it skips the bisection (k = 0 stops it).
+        guess = (k < n_eligible) & (tl.sum(held, axis=0) * k < TOPK * n_eligible)
+        tau = _top_k_threshold(keys, eligible, tl.where(guess, 0, k))
+        in_top = tl.where(eligible & (keys >= tau), held, 0)
+        ordered = guess | ((k < n_eligible) & (tl.sum(in_top, axis=0) < TOPK))
+    else:
+        tau = tl.full([], 0, tl.int64)
+        ordered = tl.full([], 1, tl.int32) > 0
+    if ordered:
+        sorted_keys = tl.sort(keys, descending=True)
+        k = _probes_holding(sorted_keys, held, k, n_eligible, TOPK)
+        tau = _kth_largest(sorted_keys, tl.maximum(k, 1), C_PAD)
     selected = eligible & (keys >= tau) & (k > 0)
     if not IS_DECODE:
         start = tl.load(run_start_ptr + b * C + offs_all, mask=selected, other=0)
@@ -1041,6 +1198,7 @@ def ivf_probe_select_kernel(
     if tl.sum(take, axis=0) > max_count:
         # Keep the most best-scoring probes whose candidates fit (bisection on
         # their number: the best ``fit`` fit, the best ``over`` do not).
+        sorted_keys = tl.sort(keys, descending=True)
         fit = tl.full([], 0, tl.int32)
         over = k
         while over - fit > 1:
@@ -1216,10 +1374,16 @@ def ivf_group_count_kernel(
     C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Per (batch row, cluster) group: how many over-budget query rows probed
     the cluster, and the most keys of it any of them sees. Also each row
     tile's probing rows per cluster (``tile_cnt [row tiles, C]``)."""
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_r = offs_r < num_rows
@@ -1266,38 +1430,60 @@ def ivf_group_plan_kernel(
     UNIT_ROWS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
-    """One program: per cluster, its probing rows before each row tile
-    (``tile_base``, an exclusive scan of ``tile_cnt`` over tiles) and its first
-    row-list slot (``cluster_base``); per group, its first work unit
+    """Programs 0 .. cdiv(C, BLOCK_C) - 1, BLOCK_C clusters each: per cluster,
+    its first row-list slot (``cluster_base``: the probing rows, ``group_m``
+    summed over batch rows, of all clusters before it) and its probing rows
+    before each row tile (``tile_base``, an exclusive scan of ``tile_cnt``
+    over tiles). The last program: per group, its first work unit
     (unit_off[G] is the unit total, unit_off[G + 1] the grouped score's work
     counter, zeroed here).
 
     A unit is up to UNIT_KEYS keys of a group against UNIT_ROWS of its rows.
     The row list is cluster-major, each cluster's rows ascending.
     """
-    offs_c = tl.arange(0, C_PAD)
-    in_c = offs_c < C
-    carry = tl.zeros([C_PAD], tl.int32)
-    for t0 in range(0, num_tiles, BLOCK_T):
-        offs_t = t0 + tl.arange(0, BLOCK_T)
-        m = (offs_t < num_tiles)[:, None] & in_c[None, :]
-        off = offs_t[:, None] * C + offs_c[None, :]
-        cnt = tl.load(tile_cnt_ptr + off, mask=m, other=0)
-        tl.store(tile_base_ptr + off, carry[None, :] + tl.cumsum(cnt, axis=0) - cnt, m)
-        carry += tl.sum(cnt, axis=0)
-    tl.store(cluster_base_ptr + offs_c, tl.cumsum(carry, axis=0) - carry, mask=in_c)
-    unit_carry = tl.full([], 0, tl.int32)
-    tl.store(unit_off_ptr, 0)
-    tl.store(unit_off_ptr + num_groups + 1, 0)
-    for g0 in range(0, num_groups, BLOCK):
-        g = g0 + tl.arange(0, BLOCK)
-        mask = g < num_groups
-        m = tl.load(group_m_ptr + g, mask=mask, other=0)
-        vis = tl.load(group_vis_ptr + g, mask=mask, other=0)
-        units = tl.cdiv(vis, UNIT_KEYS) * tl.cdiv(m, UNIT_ROWS)
-        tl.store(unit_off_ptr + 1 + g, unit_carry + tl.cumsum(units, axis=0), mask)
-        unit_carry += tl.sum(units, axis=0)
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    num_cblocks = tl.cdiv(C, BLOCK_C)
+    if pid < num_cblocks:
+        c0 = pid * BLOCK_C
+        offs = tl.arange(0, C_PAD)
+        offs_c = c0 + tl.arange(0, BLOCK_C)
+        in_c = offs_c < C
+        before = tl.zeros([C_PAD], tl.int32)
+        mine = tl.zeros([BLOCK_C], tl.int32)
+        for b0 in range(0, num_groups, C):
+            before += tl.load(group_m_ptr + b0 + offs, mask=offs < c0, other=0)
+            mine += tl.load(group_m_ptr + b0 + offs_c, mask=in_c, other=0)
+        base = tl.sum(before, axis=0) + tl.cumsum(mine, axis=0) - mine
+        tl.store(cluster_base_ptr + offs_c, base, mask=in_c)
+        carry = tl.zeros([BLOCK_C], tl.int32)
+        for t0 in range(0, num_tiles, BLOCK_T):
+            offs_t = t0 + tl.arange(0, BLOCK_T)
+            m = (offs_t < num_tiles)[:, None] & in_c[None, :]
+            off = offs_t[:, None] * C + offs_c[None, :]
+            cnt = tl.load(tile_cnt_ptr + off, mask=m, other=0)
+            tl.store(tile_base_ptr + off,
+                     carry[None, :] + tl.cumsum(cnt, axis=0) - cnt, m)
+            carry += tl.sum(cnt, axis=0)
+    else:
+        unit_carry = tl.full([], 0, tl.int32)
+        tl.store(unit_off_ptr, 0)
+        tl.store(unit_off_ptr + num_groups + 1, 0)
+        for g0 in range(0, num_groups, BLOCK):
+            g = g0 + tl.arange(0, BLOCK)
+            mask = g < num_groups
+            m = tl.load(group_m_ptr + g, mask=mask, other=0)
+            vis = tl.load(group_vis_ptr + g, mask=mask, other=0)
+            units = tl.cdiv(vis, UNIT_KEYS) * tl.cdiv(m, UNIT_ROWS)
+            tl.store(unit_off_ptr + 1 + g, unit_carry + tl.cumsum(units, axis=0), mask)
+            unit_carry += tl.sum(units, axis=0)
 
 
 @triton.jit
@@ -1317,6 +1503,7 @@ def ivf_group_fill_kernel(
     C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Place every over-budget row in the row list of each group it probed.
 
@@ -1327,20 +1514,28 @@ def ivf_group_fill_kernel(
     its visible key count of the cluster (``row_vis``) and its first candidate
     slot (``row_first``), so the grouped score reads them contiguously.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    # Cluster-major [BLOCK_C, BLOCK_R]: a cluster's probing rows of the tile
+    # take consecutive slots, so threads along rows store to adjacent words
+    # (row-major threads would put one hit per sector).
     offs_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_r = offs_r < num_rows
     in_c = offs_c < C
     need = tl.load(topk_len_ptr + offs_r, mask=mask_r, other=0) > 0
     b = tl.load(row_batch_ptr + offs_r, mask=mask_r, other=0)
-    m = (need & mask_r)[:, None] & in_c[None, :]
-    off = offs_r[:, None] * C + offs_c[None, :]
+    m = in_c[:, None] & (need & mask_r)[None, :]
+    off = offs_r[None, :] * C + offs_c[:, None]
     hit = m & (tl.load(sel_ptr + off, m, 0) != 0)
     hit_i = hit.to(tl.int32)
     base = tl.load(tile_base_ptr + tl.program_id(0) * C + offs_c, mask=in_c, other=0)
     base += tl.load(cluster_base_ptr + offs_c, mask=in_c, other=0)
-    slot = base[None, :] + tl.cumsum(hit_i, axis=0) - hit_i
-    rows = tl.broadcast_to(offs_r[:, None], [BLOCK_R, BLOCK_C])
+    slot = base[:, None] + tl.cumsum(hit_i, axis=1) - hit_i
+    rows = tl.broadcast_to(offs_r[None, :], [BLOCK_C, BLOCK_R])
     tl.store(row_list_ptr + slot, rows, mask=hit)
     vis = tl.load(vis_ws_ptr + off, mask=hit, other=0)
     tl.store(row_vis_ptr + slot, vis, mask=hit)
@@ -1348,9 +1543,9 @@ def ivf_group_fill_kernel(
     prev = tl.load(row_batch_ptr + offs_r - 1, mask=mask_r & (offs_r > 0), other=-1)
     first = mask_r & (b != prev)
     tl.store(
-        group_off_ptr + b[:, None] * C + offs_c[None, :],
+        group_off_ptr + b[None, :] * C + offs_c[:, None],
         slot,
-        mask=first[:, None] & in_c[None, :],
+        mask=in_c[:, None] & first[None, :],
     )
 
 
@@ -1626,6 +1821,8 @@ def ivf_emit_runs_kernel(
     BLOCK: tl.constexpr,
     TAIL_BLOCK: tl.constexpr,
     HAS_TAIL: tl.constexpr,
+    COARSE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Prefill emit: map selected candidate slots straight to positions.
 
@@ -1640,6 +1837,11 @@ def ivf_emit_runs_kernel(
     incomplete tail pool (``token_len`` tokens are visible), then -1 up to
     ``out_width``: the kpool indexer's expanded top-k row.
     """
+    if PDL:
+        # Programmatic dependent launch (prefill): wait for the previous
+        # grid's completion and memory, then let the next grid launch.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     count = tl.load(count_ptr + row)
@@ -1651,9 +1853,17 @@ def ivf_emit_runs_kernel(
     slot = tl.where(under, tl.where(j < count, j, -1), picked)
     live = (slot >= 0) & (j < TOPK)
     found = live & (total > 0)
-    lo = tl.zeros([BLOCK], tl.int32)
-    hi = tl.where(found, P_PAD, 0)
-    for _ in range(LOG_P):
+    # The probe holding a slot is the first whose end exceeds it. A row's ends
+    # ascend: COARSE of them, one per SPAN probes, locate the slot's block in
+    # registers, and a binary search finishes inside it (the full search would
+    # take LOG_P dependent loads).
+    SPAN: tl.constexpr = P_PAD // COARSE
+    offs_g = tl.arange(0, COARSE)
+    coarse = tl.load(probe_end_ptr + row * P_PAD + offs_g * SPAN + (SPAN - 1))
+    block = tl.sum((coarse[None, :] <= slot[:, None]).to(tl.int32), axis=1)
+    lo = tl.where(found, block * SPAN, 0)
+    hi = tl.where(found, tl.minimum(lo + SPAN, P_PAD), 0)
+    for _ in range(SPAN.bit_length()):
         active = lo < hi
         mid = (lo + hi) // 2
         end = tl.load(probe_end_ptr + row * P_PAD + mid, mask=active, other=0)
