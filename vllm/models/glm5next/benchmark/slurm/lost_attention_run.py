@@ -48,7 +48,7 @@ import yaml
 BENCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGGING_CONFIG = os.path.join(BENCH_DIR, "slurm", "fidelity_logging.json")
 sys.path.insert(0, BENCH_DIR)
-from bench_config import max_tokens_for  # noqa: E402
+from bench_config import max_tokens_for, ruler_data_dir  # noqa: E402
 from tasks import TASKS, recall  # noqa: E402
 
 
@@ -773,6 +773,8 @@ def main() -> None:
     p.add_argument("--startup-timeout", type=float, default=45 * 60)
     p.add_argument("--request-timeout", type=float, default=3600)
     args = p.parse_args()
+    args.ruler_dir = ruler_data_dir(args.runs_yaml, args.ruler_dir)
+    print(f"ruler data: {args.ruler_dir}", flush=True)
 
     sweep = _load_sweep(args.runs_yaml)
     fairness, resilience = _load_shared(args.runs_yaml)

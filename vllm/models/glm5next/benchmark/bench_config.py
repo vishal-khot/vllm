@@ -191,6 +191,13 @@ def _resolve_dataset(name: str, spec: dict[str, Any]) -> Dataset:
     )
 
 
+def ruler_data_dir(runs_yaml: str, default: str) -> str:
+    """``datasets.ruler.data_dir`` from runs.yaml if set, else ``default``."""
+    with open(runs_yaml) as f:
+        spec = yaml.safe_load(f)["datasets"]["ruler"]
+    return spec.get("data_dir") or default
+
+
 def max_tokens_for(fairness: dict, length: int | None) -> int:
     """Output cap for a length: ``fairness.max_tokens`` unless
     ``max_tokens_by_length`` lowers it where the model's context can't hold it."""

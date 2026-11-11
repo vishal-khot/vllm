@@ -47,7 +47,9 @@ datasets:
   ruler:
     metric: recall
     lengths: [65536, 131072, 262144, 524288, 1040384]
-    n: 20
+    # Read by both runners; overrides the job's --ruler-dir.
+    data_dir: /mnt/weka/shrd/ci/haok/glm5-ivf/ruler-full
+    n: 500                     # every sample in ruler-full
     tasks: [niah_single_1, niah_single_2, niah_single_3,
             niah_multikey_1, niah_multikey_2, niah_multikey_3,
             niah_multivalue, niah_multiquery, vt, cwe, fwe, qa_1, qa_2]
@@ -116,11 +118,11 @@ runs:
         with: {exec_mode: graph, measure_lost_attention: false}
         # One cell per fidelity length: the kpool recall baseline for that row.
         cells:        # kpool has no indexer knobs; only length x concurrency
-          - {length: 65536,  concurrency: [1, 4, 16, 64]}
-          - {length: 131072, concurrency: [1, 4, 16]}
-          - {length: 262144, concurrency: [1, 4]}
-          - {length: 524288, concurrency: [1, 4]}
-          - {length: 1040384, concurrency: [1, 2]}
+          - {length: 65536,  concurrency: [1]}
+          - {length: 131072, concurrency: [1]}
+          - {length: 262144, concurrency: [1]}
+          - {length: 524288, concurrency: [1]}
+          - {length: 1040384, concurrency: [1]}
 
   - id: ivf                   # with k-means (base operating point)
     <<: *default
@@ -150,11 +152,11 @@ runs:
       throughput_grid:
         with: {exec_mode: graph, measure_lost_attention: false}
         cells:
-          - {length: 65536,  clusters: 128, probes: 16, concurrency: [1, 4, 16, 64]}
-          - {length: 131072, clusters: 181, probes: 23, concurrency: [1, 4, 16]}
-          - {length: 262144, clusters: 256, probes: 32, concurrency: [1, 4]}
-          - {length: 524288, clusters: 362, probes: 45, concurrency: [1, 4]}
-          - {length: 1040384, clusters: 510, probes: 64, concurrency: [1, 2]}
+          - {length: 65536,  clusters: 128, probes: 16, concurrency: [1]}
+          - {length: 131072, clusters: 181, probes: 23, concurrency: [1]}
+          - {length: 262144, clusters: 256, probes: 32, concurrency: [1]}
+          - {length: 524288, clusters: 362, probes: 45, concurrency: [1]}
+          - {length: 1040384, clusters: 510, probes: 64, concurrency: [1]}
       # IVF lost-attention fidelity sweep, run by slurm/lost_attention_run.py
       # (not the A/B matrix). One serve per (length, probe); every task in the
       # ruler dataset runs through each serve (tasks are a free axis), n samples
@@ -162,7 +164,7 @@ runs:
       # time. Derived as clusters = round(sqrt(length/4)) = sqrt(#pools)
       # (kpool=4), probes = round(clusters * {12.5,25,37.5}%).
       cells:
-        n: 20                   # samples per task per cell; `all` = whole file
+        n: 500                  # samples per task per cell: all of ruler-full
         concurrency: 32         # requests in flight; server batches them
         # The KV cache holds ~3.2M tokens, so only a few long requests run at
         # once; the rest would queue past the request timeout.
