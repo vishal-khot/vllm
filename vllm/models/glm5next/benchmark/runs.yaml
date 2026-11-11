@@ -46,7 +46,7 @@ indexer_arms:
 datasets:
   ruler:
     metric: recall
-    lengths: [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1040384]
+    lengths: [65536, 131072, 262144, 524288, 1040384]
     n: 20
     tasks: [niah_single_1, niah_single_2, niah_single_3,
             niah_multikey_1, niah_multikey_2, niah_multikey_3,
@@ -107,10 +107,6 @@ runs:
       eager_grid:
         with: *memory_timing
         grid:
-          - {length: 4096}
-          - {length: 8192}
-          - {length: 16384}
-          - {length: 32768}
           - {length: 65536}
           - {length: 131072}
           - {length: 262144}
@@ -120,10 +116,6 @@ runs:
         with: {exec_mode: graph, measure_lost_attention: false}
         # One cell per fidelity length: the kpool recall baseline for that row.
         cells:        # kpool has no indexer knobs; only length x concurrency
-          - {length: 4096,   concurrency: [16]}
-          - {length: 8192,   concurrency: [16]}
-          - {length: 16384,  concurrency: [1, 4, 16, 64, 256]}
-          - {length: 32768,  concurrency: [16]}
           - {length: 65536,  concurrency: [1, 4, 16, 64]}
           - {length: 131072, concurrency: [1, 4, 16]}
           - {length: 262144, concurrency: [1, 4]}
@@ -146,15 +138,11 @@ runs:
       eager_grid:
         with: *memory_timing
         grid: &fidelity_grid
-          - {length: 4096,   clusters: 32,  probes: [4, 8, 16, 24]}
-          - {length: 8192,   clusters: 45,  probes: [6, 11, 23, 34]}
-          - {length: 16384,  clusters: 64,  probes: [8, 16, 32, 48]}
-          - {length: 32768,  clusters: 91,  probes: [11, 23, 46, 68]}
-          - {length: 65536,  clusters: 128, probes: [16, 32, 64, 96]}
-          - {length: 131072, clusters: 181, probes: [23, 45, 91, 136]}
-          - {length: 262144, clusters: 256, probes: [32, 64, 128, 192]}
-          - {length: 524288, clusters: 362, probes: [45, 91, 181, 272]}
-          - {length: 1040384, clusters: 510, probes: [64, 128, 255, 383]}
+          - {length: 65536,  clusters: 128, probes: [16, 32]}
+          - {length: 131072, clusters: 181, probes: [23, 45]}
+          - {length: 262144, clusters: 256, probes: [32, 64]}
+          - {length: 524288, clusters: 362, probes: [45, 91]}
+          - {length: 1040384, clusters: 510, probes: [64, 128]}
       # Throughput at IVF's real per-length operating point: clusters =
       # round(sqrt(length/4)), probes = 12.5% of clusters (same rule as the
       # fidelity grid). The ladder tapers at long context because KV memory
@@ -162,7 +150,6 @@ runs:
       throughput_grid:
         with: {exec_mode: graph, measure_lost_attention: false}
         cells:
-          - {length: 16384,  clusters: 64,  probes: 8,  concurrency: [1, 4, 16, 64, 256]}
           - {length: 65536,  clusters: 128, probes: 16, concurrency: [1, 4, 16, 64]}
           - {length: 131072, clusters: 181, probes: 23, concurrency: [1, 4, 16]}
           - {length: 262144, clusters: 256, probes: 32, concurrency: [1, 4]}
@@ -173,7 +160,7 @@ runs:
       # ruler dataset runs through each serve (tasks are a free axis), n samples
       # each. Every operating point is explicit -- nothing is computed at run
       # time. Derived as clusters = round(sqrt(length/4)) = sqrt(#pools)
-      # (kpool=4), probes = round(clusters * {12.5,25,50,75}%).
+      # (kpool=4), probes = round(clusters * {12.5,25}%).
       cells:
         n: 20                   # samples per task per cell; `all` = whole file
         concurrency: 32         # requests in flight; server batches them
