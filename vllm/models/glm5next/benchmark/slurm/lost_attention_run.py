@@ -601,7 +601,7 @@ def _cell_config(
         "length": length, "clusters": clusters, "probes": probes,
         "tasks": tasks, "n": n, "max_tokens": args.max_tokens,
         "seed": args.seed, "greedy": args.greedy, "scoring": "final_answer",
-        "mass": "all_rows_scored",
+        "mass": "all_rows_scored_finite_split",
     }, sort_keys=True)
 
 
