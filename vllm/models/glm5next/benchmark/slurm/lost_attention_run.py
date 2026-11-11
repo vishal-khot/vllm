@@ -245,7 +245,7 @@ def _post_with_retry(url: str, body: dict, timeout: float, attempts: int):
     raise ValueError(f"attempts must be >= 1, got {attempts}")
 
 
-def _serve_env(lost_dir: str) -> dict:
+def _serve_env(lost_dir: str, clusters: int, probes: int) -> dict:
     """IVF arm with lost-attention measurement on. Indexer memory and time come
     from the A/B matrix: batching here would mix requests in both numbers."""
     env = dict(os.environ)
@@ -256,6 +256,7 @@ def _serve_env(lost_dir: str) -> dict:
     env["VLLM_LOGGING_CONFIG_PATH"] = LOGGING_CONFIG
     env["GLM5_FIDELITY_PATCH"] = "1"
     env["GLM5_STACK_DUMP"] = "1"
+    env["GLM5_EXPECT_IVF"] = f"{clusters},{probes}"
     env["PYTHONPATH"] = BENCH_DIR + (
         ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )
@@ -343,6 +344,7 @@ def _serve(
     clusters: int,
     probes: int,
     gpu_mem_util: float,
+    seed: int,
 ) -> list[str]:
     return [
         shutil.which("vllm") or "vllm", "serve", model,
@@ -350,6 +352,7 @@ def _serve(
         "--tensor-parallel-size", str(tp),
         "--trust-remote-code",
         "--max-model-len", str(max_len),
+        "--seed", str(seed),
         "--gpu-memory-utilization", str(gpu_mem_util),
         "--enforce-eager",
         "--no-enable-prefix-caching",
@@ -562,10 +565,12 @@ def _serve_cell(
 
     max_len = length + args.max_tokens + args.length_margin
     cmd = _serve(
-        args.model, args.tp, max_len, args.port, clusters, probes, args.gpu_mem_util
+        args.model, args.tp, max_len, args.port, clusters, probes,
+        args.gpu_mem_util, args.seed,
     )
     print(f"[{tag}] serve: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, env=_serve_env(lost_dir), start_new_session=True)
+    proc = subprocess.Popen(cmd, env=_serve_env(lost_dir, clusters, probes),
+        start_new_session=True)
     stop = threading.Event()
     threading.Thread(
         target=_keep_lost, args=(lost_dir, kept_dir, args.lost_save_s, stop),
@@ -771,7 +776,8 @@ def main() -> None:
     p.add_argument("--gpu-mem-util", type=float, default=0.9)
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--startup-timeout", type=float, default=45 * 60)
-    p.add_argument("--request-timeout", type=float, default=3600)
+    p.add_argument("--request-timeout", type=float,
+                   help="default: resilience.request_timeout_s in runs.yaml")
     args = p.parse_args()
     args.ruler_dir = ruler_data_dir(args.runs_yaml, args.ruler_dir)
     print(f"ruler data: {args.ruler_dir}", flush=True)
@@ -785,6 +791,8 @@ def main() -> None:
     args.greedy = bool(fairness["greedy"])
     args.concurrency = args.concurrency or sweep["concurrency"]
     args.request_attempts = int(resilience["request_attempts"])
+    args.request_timeout = args.request_timeout or float(
+        resilience["request_timeout_s"])
     args.lost_save_s = float(resilience["lost_attention_save_s"])
     _exit_on_sigterm()
     tasks = [args.task] if args.task else sweep["tasks"]

@@ -40,28 +40,37 @@ _LAYER_RE = re.compile(r"layers\.(\d+)")
 _HIST_BASE = 1.05  # bin width of the call-time histogram: 5%
 
 
-def _tensor_bytes(x) -> int:
-    """Total bytes of a tensor, or of all tensors in a (nested) list/tuple."""
+def _tensor_ranges(x) -> list[tuple[int, int]]:
+    """``[start, end)`` byte ranges of a tensor, or of all tensors in a list."""
     import torch
 
     if torch.is_tensor(x):
-        return x.element_size() * x.numel()
+        start = x.data_ptr()
+        return [(start, start + x.element_size() * x.numel())]
     if isinstance(x, (list, tuple)):
-        return sum(_tensor_bytes(y) for y in x)
-    return 0
+        return [r for y in x for r in _tensor_ranges(y)]
+    return []
 
 
 def _resident_bytes(indexer) -> int:
     """Steady-state bytes the indexer holds: its key / cluster / centroid caches.
 
     k-pool carries only the pooled fp8 ``k_cache``; IVF adds the per-request
-    cluster-id map (``cid_cache``) and centroids (``cen_cache``).
+    cluster-id map (``cid_cache``) and centroids (``cen_cache``). Those caches
+    can be views into the same KV block as ``k_cache``, so overlapping byte
+    ranges count once.
     """
-    total = 0
+    ranges = []
     for name in ("k_cache", "cid_cache", "cen_cache", "tail_cache"):
         cache = getattr(indexer, name, None)
         if cache is not None:
-            total += _tensor_bytes(getattr(cache, "kv_cache", None))
+            ranges += _tensor_ranges(getattr(cache, "kv_cache", None))
+    total, end = 0, 0
+    for lo, hi in sorted(ranges):
+        lo = max(lo, end)
+        if hi > lo:
+            total += hi - lo
+            end = hi
     return total
 
 

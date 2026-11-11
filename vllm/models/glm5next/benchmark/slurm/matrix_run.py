@@ -66,7 +66,6 @@ from lost_attention_run import (  # noqa: E402
     _write_atomic,
 )
 
-_HOUR = 3600
 
 
 def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
@@ -85,6 +84,9 @@ def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
     if run.measure_lost_attention:
         env["VLLM_DSA_IVF_LOST_ATTENTION_DIR"] = lost_dir
     env["GLM5_STACK_DUMP"] = "1"
+    if run.indexer == "ivf":
+        env["GLM5_EXPECT_IVF"] = (f"{run.hf_overrides['index_num_clusters']},"
+                                  f"{run.hf_overrides['index_num_probes']}")
     return env
 
 
@@ -363,7 +365,8 @@ def main() -> None:
     p.add_argument("--gpu-mem-util", type=float, default=0.9)
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--startup-timeout", type=float, default=45 * 60)
-    p.add_argument("--request-timeout", type=float, default=2 * _HOUR)
+    p.add_argument("--request-timeout", type=float,
+                   help="default: resilience.request_timeout_s in runs.yaml")
     args = p.parse_args()
     args.ruler_dir = ruler_data_dir(args.runs_yaml, args.ruler_dir)
     print(f"ruler data: {args.ruler_dir}", flush=True)
@@ -386,6 +389,8 @@ def main() -> None:
 
     resilience = matrix.resilience
     args.request_attempts = int(resilience["request_attempts"])
+    args.request_timeout = args.request_timeout or float(
+        resilience["request_timeout_s"])
     passes = int(resilience["run_passes"])
     _exit_on_sigterm()
 

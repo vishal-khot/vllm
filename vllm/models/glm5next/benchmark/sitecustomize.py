@@ -17,6 +17,18 @@ if os.environ.get("GLM5_STACK_DUMP") == "1":
 
     faulthandler.register(signal.SIGUSR1, all_threads=True)
 
+if os.environ.get("GLM5_EXPECT_IVF"):
+    # The indexer silently falls back to 64/8 when --hf-overrides misses its
+    # config, so fail the serve unless it got the run's clusters and probes.
+    # Patched when vLLM imports the module, not here, to keep startup unchanged.
+    try:
+        import expect_ivf
+
+        expect_ivf.install(os.environ["GLM5_EXPECT_IVF"])
+    except Exception as e:
+        print(f"[sitecustomize] glm5 expect-ivf guard failed: {e!r}", flush=True)
+        os._exit(1)
+
 if os.environ.get("GLM5_INSTRUMENT") == "1":
     try:
         import instrument  # noqa: F401  (import triggers _install)
