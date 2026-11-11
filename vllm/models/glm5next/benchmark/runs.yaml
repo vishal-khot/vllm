@@ -146,15 +146,15 @@ runs:
       eager_grid:
         with: *memory_timing
         grid: &fidelity_grid
-          - {length: 4096,   clusters: 32,  probes: [2, 4, 8, 16, 24]}
-          - {length: 8192,   clusters: 45,  probes: [3, 6, 11, 23, 34]}
-          - {length: 16384,  clusters: 64,  probes: [4, 8, 16, 32, 48]}
-          - {length: 32768,  clusters: 91,  probes: [6, 11, 23, 46, 68]}
-          - {length: 65536,  clusters: 128, probes: [8, 16, 32, 64, 96]}
-          - {length: 131072, clusters: 181, probes: [11, 23, 45, 91, 136]}
-          - {length: 262144, clusters: 256, probes: [16, 32, 64, 128, 192]}
-          - {length: 524288, clusters: 362, probes: [23, 45, 91, 181, 272]}
-          - {length: 1040384, clusters: 510, probes: [32, 64, 128, 255, 383]}
+          - {length: 4096,   clusters: 32,  probes: [4, 8, 16, 24]}
+          - {length: 8192,   clusters: 45,  probes: [6, 11, 23, 34]}
+          - {length: 16384,  clusters: 64,  probes: [8, 16, 32, 48]}
+          - {length: 32768,  clusters: 91,  probes: [11, 23, 46, 68]}
+          - {length: 65536,  clusters: 128, probes: [16, 32, 64, 96]}
+          - {length: 131072, clusters: 181, probes: [23, 45, 91, 136]}
+          - {length: 262144, clusters: 256, probes: [32, 64, 128, 192]}
+          - {length: 524288, clusters: 362, probes: [45, 91, 181, 272]}
+          - {length: 1040384, clusters: 510, probes: [64, 128, 255, 383]}
       # Throughput at IVF's real per-length operating point: clusters =
       # round(sqrt(length/4)), probes = 12.5% of clusters (same rule as the
       # fidelity grid). The ladder tapers at long context because KV memory
@@ -173,7 +173,7 @@ runs:
       # ruler dataset runs through each serve (tasks are a free axis), n samples
       # each. Every operating point is explicit -- nothing is computed at run
       # time. Derived as clusters = round(sqrt(length/4)) = sqrt(#pools)
-      # (kpool=4), probes = round(clusters * {6.25,12.5,25,50,75}%).
+      # (kpool=4), probes = round(clusters * {12.5,25,50,75}%).
       cells:
         n: 20                   # samples per task per cell; `all` = whole file
         concurrency: 32         # requests in flight; server batches them
