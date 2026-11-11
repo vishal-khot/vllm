@@ -328,18 +328,22 @@ def _expand_throughput_grid(base: dict[str, Any], spec: dict[str, Any]) -> list[
     out: list[dict] = []
     for cell in spec["cells"]:
         length = int(cell["length"])
-        for conc in cell["concurrency"]:
-            run = dict(base)
-            run.update(extra)
-            run["concurrency"] = int(conc)
-            run["length"] = length
-            run["datasets"] = ["ruler"]
-            if cell.get("clusters") is not None:
-                run["clusters"] = cell["clusters"]
-            if cell.get("probes") is not None:
-                run["P"] = cell["probes"]
-            run["id"] = f"{base['id']}_L{length}_c{conc}"
-            out.append(run)
+        probes = cell.get("probes")
+        for p in probes if isinstance(probes, list) else [probes]:
+            for conc in cell["concurrency"]:
+                run = dict(base)
+                run.update(extra)
+                run["concurrency"] = int(conc)
+                run["length"] = length
+                run["datasets"] = ["ruler"]
+                tag = f"{base['id']}_L{length}"
+                if cell.get("clusters") is not None:
+                    run["clusters"] = cell["clusters"]
+                if p is not None:
+                    run["P"] = p
+                    tag += f"_C{cell['clusters']}_P{p}"
+                run["id"] = f"{tag}_c{conc}"
+                out.append(run)
     return out
 
 

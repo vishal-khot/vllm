@@ -146,18 +146,17 @@ runs:
           - {length: 262144, clusters: 256, probes: [32, 64, 96]}
           - {length: 524288, clusters: 362, probes: [45, 91, 136]}
           - {length: 1040384, clusters: 510, probes: [64, 128, 191]}
-      # Throughput at IVF's real per-length operating point: clusters =
-      # round(sqrt(length/4)), probes = 12.5% of clusters (same rule as the
-      # fidelity grid). The ladder tapers at long context because KV memory
-      # caps concurrency. max_model_len is derived as length + max_tokens.
+      # End-to-end recall and latency at each probe share of the fidelity grid
+      # (12.5/25/37.5% of clusters = round(sqrt(length/4))), one request at a
+      # time, against the kpool cell of the same length.
       throughput_grid:
         with: {exec_mode: graph, measure_lost_attention: false}
         cells:
-          - {length: 65536,  clusters: 128, probes: 16, concurrency: [1]}
-          - {length: 131072, clusters: 181, probes: 23, concurrency: [1]}
-          - {length: 262144, clusters: 256, probes: 32, concurrency: [1]}
-          - {length: 524288, clusters: 362, probes: 45, concurrency: [1]}
-          - {length: 1040384, clusters: 510, probes: 64, concurrency: [1]}
+          - {length: 65536,  clusters: 128, probes: [16, 32, 48], concurrency: [1]}
+          - {length: 131072, clusters: 181, probes: [23, 45, 68], concurrency: [1]}
+          - {length: 262144, clusters: 256, probes: [32, 64, 96], concurrency: [1]}
+          - {length: 524288, clusters: 362, probes: [45, 91, 136], concurrency: [1]}
+          - {length: 1040384, clusters: 510, probes: [64, 128, 191], concurrency: [1]}
       # IVF lost-attention fidelity sweep, run by slurm/lost_attention_run.py
       # (not the A/B matrix). One serve per (length, probe); every task in the
       # ruler dataset runs through each serve (tasks are a free axis), n samples
