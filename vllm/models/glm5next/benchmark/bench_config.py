@@ -20,6 +20,7 @@ Inspect from the shell:
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -86,6 +87,8 @@ class Run:
     measure_lost_attention: bool
     datasets: list[Dataset]
     length: int | None = None  # throughput-grid runs pin a single context length
+    thinking: bool = True
+    task_caps: dict[str, int] = field(default_factory=dict)
 
     @property
     def eager(self) -> bool:
@@ -198,12 +201,42 @@ def ruler_data_dir(runs_yaml: str, default: str) -> str:
     return spec.get("data_dir") or default
 
 
-def max_tokens_for(fairness: dict, length: int | None) -> int:
-    """Output cap for a length: ``fairness.max_tokens`` unless
-    ``max_tokens_by_length`` lowers it where the model's context can't hold it."""
+def max_tokens_for(fairness: dict, length: int | None, task: str | None = None) -> int:
+    """Output cap: ``fairness.max_tokens``, lowered by ``max_tokens_by_length``
+    where the model's context can't hold it and by ``max_tokens_by_task`` (with
+    thinking off, RULER's own per-task budgets)."""
     by_length = {int(k): int(v)
                  for k, v in (fairness.get("max_tokens_by_length") or {}).items()}
-    return by_length.get(length, int(fairness["max_tokens"]))
+    cap = by_length.get(length, int(fairness["max_tokens"]))
+    by_task = fairness.get("max_tokens_by_task") or {}
+    if task is not None and task in by_task:
+        cap = min(cap, int(by_task[task]))
+    return cap
+
+
+def thinking_on(fairness: dict) -> bool:
+    return bool(fairness.get("thinking", True))
+
+
+_GEN_PROMPT = "<|assistant|>{{- '<think>' -}}"
+_GEN_PROMPT_NOTHINK = "<|assistant|>{{- '<think></think>' -}}"
+
+
+def nothink_template(model_dir: str, out_dir: str) -> str:
+    """The model's chat template with an empty ``<think></think>`` opening the
+    reply: the form the template itself gives a turn without reasoning. Fails
+    unless the generation prompt is found exactly once."""
+    with open(os.path.join(model_dir, "chat_template.jinja")) as f:
+        text = f.read()
+    if text.count(_GEN_PROMPT) != 1:
+        raise ConfigError(
+            f"expected one {_GEN_PROMPT!r} in the chat template, "
+            f"found {text.count(_GEN_PROMPT)}")
+    path = os.path.join(out_dir, "chat_template_nothink.jinja")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text.replace(_GEN_PROMPT, _GEN_PROMPT_NOTHINK))
+    return path
 
 
 def _resolve_run(
@@ -300,6 +333,9 @@ def _resolve_run(
         measure_lost_attention=measure,
         datasets=resolved_ds,
         length=length,
+        thinking=thinking_on(fairness),
+        task_caps={t: int(v) for t, v in
+                   (fairness.get("max_tokens_by_task") or {}).items()},
     )
 
 

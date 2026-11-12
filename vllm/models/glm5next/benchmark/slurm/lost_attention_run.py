@@ -48,7 +48,12 @@ import yaml
 BENCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGGING_CONFIG = os.path.join(BENCH_DIR, "slurm", "fidelity_logging.json")
 sys.path.insert(0, BENCH_DIR)
-from bench_config import max_tokens_for, ruler_data_dir  # noqa: E402
+from bench_config import (  # noqa: E402
+    max_tokens_for,
+    nothink_template,
+    ruler_data_dir,
+    thinking_on,
+)
 from tasks import TASKS, recall  # noqa: E402
 
 
@@ -143,6 +148,11 @@ class _Reply(NamedTuple):
     finish_reason: str | None
 
 
+# False when runs.yaml sets fairness.thinking off: the prompt then closes
+# <think></think> itself and the whole completion is the answer.
+THINKING = True
+
+
 def _split_answer(
     content: str, reasoning: str, finish_reason: str | None,
 ) -> tuple[str, str]:
@@ -150,14 +160,15 @@ def _split_answer(
 
     The chat template opens ``<think>`` and we serve without a reasoning parser,
     so GLM-5.3's stream is ``reasoning</think>answer``. A stream cut by
-    ``max_tokens`` before ``</think>`` has reasoning and no answer.
+    ``max_tokens`` before ``</think>`` has reasoning and no answer. With thinking
+    off, a cut stream is a truncated answer, scored as RULER scores it.
     """
     if reasoning:
         return content, reasoning
     if "</think>" in content:
         thought, answer = content.rsplit("</think>", 1)
         return answer, thought
-    if finish_reason == "length":
+    if finish_reason == "length" and THINKING:
         return "", content
     return content, ""
 
@@ -345,6 +356,7 @@ def _serve(
     probes: int,
     gpu_mem_util: float,
     seed: int,
+    chat_template: str | None = None,
 ) -> list[str]:
     return [
         shutil.which("vllm") or "vllm", "serve", model,
@@ -365,7 +377,7 @@ def _serve(
                 "index_num_clusters": clusters, "index_num_probes": probes,
             }}
         ),
-    ]
+    ] + (["--chat-template", chat_template] if chat_template else [])
 
 
 def _stop_serve(proc: subprocess.Popen, dump_stacks: bool) -> None:
@@ -493,6 +505,7 @@ def _run_tasks(
     tag: str, port: int, length: int, todo: list[tuple[str, dict]],
     request_timeout: float, concurrency: int, max_tokens: int, seed: int | None,
     greedy: bool, request_attempts: int, ckpt: _Results,
+    task_caps: dict[str, int],
 ) -> None:
     """Stream ``todo`` (task, sample) through the live serve, checkpointing each.
 
@@ -522,7 +535,7 @@ def _run_tasks(
         body = {
             "model": "glm",
             "messages": [{"role": "user", "content": ex["input"]}],
-            "max_tokens": max_tokens,
+            "max_tokens": min(max_tokens, task_caps.get(task, max_tokens)),
             "temperature": 0 if greedy else 1.0,
         }
         if seed is not None:
@@ -566,7 +579,7 @@ def _serve_cell(
     max_len = length + args.max_tokens + args.length_margin
     cmd = _serve(
         args.model, args.tp, max_len, args.port, clusters, probes,
-        args.gpu_mem_util, args.seed,
+        args.gpu_mem_util, args.seed, args.chat_template,
     )
     print(f"[{tag}] serve: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, env=_serve_env(lost_dir, clusters, probes),
@@ -588,6 +601,7 @@ def _serve_cell(
         _run_tasks(
             tag, args.port, length, todo, args.request_timeout, args.concurrency,
             args.max_tokens, args.seed, args.greedy, args.request_attempts, ckpt,
+            args.task_caps,
         )
     finally:
         stop.set()
@@ -606,6 +620,7 @@ def _cell_config(
         "length": length, "clusters": clusters, "probes": probes,
         "tasks": tasks, "n": n, "max_tokens": args.max_tokens,
         "seed": args.seed, "greedy": args.greedy, "scoring": "final_answer",
+        "thinking": args.thinking, "task_caps": args.task_caps,
         "mass": "all_rows_scored_finite_split",
     }, sort_keys=True)
 
@@ -789,6 +804,12 @@ def main() -> None:
     args.length_margin = int(fairness["length_margin"])
     args.seed = int(fairness["seed"])
     args.greedy = bool(fairness["greedy"])
+    global THINKING
+    THINKING = args.thinking = thinking_on(fairness)
+    args.task_caps = {t: int(v) for t, v in
+                      (fairness.get("max_tokens_by_task") or {}).items()}
+    args.chat_template = (None if args.thinking
+                          else nothink_template(args.model, args.out_dir))
     args.concurrency = args.concurrency or sweep["concurrency"]
     args.request_attempts = int(resilience["request_attempts"])
     args.request_timeout = args.request_timeout or float(

@@ -11,12 +11,17 @@ image:
 fairness:
   greedy: true
   seed: 0
-  max_tokens: 16384
+  # Thinking off: the reply opens with an empty <think></think> (the chat
+  # template's own form for a turn without reasoning), so outputs are short and
+  # each task gets RULER's generation budget (scripts/data/synthetic/constants.py).
+  thinking: false
+  max_tokens: 128            # the largest per-task budget; sizes max_model_len
+  max_tokens_by_task: {niah_single_1: 128, niah_single_2: 128, niah_single_3: 128,
+                       niah_multikey_1: 128, niah_multikey_2: 128, niah_multikey_3: 128,
+                       niah_multivalue: 128, niah_multiquery: 128,
+                       vt: 30, cwe: 120, fwe: 50, qa_1: 32, qa_2: 32}
   max_model_len: 34000
   length_margin: 4096        # room over a run's length: chat template, token drift
-  # The model's context is 1048576; at 1040384 only 4096 output tokens fit.
-  # Both arms share the cap, so the A/B at that length stays fair.
-  max_tokens_by_length: {1040384: 4096}
   prefix_caching: off        # IVF forces off; match on kpool
 
 # Failure handling for both runners. A failed request is retried, then its run

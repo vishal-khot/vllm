@@ -46,7 +46,14 @@ BENCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SLURM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH_DIR)
 sys.path.insert(0, SLURM_DIR)
-from bench_config import load_matrix, ruler_data_dir  # noqa: E402
+import lost_attention_run  # noqa: E402
+from bench_config import (  # noqa: E402
+    load_matrix,
+    max_tokens_for,
+    nothink_template,
+    ruler_data_dir,
+    thinking_on,
+)
 from tasks import recall  # noqa: E402
 
 # Reuse the proven serve/HTTP/summary helpers from the fidelity runner.
@@ -90,23 +97,29 @@ def _serve_env(run, timing_dir: str, lost_dir: str) -> dict:
     return env
 
 
-def _serve_cmd(run, model: str, tp: int, port: int, gpu_mem_util: float) -> list:
+def _serve_cmd(
+    run, model: str, tp: int, port: int, gpu_mem_util: float,
+    chat_template: str | None = None,
+) -> list:
     """`vllm serve` for a run: fixed flags plus the run's own serve_args
     (max-model-len, seed, eager, prefix-caching, hf-overrides)."""
-    return [
+    cmd = [
         shutil.which("vllm") or "vllm", "serve", model,
         "--served-model-name", "glm",
         "--tensor-parallel-size", str(tp),
         "--gpu-memory-utilization", str(gpu_mem_util),
         "--port", str(port),
     ] + run.serve_args()
+    if chat_template:
+        cmd += ["--chat-template", chat_template]
+    return cmd
 
 
 def _one_request(port: int, meta: dict, run, args) -> dict:
     body = {
         "model": "glm",
         "messages": [{"role": "user", "content": meta["input"]}],
-        "max_tokens": run.max_tokens,
+        "max_tokens": max_tokens_for(args.fairness, run.length, meta["task"]),
         "temperature": 0 if run.greedy else 1.0,
         "seed": run.seed,
     }
@@ -174,7 +187,8 @@ def _config_text(run) -> str:
     return json.dumps({
         "serve": run.serve_key(), "max_tokens": run.max_tokens,
         "seed": run.seed, "greedy": run.greedy, "timing": "merged_attempts",
-        "scoring": "final_answer",
+        "scoring": "final_answer", "thinking": run.thinking,
+        "task_caps": run.task_caps,
         "datasets": [[d.name, d.n, d.lengths, d.tasks] for d in run.datasets],
     }, sort_keys=True)
 
@@ -214,7 +228,8 @@ def run_one(run, args) -> dict:
             shutil.rmtree(d)
         os.makedirs(d, exist_ok=True)
 
-    cmd = _serve_cmd(run, args.model, args.tp, args.port, args.gpu_mem_util)
+    cmd = _serve_cmd(run, args.model, args.tp, args.port, args.gpu_mem_util,
+                     args.chat_template)
     print(f"[{run.id}] serve: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(
         cmd, env=_serve_env(run, timing_dir, lost_dir), start_new_session=True)
@@ -372,6 +387,10 @@ def main() -> None:
     print(f"ruler data: {args.ruler_dir}", flush=True)
 
     matrix = load_matrix(args.runs_yaml)
+    args.fairness = matrix.fairness
+    lost_attention_run.THINKING = thinking_on(matrix.fairness)
+    args.chat_template = (None if lost_attention_run.THINKING
+                          else nothink_template(args.model, args.out_dir))
     runs = matrix.runs
     if args.only:
         want = {s.strip() for s in args.only.split(",") if s.strip()}
