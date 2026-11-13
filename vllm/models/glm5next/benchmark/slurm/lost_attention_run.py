@@ -153,6 +153,21 @@ class _Reply(NamedTuple):
 THINKING = True
 
 
+def ruler_messages(text: str, answer_prefix: str) -> dict:
+    """Chat fields for one RULER sample. With thinking off the reply starts with
+    the sample's ``answer_prefix``, as RULER's own client sends
+    ``input + answer_prefix`` (scripts/pred/call_api.py), so the model writes only
+    the answer and RULER's per-task budgets hold."""
+    msgs = [{"role": "user", "content": text}]
+    if THINKING or not answer_prefix:
+        return {"messages": msgs}
+    return {
+        "messages": msgs + [{"role": "assistant", "content": answer_prefix}],
+        "add_generation_prompt": False,
+        "continue_final_message": True,
+    }
+
+
 def _split_answer(
     content: str, reasoning: str, finish_reason: str | None,
 ) -> tuple[str, str]:
@@ -534,7 +549,7 @@ def _run_tasks(
     def _one(task: str, ex: dict) -> dict:
         body = {
             "model": "glm",
-            "messages": [{"role": "user", "content": ex["input"]}],
+            **ruler_messages(ex["input"], ex.get("answer_prefix", "")),
             "max_tokens": min(max_tokens, task_caps.get(task, max_tokens)),
             "temperature": 0 if greedy else 1.0,
         }
@@ -621,6 +636,7 @@ def _cell_config(
         "tasks": tasks, "n": n, "max_tokens": args.max_tokens,
         "seed": args.seed, "greedy": args.greedy, "scoring": "final_answer",
         "thinking": args.thinking, "task_caps": args.task_caps,
+        "answer_prefix": not args.thinking,
         "mass": "all_rows_scored_finite_split",
     }, sort_keys=True)
 

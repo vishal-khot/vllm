@@ -69,6 +69,7 @@ from lost_attention_run import (  # noqa: E402
     _summarize_lost,
     _summarize_timing,
     _stop_serve,
+    ruler_messages,
     _wait_ready,
     _write_atomic,
 )
@@ -118,7 +119,7 @@ def _serve_cmd(
 def _one_request(port: int, meta: dict, run, args) -> dict:
     body = {
         "model": "glm",
-        "messages": [{"role": "user", "content": meta["input"]}],
+        **ruler_messages(meta["input"], meta["answer_prefix"]),
         "max_tokens": max_tokens_for(args.fairness, run.length, meta["task"]),
         "temperature": 0 if run.greedy else 1.0,
         "seed": run.seed,
@@ -188,7 +189,7 @@ def _config_text(run) -> str:
         "serve": run.serve_key(), "max_tokens": run.max_tokens,
         "seed": run.seed, "greedy": run.greedy, "timing": "merged_attempts",
         "scoring": "final_answer", "thinking": run.thinking,
-        "task_caps": run.task_caps,
+        "task_caps": run.task_caps, "answer_prefix": not run.thinking,
         "datasets": [[d.name, d.n, d.lengths, d.tasks] for d in run.datasets],
     }, sort_keys=True)
 
@@ -263,7 +264,8 @@ def run_one(run, args) -> dict:
                     raise SystemExit(f"missing ruler data: {path}")
                 rows = [json.loads(line) for line in open(path)][:cap]
                 return [{"task": task, "L": length, "idx": ex["index"],
-                         "gold": ex["outputs"], "input": ex["input"]}
+                         "gold": ex["outputs"], "input": ex["input"],
+                         "answer_prefix": ex.get("answer_prefix", "")}
                         for ex in rows]
 
             metas = [m for length in ds.lengths for task in ds.tasks
