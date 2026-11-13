@@ -764,6 +764,7 @@ def _load_sweep(path: str) -> dict:
     return {
         "n": n, "tasks": list(tasks), "grid": cells["grid"],
         "concurrency": int(cells["concurrency"]),
+        "gpu_memory_utilization": cells.get("gpu_memory_utilization"),
         "concurrency_by_length": {
             int(k): int(v)
             for k, v in (cells.get("concurrency_by_length") or {}).items()},
@@ -804,7 +805,8 @@ def main() -> None:
                    help="re-run every cell even if its verdict.json exists "
                         "(default: resume — skip already-finished cells)")
     p.add_argument("--tp", type=int, required=True)
-    p.add_argument("--gpu-mem-util", type=float, default=0.9)
+    p.add_argument("--gpu-mem-util", type=float,
+                   help="default: sweep.cells.gpu_memory_utilization, else 0.9")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--startup-timeout", type=float, default=45 * 60)
     p.add_argument("--request-timeout", type=float,
@@ -827,6 +829,8 @@ def main() -> None:
     args.chat_template = (None if args.thinking
                           else nothink_template(args.model, args.out_dir))
     args.concurrency = args.concurrency or sweep["concurrency"]
+    args.gpu_mem_util = args.gpu_mem_util or float(
+        sweep["gpu_memory_utilization"] or 0.9)
     args.request_attempts = int(resilience["request_attempts"])
     args.request_timeout = args.request_timeout or float(
         resilience["request_timeout_s"])

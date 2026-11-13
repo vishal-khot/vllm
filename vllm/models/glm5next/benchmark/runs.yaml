@@ -171,8 +171,11 @@ runs:
       cells:
         n: 100                  # samples per task per cell (first 100 of 500)
         concurrency: 32         # requests in flight; server batches them
-        # The KV cache holds ~3.2M tokens, so only a few long requests run at
-        # once; the rest would queue past the request timeout.
-        concurrency_by_length: {262144: 8, 524288: 4, 1040384: 2}
+        # The exact re-scoring that measures lost attention needs scratch memory
+        # that grows with context, so fidelity leaves 20% of the GPU outside
+        # the KV cache (~2.5M tokens); a 128K cell at 0.9 / 32 in flight ran out
+        # of memory. Long lengths run fewer requests at once so they fit.
+        gpu_memory_utilization: 0.8
+        concurrency_by_length: {131072: 16, 262144: 8, 524288: 4, 1040384: 2}
         tasks: all              # all tasks listed in the ruler dataset above
         grid: *fidelity_grid
