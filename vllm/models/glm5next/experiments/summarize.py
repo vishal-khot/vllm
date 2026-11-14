@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Roll the reorder records up into ``<reorder>/summary.json``.
+"""Roll experiment records up into ``<root>/summary.json``.
+
+Reorder (experiment 2):
 
 One row per (kind, length, probe share, rows): the median over inputs (prompts
 x layers) of each step's median ms, the share of inputs where the reorder pays
@@ -60,12 +62,61 @@ def summarize_reorder(root: str) -> dict:
     return out
 
 
+def _records(root: str) -> list[dict]:
+    recs = []
+    for path in sorted(glob.glob(os.path.join(root, "results", "*.jsonl"))):
+        with open(path) as f:
+            for line in f:
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+    return recs
+
+
+def _roll(recs: list[dict], by: tuple, skip: tuple) -> list[dict]:
+    """Median of every numeric field per group; ``match*`` fields take the min."""
+    groups: dict[tuple, list] = {}
+    for r in recs:
+        groups.setdefault(tuple(r[k] for k in by), []).append(r)
+    rows = []
+    for gkey, rs in sorted(groups.items()):
+        row = dict(zip(by, gkey))
+        row["inputs"] = len(rs)
+        fields = sorted({k for r in rs for k, v in r.items()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool)})
+        for k in fields:
+            if k in by or k in skip:
+                continue
+            vals = [r[k] for r in rs if r.get(k) is not None]
+            row[k] = min(vals) if k.startswith("match") else _med(vals)
+        rows.append(row)
+    return rows
+
+
+def summarize_layout(root: str) -> dict:
+    """Experiment 3: part A per (length, probe share, rows), B per length, C per
+    (length, probe share); medians over inputs, top-k agreements as minima."""
+    recs = _records(root)
+    skip = ("layer", "n_keys", "clusters", "probes", "wall_s", "bytes")
+    out = {"records": len(recs)}
+    for part, by in (("A", ("length", "probe_share", "rows")), ("B", ("length",)),
+                     ("C", ("length", "probe_share"))):
+        out[part] = _roll([r for r in recs if r.get("part") == part], by, skip)
+    with open(os.path.join(root, "summary.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--reorder", required=True, help="the reorder output root")
+    p.add_argument("--reorder", help="experiment 2's output root")
+    p.add_argument("--layout", help="experiment 3's output root")
     args = p.parse_args()
-    out = summarize_reorder(args.reorder)
-    print(f"{out['records']} records -> {os.path.join(args.reorder, 'summary.json')}")
+    for root, fn in ((args.reorder, summarize_reorder), (args.layout, summarize_layout)):
+        if root:
+            out = fn(root)
+            print(f"{out['records']} records -> {os.path.join(root, 'summary.json')}")
 
 
 if __name__ == "__main__":

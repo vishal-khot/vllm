@@ -78,3 +78,19 @@ reorder:
       mixture_centers: 256     # keys are a Gaussian mixture around these
       center_scale: 3.0
       seed: 0
+
+# ---------------------------------------------------------------------------
+# Experiment 3: the key layout alone (layout_bench.py). Replays experiment 2's
+# captured keys; the scoring kernel is held fixed, only where keys are read
+# from changes. Output: $BASE/exp_layout.
+layout:
+  gpus: 4                      # processes; captured inputs are sharded across them
+  warmup: 5
+  reps: 30
+  rows: [128, 1024, 4096, 8192]   # part A: query rows per call
+  probe_shares: [0, 1, 2]      # part A: indices into ivf_grid probes
+  read_reps: 50                # part B
+  flush_bytes: 268435456       # zeroed before each cold rep (> L2)
+  chunk_tokens: 8192           # part C: prefill chunk size
+  chunk_reps: 5                # part C: scoring reps per chunk
+  chunk_probe_shares: [0, 1, 2]
