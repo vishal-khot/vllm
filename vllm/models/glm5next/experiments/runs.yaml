@@ -1,0 +1,80 @@
+# Follow-up experiments to the v0.32 A/B matrix. Single source of truth for
+# both runners; nothing is computed or hardcoded in them. Separate from
+# ../benchmark/runs.yaml so the running matrix never sees a change here.
+
+model_dir: /mnt/weka/shrd/ci/haok/glm5/model
+ruler_dir: /mnt/weka/shrd/ci/haok/glm5-ivf/ruler-full
+
+# Same serve settings as the matrix's graph runs.
+fairness:
+  seed: 0
+  thinking: false
+  length_margin: 4096          # max_model_len = length + margin
+  max_tokens_by_task: {niah_single_1: 128, niah_single_2: 128, niah_single_3: 128,
+                       niah_multikey_1: 128, niah_multikey_2: 128, niah_multikey_3: 128,
+                       niah_multivalue: 128, niah_multiquery: 128,
+                       vt: 30, cwe: 120, fwe: 50, qa_1: 32, qa_2: 32}
+
+# The fidelity grid's operating points: clusters = round(sqrt(length / 4)),
+# probes = 12.5 / 25 / 37.5% of clusters.
+ivf_grid:
+  65536:   {clusters: 128, probes: [16, 32, 48]}
+  131072:  {clusters: 181, probes: [23, 45, 68]}
+  262144:  {clusters: 256, probes: [32, 64, 96]}
+  524288:  {clusters: 362, probes: [45, 91, 136]}
+  1040384: {clusters: 510, probes: [64, 128, 191]}
+
+# Experiment 1: highest gpu_memory_utilization each arm survives at full load.
+capacity:
+  tp: 4
+  lengths: [262144, 524288, 1040384]
+  # Arms: kpool, and IVF at the first N probe shares of ivf_grid (12.5, 25%).
+  ivf_probe_shares: 2
+  util_lo: 0.80
+  util_hi: 0.97
+  util_step: 0.01              # bisection stops at this resolution
+  # Requests sent at once = floor(KV tokens / max_model_len), at least 1, drawn
+  # round-robin over these tasks (sample i of each) at the cell's length.
+  tasks: [niah_single_1, niah_multikey_2, qa_1, vt, cwe]
+  startup_timeout_s: 3600
+  # A request that has not finished by then counts as a hang.
+  request_timeout_s: 7200
+  max_attempts_per_point: 2    # a point re-runs once on a non-memory failure
+
+# Experiment 2: does the cluster-ordered copy pay for itself?
+reorder:
+  # Capture: one eager TP serve saves real pooled keys and final-chunk queries.
+  capture:
+    tp: 4
+    gpu_memory_utilization: 0.85
+    layers: [3, 23, 43]
+    lengths: [65536, 131072, 262144, 524288, 1040384]
+    tasks: [niah_single_1, qa_1, cwe]
+    sample_idx: 0
+    probe_share: 0             # index into ivf_grid probes for the capture serve
+  # Replay: microbenchmark on 1 GPU per process, existing v0.32 kernels unchanged.
+  replay:
+    gpus: 4                    # processes; inputs are sharded across them
+    warmup: 5
+    reps: 50
+    rows: [128, 1024, 4096, 8192]   # query rows scored per call
+    probe_shares: [0, 1, 2]    # indices into ivf_grid probes
+    # Score matrices of the scattered path are rows x pools x 8 B; larger
+    # cells are skipped and recorded as such.
+    max_scatter_bytes: 40000000000
+    # Indexer constants of GLM-5.3-Flash (config.json): 32 heads, 2048/4 pools.
+    heads: 32
+    topk: 512
+    kpool: 4
+    kmeans_iters: 10
+    kmeans_warm_iters: 2
+    kmeans_stop_fraction: 0.01
+    # Cache geometry for synthetic inputs; captured inputs carry the served one.
+    page: 64
+    cid_block: 4224
+    cen_block: 31
+    synthetic:
+      lengths: [65536, 131072, 262144, 524288, 1040384]
+      mixture_centers: 256     # keys are a Gaussian mixture around these
+      center_scale: 3.0
+      seed: 0
