@@ -100,3 +100,22 @@ trace. Projections inside compiled regions carry no layer label, so they count
 as dense GEMM.
 
     BASE=/mnt/weka/shrd/ci/haok/glm5 bash slurm/submit_prof.sh   # -> $BASE/exp_profile
+
+## 5. E-means for the IVF build (branch `emeans-v0.32`)
+
+`nvidia/ops/ivf_emeans.py` ports FAISS's spherical E-means (mini-batch EMA
+k-means with fitted batch and step laws, arXiv 2611.09501) and plugs it into
+`build_ivf_index` behind `index_kmeans_algo=emeans` (`index_emeans_epochs`,
+`index_emeans_warm_epochs`; the default stays `kmeans`). E-means fits the
+centroids of each full build (cold, and warm from the previous centroids);
+the fused kernel then only assigns, so cluster ids, sizes, the run layout and
+appends are unchanged. On CPU the port reproduces the reference's centroids
+exactly (same seed); the job rechecks this on real keys.
+
+`emeans_bench.py` replays experiment 2's captured keys and compares build
+variants (served k-means, k-means with 2 iterations, E-means at 2/1, 2/2 and
+5/5 passes) one-shot and over the chunked prefill schedule: build time, mean
+key-centroid cosine, imbalance, and per probe share the selection time and
+recall of the exact top-k.
+
+    BASE=/mnt/weka/shrd/ci/haok/glm5 SHA=<commit> bash slurm/submit_emeans.sh  # -> $BASE/exp_emeans

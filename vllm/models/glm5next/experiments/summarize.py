@@ -108,12 +108,46 @@ def summarize_layout(root: str) -> dict:
     return out
 
 
+def summarize_emeans(root: str) -> dict:
+    """Experiment 5: per (scenario, length, variant), medians over inputs, and
+    each variant's build time, recall and selection time relative to kmeans on
+    the same input (medians of the per-input ratios / differences)."""
+    recs = _records(root)
+    skip = ("layer", "n_keys", "clusters", "wall_s", "rows", "iters", "warm_iters",
+            "epochs", "warm_epochs", "chunk_tokens")
+    out = {"records": len(recs)}
+    for sc in ("oneshot", "chunked"):
+        rs = [r for r in recs if r["key"].startswith(sc + "|")]
+        out[sc] = _roll(rs, ("length", "variant"), skip)
+        base = {(r["label"], r["layer"]): r for r in rs if r["variant"] == "kmeans"}
+        rel = []
+        for r in rs:
+            b = base.get((r["label"], r["layer"]))
+            if b is None or r["variant"] == "kmeans":
+                continue
+            d = {"length": r["length"], "variant": r["variant"],
+                 "build_x": r["build_ms"] / b["build_ms"],
+                 "cos_diff": r["mean_cos"] - b["mean_cos"]}
+            for k in r:
+                if k.startswith("recall_p"):
+                    d[k.replace("recall", "recall_diff")] = r[k] - b[k]
+                if k.startswith("select_ms_p"):
+                    d[k.replace("select_ms", "select_x")] = r[k] / b[k]
+            rel.append(d)
+        out[sc + "_vs_kmeans"] = _roll(rel, ("length", "variant"), ())
+    with open(os.path.join(root, "summary.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--reorder", help="experiment 2's output root")
     p.add_argument("--layout", help="experiment 3's output root")
+    p.add_argument("--emeans", help="experiment 5's output root")
     args = p.parse_args()
-    for root, fn in ((args.reorder, summarize_reorder), (args.layout, summarize_layout)):
+    for root, fn in ((args.reorder, summarize_reorder), (args.layout, summarize_layout),
+                     (args.emeans, summarize_emeans)):
         if root:
             out = fn(root)
             print(f"{out['records']} records -> {os.path.join(root, 'summary.json')}")

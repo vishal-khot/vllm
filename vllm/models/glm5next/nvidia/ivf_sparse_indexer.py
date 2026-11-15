@@ -503,6 +503,9 @@ def build_ivf_index(
         if "cold" in modes
         else min(config.kmeans_warm_iters, config.kmeans_iters)
     )
+    emeans = config.kmeans_algo == "emeans" and num_full > 0
+    if emeans:
+        iters = 0
     num_phases = 2 * iters + 2
     num_segs = int(seg_first[num_full])
     # One zero fill: the k-means phase counters, and the counting sort's run
@@ -536,6 +539,25 @@ def build_ivf_index(
         (num_segs if num_full else 0, C, 128),
     )
     C_PAD = max(triton.next_power_of_2(C), 32)
+    emeans_lengths = None
+    kmeans_prev_t = n_prev_t
+    if emeans:
+        from vllm.models.glm5next.nvidia.ops.ivf_emeans import emeans_seed_centroids
+
+        emeans_lengths = emeans_seed_centroids(
+            key=key,
+            state=state,
+            batch_rows=batch_rows_cpu[:num_full],
+            n_keys=n_keys_cpu[:num_full],
+            warm=[m == "warm" for m in modes[:num_full]],
+            clusters=[clusters(x) for x in n_keys_cpu[:num_full]],
+            epochs=config.emeans_epochs,
+            warm_epochs=config.emeans_warm_epochs,
+            seed=config.kmeans_seed,
+        )
+        # Every full item now reuses its stored centroids, as a warm build
+        # does; with no iteration the fused kernel only assigns.
+        kmeans_prev_t = n_keys_t
     if num_full > 0:
         full_keys = int(cu_keys[num_full])
         units = num_full * triton.cdiv(C, tune.kmeans_update_block)
@@ -552,7 +574,7 @@ def build_ivf_index(
             *state.cid_args(),
             req_t,
             n_keys_t,
-            n_prev_t,
+            kmeans_prev_t,
             tile_first_t,
             seg_first_t,
             cu_keys_t,
@@ -579,6 +601,10 @@ def build_ivf_index(
             PDL=tune.pdl,
             launch_pdl=tune.pdl,
         )
+    if emeans_lengths:
+        from vllm.models.glm5next.nvidia.ops.ivf_emeans import emeans_store_lengths
+
+        emeans_store_lengths(state, emeans_lengths)
     if num_full < num_items:
         sums = torch.empty(
             (int(new_tile_first[-1]), C, 128), dtype=torch.float32, device=device

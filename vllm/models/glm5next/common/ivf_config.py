@@ -40,6 +40,14 @@ class IvfIndexerConfig:
     # A prefill request with at most this many pools scores all of them
     # densely, as the kpool indexer does (0: every request probes).
     exact_pools: int = 0
+    # How full builds (cold and warm) fit their centroids: "kmeans" runs the
+    # fused Lloyd iterations above; "emeans" fits them with E-means
+    # (mini-batch EMA k-means, arXiv 2611.09501) over ``emeans_epochs`` passes
+    # (``emeans_warm_epochs`` from the previous centroids) and the fused
+    # kernel only assigns.
+    kmeans_algo: str = "kmeans"
+    emeans_epochs: float = 2.0
+    emeans_warm_epochs: float = 1.0
 
     @classmethod
     def from_hf_config(cls, config, max_model_len: int) -> "IvfIndexerConfig":
@@ -50,6 +58,17 @@ class IvfIndexerConfig:
         warm_iters = getattr(config, "index_kmeans_warm_iters", 2)
         stop_fraction = getattr(config, "index_kmeans_stop_fraction", 0.01)
         exact_pools = getattr(config, "index_exact_pools", 0)
+        algo = getattr(config, "index_kmeans_algo", "kmeans")
+        emeans_epochs = float(getattr(config, "index_emeans_epochs", 2.0))
+        emeans_warm_epochs = float(getattr(config, "index_emeans_warm_epochs", 1.0))
+        if algo not in ("kmeans", "emeans"):
+            raise ValueError(
+                f"index_kmeans_algo must be kmeans or emeans, got {algo!r}"
+            )
+        if not (emeans_epochs > 0 and emeans_warm_epochs > 0):
+            raise ValueError(
+                "index_emeans_epochs and index_emeans_warm_epochs must be > 0"
+            )
         if not 1 <= num_clusters <= 32767:
             raise ValueError(
                 f"index_num_clusters must be in [1, 32767], got {num_clusters}"
@@ -80,6 +99,9 @@ class IvfIndexerConfig:
             kmeans_warm_iters=warm_iters,
             kmeans_incremental=bool(getattr(config, "index_kmeans_incremental", True)),
             exact_pools=exact_pools,
+            kmeans_algo=algo,
+            emeans_epochs=emeans_epochs,
+            emeans_warm_epochs=emeans_warm_epochs,
         )
 
 

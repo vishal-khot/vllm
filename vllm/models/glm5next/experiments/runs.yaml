@@ -111,3 +111,21 @@ profile:
   startup_timeout_s: 3600
   request_timeout_s: 1800
   trace_timeout_s: 3600        # /stop_profile and writing the traces
+
+# ---------------------------------------------------------------------------
+# Experiment 5: E-means vs the fused k-means for the IVF build
+# (emeans_bench.py, branch emeans-v0.32). Replays experiment 2's captured keys.
+# Output: $BASE/exp_emeans.
+emeans:
+  gpus: 2                      # processes; captured inputs are sharded across them
+  rows: 1024                   # final-chunk queries scored for recall
+  probe_shares: [0, 1, 2]      # indices into ivf_grid probes
+  build_reps: 3                # one-shot builds timed (median)
+  select_reps: 5
+  chunk_tokens: 8192           # chunked scenario: prefill chunk size
+  variants:
+    - {name: kmeans, algo: kmeans}                    # served: cold 10 iters, warm 2
+    - {name: kmeans_i2, algo: kmeans, iters: 2, warm_iters: 2}
+    - {name: emeans_e2_w1, algo: emeans, epochs: 2, warm_epochs: 1}
+    - {name: emeans_e2_w2, algo: emeans, epochs: 2, warm_epochs: 2}
+    - {name: emeans_e5_w5, algo: emeans, epochs: 5, warm_epochs: 5}
