@@ -100,3 +100,17 @@ trace. Projections inside compiled regions carry no layer label, so they count
 as dense GEMM.
 
     BASE=/mnt/weka/shrd/ci/haok/glm5 bash slurm/submit_prof.sh   # -> $BASE/exp_profile
+
+## 5. A 2M context
+
+`long_run.py` serves kpool and IVF at 25% and 37.5% probes (723 clusters) at
+2,088,960 tokens, past GLM-5.3's trained 1,048,576 positions (`long:` in
+runs.yaml). `--hf-overrides` raises `max_position_embeddings` to 2,097,152; MLA
+has no rotary part and KDA has no positions, but the indexer's rotary positions
+past 1M are untrained, so accuracy is out of distribution for both arms. Every
+RULER task, 20 samples each (`slurm/prepare_ruler_2m.sh` -> `$BASE/ruler_2m`),
+one request at a time: the record holds recall and TTFT. Two TP=4 processes on
+one node take sample rows 0-9 and 10-19. The first request after each serve
+start is marked `cold` and left out of the timing summary.
+
+    BASE=/mnt/weka/shrd/ci/haok/glm5 bash slurm/submit_long.sh   # -> $BASE/exp_long2m
