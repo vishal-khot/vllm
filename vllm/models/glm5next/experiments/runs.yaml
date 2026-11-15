@@ -94,3 +94,20 @@ layout:
   chunk_tokens: 8192           # part C: prefill chunk size
   chunk_reps: 5                # part C: scoring reps per chunk
   chunk_probe_shares: [0, 1, 2]
+
+# ---------------------------------------------------------------------------
+# Experiment 4: where one served prefill's time goes (prefill_profile.py).
+# vLLM's torch profiler over one full-length request per cell; rank 0's kernels
+# split by component (profile_breakdown.py). Output: $BASE/exp_profile.
+profile:
+  tp: 4
+  util: 0.90                   # one request at a time; well inside capacity
+  lengths: [65536, 262144, 1040384]
+  arms: [kpool, ivf]
+  ivf_probe_index: 1           # 25% of clusters (index into ivf_grid probes)
+  task: niah_single_1
+  warmup_length: 65536         # one unprofiled request first (JIT, autotune)
+  timed_requests: 2            # unprofiled, one at a time: the TTFT
+  startup_timeout_s: 3600
+  request_timeout_s: 1800
+  trace_timeout_s: 3600        # /stop_profile and writing the traces

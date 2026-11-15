@@ -86,3 +86,17 @@ $BASE/exp_layout/summary.json
 ```
 
 Caveat: captured final-chunk queries stand in for every chunk's queries in C.
+
+## 4. Where one served prefill's time goes
+
+`prefill_profile.py` serves each cell (kpool and IVF at 25% probes, at 64K,
+256K and 1M; `profile:` in runs.yaml) with the matrix's flags plus vLLM's torch
+profiler. It times two unprofiled full-length requests (TTFT), then profiles a
+third. `profile_breakdown.py` ties each kernel of rank 0's trace to its
+`vllm::` custom op and splits the kernel time into DSA indexer (with its
+sub-steps), MLA attention, KDA attention, MoE, dense GEMM, all-reduce and
+norm/elementwise. It can re-categorize a saved `breakdown.json` without the
+trace. Projections inside compiled regions carry no layer label, so they count
+as dense GEMM.
+
+    BASE=/mnt/weka/shrd/ci/haok/glm5 bash slurm/submit_prof.sh   # -> $BASE/exp_profile
