@@ -103,7 +103,7 @@ as dense GEMM.
 
 ## 5. A 2M context
 
-`long_run.py` serves kpool and IVF at 25% and 37.5% probes (723 clusters) at
+`long_run.py` serves kpool and IVF at 25% and 37.5% probes (512 clusters) at
 2,088,960 tokens, past GLM-5.3's trained 1,048,576 positions (`long:` in
 runs.yaml). `--hf-overrides` raises `max_position_embeddings` to 2,097,152; MLA
 has no rotary part and KDA has no positions, but the indexer's rotary positions
@@ -114,3 +114,10 @@ one node take sample rows 0-9 and 10-19. The first request after each serve
 start is marked `cold` and left out of the timing summary.
 
     BASE=/mnt/weka/shrd/ci/haok/glm5 bash slurm/submit_long.sh   # -> $BASE/exp_long2m
+
+512 clusters, not the sqrt rule's 723: the fused k-means kernel holds a
+[C_PAD, 128] block with C_PAD = next power of two, and 1024 needs 340,096 bytes
+of shared memory against H200's 232,448 (`triton OutOfResources` at startup;
+logs in `exp_long2m/ivf_C723_*`). So 2M clusters are twice the 1M size. The
+first run (job 3066312) finished kpool only; `LONG_RESUME=1` resumes into the
+same directory, where kpool's records are skipped.

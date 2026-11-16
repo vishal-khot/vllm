@@ -23,7 +23,7 @@ ivf_grid:
   262144:  {clusters: 256, probes: [32, 64, 96]}
   524288:  {clusters: 362, probes: [45, 91, 136]}
   1040384: {clusters: 510, probes: [64, 128, 191]}
-  2088960: {clusters: 723, probes: [90, 181, 271]}   # experiment 5 only
+  2088960: {clusters: 512, probes: [64, 128, 192]}   # experiment 5; 512 = k-means kernel max
 
 # Experiment 1: highest gpu_memory_utilization each arm survives at full load.
 capacity:
