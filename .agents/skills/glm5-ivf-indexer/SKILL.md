@@ -71,10 +71,15 @@ request probes); see `IvfIndexerConfig.from_hf_config`.
    `ivf_grouped_score_kernel` scores candidates with TMA plus wgmma. Then
    per-row top-k runs, and `ivf_emit_runs_kernel` writes expanded token indices
    (pools x kpool plus the tail) straight into `topk_indices_buffer`.
-4. **Decode.** A step that completes a pool assigns it to the nearest fixed
-   centroid (`ivf_decode_append_kernel`). Select scans cluster ids for
-   candidates, scores them per row (`ivf_score_kernel`), runs top-k and
-   expands. Decode takes no host data, so it is CUDA-graph safe.
+4. **Decode.** One launch (`ivf_decode_probe_kernel`) assigns a pool the
+   step completed to its nearest fixed centroid, scores the centroids and
+   selects the probes. Select then scans cluster ids for candidates
+   (`ivf_scan_count_kernel`, `ivf_scan_write_kernel`), scores them per row
+   (`ivf_score_kernel`), runs top-k and expands straight into
+   `topk_indices_buffer` (`ivf_emit_kernel`). Decode takes no host data, so
+   it is CUDA-graph safe. `decode_probe_fused=False` splits the first launch
+   into `ivf_decode_append_kernel`, `ivf_probe_score_kernel` and
+   `ivf_probe_select_kernel`.
 
 ## Invariants (break these and results silently change)
 

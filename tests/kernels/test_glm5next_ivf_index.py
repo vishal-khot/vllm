@@ -829,8 +829,12 @@ def test_per_row_topk_ranks_rows_longer_than_its_view():
         assert torch.equal(out[r].long().sort().values, want), r
 
 
-def _decode_step(setup, seq_lens, qb: Queries):
-    append_ivf_decode_keys(key=setup.key, state=setup.state, seq_lens=seq_lens)
+def _decode_step(setup, seq_lens, qb: Queries, append_in_select=False):
+    kw = {}
+    if append_in_select:  # select appends, from token counts
+        kw["append_seq_lens"] = seq_lens * setup.config.kpool
+    else:
+        append_ivf_decode_keys(key=setup.key, state=setup.state, seq_lens=seq_lens)
     rows = seq_lens.shape[0]
     out = torch.full((rows, TOPK + 128), -7, dtype=torch.int32, device=DEV)
     select_ivf_topk(
@@ -844,17 +848,28 @@ def _decode_step(setup, seq_lens, qb: Queries):
         out=out,
         topk_backend="auto",
         seq_lens=seq_lens,
+        **kw,
     )
     return out
 
 
-def test_decode_matches_reference():
+# Decode probe paths: two launches; one fused launch; fused with the append.
+DECODE_PATHS = [(False, False), (True, False), (True, True)]
+
+
+@pytest.mark.parametrize("probe_fused,append_in_select", DECODE_PATHS)
+def test_decode_matches_reference(monkeypatch, probe_fused, append_in_select):
+    monkeypatch.setattr(
+        ivf_sparse_indexer,
+        "TUNING",
+        dataclasses.replace(ivf_sparse_indexer.TUNING, decode_probe_fused=probe_fused),
+    )
     setup = Setup(_config(), extra_decode_key=True)
     setup.build()
     before = [setup.kmeans_from_state(b, n) for b, n in enumerate(LENGTHS)]
     seq_lens = torch.tensor([n + 1 for n in LENGTHS], dtype=torch.int32, device=DEV)
     qb = _queries(len(LENGTHS), seed=7)
-    out = _decode_step(setup, seq_lens, qb).cpu()
+    out = _decode_step(setup, seq_lens, qb, append_in_select).cpu()
     for b, n in enumerate(LENGTHS):
         want = decode_assign_reference(
             setup.fp8_vals[b][n],
@@ -883,7 +898,13 @@ def test_decode_first_key_seeds_one_cluster():
         assert out[b][out[b] >= 0].tolist() == [0]
 
 
-def test_decode_cuda_graph_matches_eager():
+@pytest.mark.parametrize("probe_fused,append_in_select", DECODE_PATHS)
+def test_decode_cuda_graph_matches_eager(monkeypatch, probe_fused, append_in_select):
+    monkeypatch.setattr(
+        ivf_sparse_indexer,
+        "TUNING",
+        dataclasses.replace(ivf_sparse_indexer.TUNING, decode_probe_fused=probe_fused),
+    )
     setup = Setup(_config(), extra_decode_key=True)
     setup.build()
     snapshot = (setup.cid.clone(), setup.cen.clone())
@@ -894,14 +915,14 @@ def test_decode_cuda_graph_matches_eager():
         setup.cid.copy_(snapshot[0])
         setup.cen.copy_(snapshot[1])
 
-    eager = _decode_step(setup, seq_lens, qb)
+    eager = _decode_step(setup, seq_lens, qb, append_in_select)
     for _ in range(2):  # compile outside capture
         restore()
-        _decode_step(setup, seq_lens, qb)
+        _decode_step(setup, seq_lens, qb, append_in_select)
     restore()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _decode_step(setup, seq_lens, qb)
+        captured = _decode_step(setup, seq_lens, qb, append_in_select)
     restore()
     graph.replay()
     torch.cuda.synchronize()

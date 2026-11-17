@@ -902,6 +902,106 @@ def ivf_run_scatter_kernel(
 
 
 @triton.jit
+def _append_share(
+    k_u8_ptr,
+    k_page_stride,
+    k_bt_ptr,
+    k_bt_stride,
+    cen_ptr,
+    cen_i32_ptr,
+    cen_stride,
+    cen_bt_ptr,
+    cen_bt_stride,
+    cpb,
+    cid_ptr,
+    cid_stride,
+    cid_bt_ptr,
+    cid_bt_stride,
+    cid_bs,
+    best_ptr,
+    b,
+    slot,
+    blk,
+    pos,
+    C: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """One program's part of appending pool ``pos`` (>= 0) of batch row b:
+    seed the first key's cluster, or fold the best of this program's BLOCK_C
+    centroids into ``best_ptr[slot]`` for ``_append_commit``.
+
+    The fold packs (similarity, then lowest index) into one int64 so a single
+    atomic max keeps it: an order-preserving fp32 key (-0 made +0) in
+    [0, 2**32), then the inverted index; 0 is below every packing.
+    """
+    offs_d = tl.arange(0, 128)
+    page = tl.load(k_bt_ptr + b * k_bt_stride + pos // PAGE).to(tl.int64)
+    key = (
+        tl.load(k_u8_ptr + page * k_page_stride + (pos % PAGE) * 128 + offs_d)
+        .to(tl.float8e4nv, bitcast=True)
+        .to(tl.float32)
+    )
+    c0 = blk * BLOCK_C
+    offs_c = c0 + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+    rec = _rec(cen_bt_ptr, cen_bt_stride, b, offs_c, cpb, cen_stride, mask_c)
+    size_ptr = cen_i32_ptr + (rec + 256) // 4
+    if pos == 0:
+        # A first key (a one-token prompt) gets one cluster seeded by it, as
+        # k-means over one key does: clear every size, then (the program
+        # owning cluster 0, so no other waits on it) seed cluster 0.
+        cblk = tl.load(cid_bt_ptr + b * cid_bt_stride).to(tl.int64)
+        tl.store(size_ptr, tl.full([BLOCK_C], -1, tl.int32), mask=mask_c)
+        if blk == 0:
+            # The reset above must land before cluster 0 is written.
+            tl.debug_barrier()
+            rec0 = tl.load(cen_bt_ptr + b * cen_bt_stride).to(tl.int64) * cen_stride
+            tl.store(cid_ptr + cblk * cid_stride, tl.zeros([], tl.int16))
+            unit = key / tl.maximum(tl.sqrt(tl.sum(key * key, axis=0)), 1e-12)
+            tl.store(cen_ptr + rec0 // 2 + offs_d, unit.to(tl.bfloat16))
+            tl.store(cen_i32_ptr + (rec0 + 256) // 4, 1)
+    else:
+        live = mask_c & (tl.load(size_ptr, mask=mask_c, other=-1) >= 0)
+        cf = _load_centroids(cen_ptr, rec, live).to(tl.float32)
+        sim = tl.where(live, tl.sum(cf * key[None, :], axis=1), float("-inf"))
+        blk_best = tl.max(sim, axis=0)
+        blk_arg = tl.argmax(sim, axis=0).to(tl.int64) + c0
+        bits = (blk_best + 0.0).to(tl.int32, bitcast=True).to(tl.int64)
+        ordered = tl.where(bits < 0, -1 - bits, bits + 2147483648)
+        packed = ordered * 65536 + (65535 - blk_arg)
+        tl.atomic_max(best_ptr + slot, packed, sem="relaxed")
+
+
+@triton.jit
+def _append_commit(
+    cen_i32_ptr,
+    cen_stride,
+    cen_bt_ptr,
+    cen_bt_stride,
+    cpb,
+    cid_ptr,
+    cid_stride,
+    cid_bt_ptr,
+    cid_bt_stride,
+    cid_bs,
+    best_ptr,
+    b,
+    slot,
+    pos,
+):
+    """Assign pool ``pos`` (> 0) of batch row b to the best centroid every
+    ``_append_share`` folded into ``best_ptr[slot]``, and reset it to 0."""
+    won = tl.atomic_xchg(best_ptr + slot, 0, sem="acq_rel")
+    best_c = (65535 - won % 65536).to(tl.int32)
+    blk0 = tl.load(cen_bt_ptr + b * cen_bt_stride + best_c // cpb)
+    rec0 = blk0.to(tl.int64) * cen_stride + (best_c % cpb).to(tl.int64) * 272
+    cblk = tl.load(cid_bt_ptr + b * cid_bt_stride + pos // cid_bs).to(tl.int64)
+    tl.store(cid_ptr + cblk * cid_stride + pos % cid_bs, best_c.to(tl.int16))
+    tl.atomic_add(cen_i32_ptr + (rec0 + 256) // 4, 1, sem="relaxed")
+
+
+@triton.jit
 def ivf_decode_append_kernel(
     k_u8_ptr,
     k_page_stride,
@@ -919,58 +1019,83 @@ def ivf_decode_append_kernel(
     cid_bt_stride,
     cid_bs,
     seq_lens_ptr,
+    best_ptr,
+    done_ptr,
+    pools_ptr,
+    num_rows,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
     PAGE: tl.constexpr,
+    KPOOL: tl.constexpr,
+    WRITE_POOLS: tl.constexpr,
 ):
-    """Assign the key just cached at position seq_len - 1 to its nearest centroid.
+    """Assign the pool a decode step completed to its nearest centroid.
 
-    A request whose first key this is (a one-token prompt) gets one cluster
-    seeded by that key, which is what k-means over one key produces.
+    Row b's ``seq_lens`` are tokens: a step that ends a pool (a multiple of
+    KPOOL) appends pool seq_len // KPOOL - 1, others append nothing. With
+    WRITE_POOLS, also store the row's pool count and last pool
+    (``pools_ptr[0, b]``, ``pools_ptr[1, b]``).
+
+    One program per BLOCK_C clusters (``_append_share``); the last to
+    finish, counted in ``done_ptr[b]``, commits the assignment
+    (``_append_commit``) and resets the counter.
     """
     b = tl.program_id(0)
-    pos = tl.load(seq_lens_ptr + b) - 1
+    blk = tl.program_id(1)
+    n = tl.load(seq_lens_ptr + b)
+    pools = n // KPOOL
+    if WRITE_POOLS:
+        if blk == 0:
+            tl.store(pools_ptr + b, pools)
+            tl.store(pools_ptr + num_rows + b, pools - 1)
+    pos = tl.where(n % KPOOL == 0, pools, 0) - 1
     if pos >= 0:
-        offs_d = tl.arange(0, 128)
-        page = tl.load(k_bt_ptr + b * k_bt_stride + pos // PAGE).to(tl.int64)
-        key = (
-            tl.load(k_u8_ptr + page * k_page_stride + (pos % PAGE) * 128 + offs_d)
-            .to(tl.float8e4nv, bitcast=True)
-            .to(tl.float32)
+        _append_share(
+            k_u8_ptr,
+            k_page_stride,
+            k_bt_ptr,
+            k_bt_stride,
+            cen_ptr,
+            cen_i32_ptr,
+            cen_stride,
+            cen_bt_ptr,
+            cen_bt_stride,
+            cpb,
+            cid_ptr,
+            cid_stride,
+            cid_bt_ptr,
+            cid_bt_stride,
+            cid_bs,
+            best_ptr,
+            b,
+            b,
+            blk,
+            pos,
+            C,
+            BLOCK_C,
+            PAGE,
         )
-
-        best = tl.full([], float("-inf"), tl.float32)
-        best_c = tl.full([], 0, tl.int32)
-        for c0 in range(0, C, BLOCK_C):
-            offs_c = c0 + tl.arange(0, BLOCK_C)
-            mask_c = offs_c < C
-            rec = _rec(cen_bt_ptr, cen_bt_stride, b, offs_c, cpb, cen_stride, mask_c)
-            size_ptr = cen_i32_ptr + (rec + 256) // 4
-            if pos == 0:
-                tl.store(size_ptr, tl.full([BLOCK_C], -1, tl.int32), mask=mask_c)
-            else:
-                live = mask_c & (tl.load(size_ptr, mask=mask_c, other=-1) >= 0)
-                cf = _load_centroids(cen_ptr, rec, live).to(tl.float32)
-                sim = tl.sum(cf * key[None, :], axis=1)
-                sim = tl.where(live, sim, float("-inf"))
-                blk_best = tl.max(sim, axis=0)
-                blk_arg = tl.argmax(sim, axis=0).to(tl.int32) + c0
-                better = blk_best > best
-                best = tl.where(better, blk_best, best)
-                best_c = tl.where(better, blk_arg, best_c)
-
-        # The first-key reset above must land before cluster 0 is written.
-        tl.debug_barrier()
-        blk0 = tl.load(cen_bt_ptr + b * cen_bt_stride + best_c // cpb).to(tl.int64)
-        rec0 = blk0 * cen_stride + (best_c % cpb).to(tl.int64) * 272
-        cblk = tl.load(cid_bt_ptr + b * cid_bt_stride + pos // cid_bs).to(tl.int64)
-        tl.store(cid_ptr + cblk * cid_stride + pos % cid_bs, best_c.to(tl.int16))
-        if pos == 0:
-            unit = key / tl.maximum(tl.sqrt(tl.sum(key * key, axis=0)), 1e-12)
-            tl.store(cen_ptr + rec0 // 2 + offs_d, unit.to(tl.bfloat16))
-            tl.store(cen_i32_ptr + (rec0 + 256) // 4, 1)
-        else:
-            tl.atomic_add(cen_i32_ptr + (rec0 + 256) // 4, 1, sem="relaxed")
+        if pos > 0:
+            tl.debug_barrier()
+            last = (C + BLOCK_C - 1) // BLOCK_C - 1
+            if tl.atomic_add(done_ptr + b, 1, sem="acq_rel") == last:
+                tl.store(done_ptr + b, 0)
+                _append_commit(
+                    cen_i32_ptr,
+                    cen_stride,
+                    cen_bt_ptr,
+                    cen_bt_stride,
+                    cpb,
+                    cid_ptr,
+                    cid_stride,
+                    cid_bt_ptr,
+                    cid_bt_stride,
+                    cid_bs,
+                    best_ptr,
+                    b,
+                    b,
+                    pos,
+                )
 
 
 @triton.jit
@@ -1230,6 +1355,201 @@ def ivf_probe_select_kernel(
     count = tl.maximum(total, 1)
     tl.store(count_out_ptr + row, count)
     tl.store(topk_len_out_ptr + row, tl.where(count > TOPK, count, 0))
+
+
+@triton.jit(do_not_specialize=["max_count"])
+def ivf_decode_probe_kernel(
+    q_fp8_ptr,
+    w_ptr,
+    row_batch_ptr,
+    pos_ptr,
+    cen_ptr,
+    cen_i32_ptr,
+    cen_stride,
+    cen_bt_ptr,
+    cen_bt_stride,
+    cpb,
+    score_ws_ptr,
+    vis_ws_ptr,
+    done_ptr,
+    sel_out_ptr,
+    count_out_ptr,
+    topk_len_out_ptr,
+    cand_ptr,
+    cand_width,
+    num_probes,
+    max_count,
+    k_u8_ptr,
+    k_page_stride,
+    k_bt_ptr,
+    k_bt_stride,
+    cid_ptr,
+    cid_stride,
+    cid_bt_ptr,
+    cid_bt_stride,
+    cid_bs,
+    seq_lens_ptr,
+    best_ptr,
+    pools_ptr,
+    num_rows,
+    TOPK: tl.constexpr,
+    C: tl.constexpr,
+    C_PAD: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    PAGE: tl.constexpr,
+    KPOOL: tl.constexpr,
+    APPEND: tl.constexpr,
+    WRITE_POOLS: tl.constexpr,
+):
+    """Decode probe: score the clusters and select the probes in one launch.
+
+    Program (row, j) scores clusters [j * BLOCK_C, (j + 1) * BLOCK_C) as
+    ``ivf_probe_score_kernel`` does at decode; the row's last program to
+    finish (counted in ``done_ptr``, which it resets) then selects the probes
+    as ``ivf_probe_select_kernel`` does at decode.
+
+    With APPEND the launch also does ``ivf_decode_append_kernel``'s work: the
+    row's query position comes from its token count ``seq_lens`` (stored to
+    ``pools_ptr`` with WRITE_POOLS), every program folds in its share of the
+    append, and the last one commits it, then selects from the cluster sizes
+    after it.
+    """
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    b = tl.load(row_batch_ptr + row)
+    if APPEND:
+        n = tl.load(seq_lens_ptr + row)
+        t = n // KPOOL - 1
+        if WRITE_POOLS:
+            if blk == 0:
+                tl.store(pools_ptr + row, t + 1)
+                tl.store(pools_ptr + num_rows + row, t)
+        pos = tl.where(n % KPOOL == 0, t + 1, 0) - 1
+        if pos >= 0:
+            _append_share(
+                k_u8_ptr,
+                k_page_stride,
+                k_bt_ptr,
+                k_bt_stride,
+                cen_ptr,
+                cen_i32_ptr,
+                cen_stride,
+                cen_bt_ptr,
+                cen_bt_stride,
+                cpb,
+                cid_ptr,
+                cid_stride,
+                cid_bt_ptr,
+                cid_bt_stride,
+                cid_bs,
+                best_ptr,
+                b,
+                row,
+                blk,
+                pos,
+                C,
+                BLOCK_C,
+                PAGE,
+            )
+    else:
+        t = tl.load(pos_ptr + row).to(tl.int32)
+    offs_d = tl.arange(0, 128)
+    offs_h = tl.arange(0, H)
+    q_t = tl.load(
+        q_fp8_ptr + (row * H + offs_h).to(tl.int64)[None, :] * 128 + offs_d[:, None]
+    ).to(tl.bfloat16)
+    w = tl.load(w_ptr + row * H + offs_h)
+    offs_c = blk * BLOCK_C + tl.arange(0, BLOCK_C)
+    in_c = offs_c < C
+    rec = _rec(cen_bt_ptr, cen_bt_stride, b, offs_c, cpb, cen_stride, in_c)
+    size = tl.load(cen_i32_ptr + (rec + 256) // 4, mask=in_c, other=-1)
+    live = in_c & (size >= 0)
+    cf = _load_centroids(cen_ptr, rec, live)
+    per_head = tl.maximum(tl.dot(cf, q_t), 0.0) * w[None, :]
+    tl.store(score_ws_ptr + row * C + offs_c, tl.sum(per_head, axis=1), mask=in_c)
+    # Padded graph rows (seq_len 0, t < 0) see nothing and emit -1.
+    vis = tl.where(live, tl.where(t >= 0, size, 0), -1)
+    tl.store(vis_ws_ptr + row * C + offs_c, vis, mask=in_c)
+    tl.debug_barrier()
+    if tl.atomic_add(done_ptr + row, 1, sem="acq_rel") == tl.num_programs(1) - 1:
+        tl.store(done_ptr + row, 0)
+        offs_all = tl.arange(0, C_PAD)
+        in_range = offs_all < C
+        score_all = tl.load(
+            score_ws_ptr + row * C + offs_all,
+            mask=in_range,
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        if APPEND:
+            if pos > 0:
+                _append_commit(
+                    cen_i32_ptr,
+                    cen_stride,
+                    cen_bt_ptr,
+                    cen_bt_stride,
+                    cpb,
+                    cid_ptr,
+                    cid_stride,
+                    cid_bt_ptr,
+                    cid_bt_stride,
+                    cid_bs,
+                    best_ptr,
+                    b,
+                    row,
+                    pos,
+                )
+            # The sizes after the append (its commit, or a first key's seed).
+            tl.debug_barrier()
+            rec_all = _rec(
+                cen_bt_ptr, cen_bt_stride, b, offs_all, cpb, cen_stride, in_range
+            )
+            size_all = tl.load(
+                cen_i32_ptr + (rec_all + 256) // 4,
+                mask=in_range,
+                other=-1,
+                cache_modifier=".cg",
+            )
+            vis_all = tl.where(size_all >= 0, tl.where(t >= 0, size_all, 0), -1)
+        else:
+            vis_all = tl.load(
+                vis_ws_ptr + row * C + offs_all,
+                mask=in_range,
+                other=-1,
+                cache_modifier=".cg",
+            )
+        eligible = vis_all > 0
+        n_eligible = tl.sum(eligible.to(tl.int32), axis=0)
+        none = -1099511627776  # below every float order key
+        keys = tl.where(eligible, _float_order_key(score_all), none) * 65536 + (
+            65535 - offs_all
+        )
+        k = tl.where(t < TOPK, n_eligible, tl.minimum(num_probes, n_eligible))
+        held = tl.where(eligible, vis_all, 0)
+        sorted_keys = tl.sort(keys, descending=True)
+        k = _probes_holding(sorted_keys, held, k, n_eligible, TOPK)
+        tau = _kth_largest(sorted_keys, tl.maximum(k, 1), C_PAD)
+        selected = eligible & (keys >= tau) & (k > 0)
+        take = tl.where(selected, held, 0)
+        if tl.sum(take, axis=0) > max_count:
+            fit = tl.full([], 0, tl.int32)
+            over = k
+            while over - fit > 1:
+                mid = (fit + over) // 2
+                tau_mid = _kth_largest(sorted_keys, mid, C_PAD)
+                n_mid = tl.sum(tl.where(keys >= tau_mid, take, 0), axis=0)
+                fit = tl.where(n_mid <= max_count, mid, fit)
+                over = tl.where(n_mid <= max_count, over, mid)
+            tau = _kth_largest(sorted_keys, tl.maximum(fit, 1), C_PAD)
+            selected = selected & (keys >= tau) & (fit > 0)
+            take = tl.where(selected, take, 0)
+        total = tl.sum(take, axis=0)
+        tl.store(sel_out_ptr + row * C + offs_all, selected.to(tl.int8), mask=in_range)
+        tl.store(cand_ptr + row * cand_width, t, mask=total == 0)
+        count = tl.maximum(total, 1)
+        tl.store(count_out_ptr + row, count)
+        tl.store(topk_len_out_ptr + row, tl.where(count > TOPK, count, 0))
 
 
 @triton.jit
@@ -1778,16 +2098,25 @@ def ivf_emit_kernel(
     count_ptr,
     selected_ptr,
     cand_ptr,
+    token_len_ptr,
     out_ptr,
     out_stride,
     cand_cap,
     out_width,
     TOPK: tl.constexpr,
+    KPOOL: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
 ):
-    """Turn selected candidate slots into request-local positions, -1 padded."""
+    """Turn selected candidate slots into request-local positions, -1 padded.
+
+    Each selected key (a pool of KPOOL tokens) is written as its KPOOL token
+    positions; with HAS_TAIL, columns from TOPK * KPOOL then hold the tokens
+    of the row's incomplete tail pool (``token_len`` tokens are visible).
+    """
     row = tl.program_id(0)
-    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    j = col // KPOOL
     count = tl.load(count_ptr + row)
     under = count <= TOPK
     picked = tl.load(
@@ -1796,9 +2125,13 @@ def ivf_emit_kernel(
     slot = tl.where(under, tl.where(j < count, j, -1), picked)
     live = (slot >= 0) & (j < TOPK)
     pos = tl.load(cand_ptr + row * cand_cap + slot, mask=live, other=0)
-    tl.store(
-        out_ptr + row * out_stride + j, tl.where(live, pos, -1), mask=j < out_width
-    )
+    val = tl.where(live, pos * KPOOL + col % KPOOL, -1)
+    if HAS_TAIL:
+        n = tl.load(token_len_ptr + row)
+        tail_start = n // KPOOL * KPOOL
+        t = col - TOPK * KPOOL
+        val = tl.where((t >= 0) & (t < n - tail_start), tail_start + t, val)
+    tl.store(out_ptr + row * out_stride + col, val, mask=col < out_width)
 
 
 @triton.jit

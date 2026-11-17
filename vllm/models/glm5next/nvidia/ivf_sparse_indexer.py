@@ -42,6 +42,7 @@ from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.nvidia.ops.ivf_index import (
     REC_BYTES,
     ivf_decode_append_kernel,
+    ivf_decode_probe_kernel,
     ivf_emit_kernel,
     ivf_emit_runs_kernel,
     ivf_group_count_kernel,
@@ -71,12 +72,26 @@ class IvfKernelTuning:
     """Launch parameters, tuned on H200; sweep again on other GPUs."""
 
     centroid_block: int = 64
+    # Decode probe score: clusters per program (and tile); narrow blocks
+    # spread its centroid loads over more SMs (H200 512k: 6.6 -> 5.7 us).
+    probe_decode_block_c: int = 16
+    # Decode collect: positions per program of the two scan passes (H200
+    # 512k: 512 takes both in about 4.9 us, 2048 in 10.7).
+    scan_block: int = 512
+    scan_num_warps: int = 4
+    # Decode score: tile, and programs per SM to aim for (a row splits its
+    # tiles until reached).
     score_block_n: int = 128
     score_num_warps: int = 4
     score_num_stages: int = 3
-    # Score programs per SM to aim for; a row splits its tiles until reached.
     score_programs_per_sm: int = 4
-    scan_block: int = 2048
+    # Decode probe score, select and append in one launch, of
+    # fused_probe_block_c clusters per program (H200: 7-16% off the decode
+    # step at 64k-512k); off, they take three launches, of which the probe
+    # score's uses probe_decode_block_c and its select select_*_num_warps.
+    decode_probe_fused: bool = True
+    fused_probe_block_c: int = 32
+    fused_probe_num_warps: int = 4
     # Key tiles per step, and clusters per program, of the run-layout scan:
     # narrow cluster blocks give it more programs, long steps fewer serial
     # passes (H200: 512 / 4 is about half the time of 128 / 16 at 512k).
@@ -90,7 +105,7 @@ class IvfKernelTuning:
     # One probe-select program per row, over at most C_PAD clusters. Its sort
     # is the kernel's main cost from C_PAD 512 on, where more warps pay.
     select_num_warps: int = 2
-    select_wide_num_warps: int = 4
+    select_wide_num_warps: int = 8
     select_wide_clusters: int = 512
     # Prefill's (many rows, partial-page counts one key at a time): fewer
     # warps pay (H200: 1 below C_PAD 512, 2 from it).
@@ -709,17 +724,46 @@ def build_ivf_index(
     )
 
 
-def append_ivf_decode_keys(
-    *, key: IvfKeyView, state: IvfStateView, seq_lens: torch.Tensor
-) -> None:
-    """Assign each decode request's newest cached key to a fixed centroid.
+# Zeroed int scratch the decode kernels keep at zero between launches (each
+# row's last program resets what it used), so it is allocated once instead of
+# cleared per step. Outgrown buffers stay alive: captured graphs use them.
+_ZEROED: dict[tuple[torch.device, str], torch.Tensor] = {}
+_OUTGROWN: list[torch.Tensor] = []
 
-    Decode rows are batch rows 0..len(seq_lens)-1.
+
+def _zeroed(device: torch.device, name: str, numel: int, dtype: torch.dtype):
+    buf = _ZEROED.get((device, name))
+    if buf is None or buf.numel() < numel:
+        if buf is not None:
+            _OUTGROWN.append(buf)
+        buf = torch.zeros(max(numel, 1024), dtype=dtype, device=device)
+        _ZEROED[(device, name)] = buf
+    return buf
+
+
+def append_ivf_decode_keys(
+    *,
+    key: IvfKeyView,
+    state: IvfStateView,
+    seq_lens: torch.Tensor,
+    kpool: int = 1,
+    pools_out: torch.Tensor | None = None,
+) -> None:
+    """Assign each decode request's newest complete pool to a fixed centroid.
+
+    Decode rows are batch rows 0..len(seq_lens)-1. ``seq_lens`` count tokens
+    of ``kpool`` per pool: a row whose count is a multiple of ``kpool``
+    appends pool seq_len // kpool - 1, the others nothing (with kpool 1, a
+    row appends key seq_len - 1, or nothing at 0). ``pools_out`` [2, rows]
+    int32, if given, receives each row's pool count and last pool.
     """
     num_rows = seq_lens.shape[0]
     if num_rows == 0:
         return
-    ivf_decode_append_kernel[(num_rows,)](
+    best = _zeroed(seq_lens.device, "append_best", num_rows, torch.int64)
+    done = _zeroed(seq_lens.device, "append_done", num_rows, torch.int32)
+    block_c = TUNING.centroid_block
+    ivf_decode_append_kernel[(num_rows, triton.cdiv(state.num_clusters, block_c))](
         key.u8,
         key.page_stride,
         key.block_table,
@@ -727,9 +771,15 @@ def append_ivf_decode_keys(
         *state.cen_args(),
         *state.cid_args(),
         seq_lens,
+        best,
+        done,
+        seq_lens if pools_out is None else pools_out,
+        num_rows,
         C=state.num_clusters,
-        BLOCK_C=TUNING.centroid_block,
+        BLOCK_C=block_c,
         PAGE=key.page,
+        KPOOL=kpool,
+        WRITE_POOLS=pools_out is not None,
     )
 
 
@@ -750,6 +800,8 @@ def select_ivf_topk(
     max_width: int | None = None,
     token_lens: torch.Tensor | None = None,
     score_sum_out: torch.Tensor | None = None,
+    append_seq_lens: torch.Tensor | None = None,
+    pools_out: torch.Tensor | None = None,
 ) -> None:
     """Top-k over IVF candidates, written in place into ``out`` [rows, W].
 
@@ -768,13 +820,18 @@ def select_ivf_topk(
     lowest-scoring probed clusters. Decode uses the requests' position
     capacity as the width, so it can be captured.
 
-    With ``token_lens`` (prefill: each row's visible token count) a row of
-    ``out`` is the kpool indexer's expanded top-k instead: each selected
-    pool's ``config.kpool`` token positions, then the tokens of the row's
+    With ``token_lens`` (each row's visible token count) a row of ``out`` is
+    the kpool indexer's expanded top-k instead: each selected pool's
+    ``config.kpool`` token positions, then the tokens of the row's
     incomplete tail pool, then -1.
+
+    Decode with ``append_seq_lens`` first appends the step's pools, as
+    ``append_ivf_decode_keys(seq_lens=append_seq_lens, kpool=config.kpool,
+    pools_out=pools_out)`` (possibly in the probe's launch); ``query_pos``
+    and ``seq_lens`` must then be the pool counts it computes.
     """
     assert (layout is None) == (seq_lens is not None)
-    assert token_lens is None or layout is not None
+    assert append_seq_lens is None or layout is None
     num_rows = q_fp8.shape[0]
     if num_rows == 0:
         return
@@ -839,7 +896,7 @@ def select_ivf_topk(
     assert tune.probe_rows * num_heads <= 256, "probe_rows * heads > 256"
     # Prefill: one program per row tile over every cluster (its queries load
     # once). Decode: few rows, so the clusters split across programs too.
-    c_per_program = tune.centroid_block if is_decode else C
+    c_per_program = tune.probe_decode_block_c if is_decode else C
     probe_grid = (
         triton.cdiv(num_rows, tune.probe_rows),
         triton.cdiv(C, c_per_program),
@@ -852,88 +909,136 @@ def select_ivf_topk(
             layout.cen_dense, [tune.centroid_block, 128]
         )
         cen_size = layout.cen_size
-    ivf_probe_score_kernel[probe_grid](
-        q_fp8,
-        weights,
-        row_batch,
-        query_pos,
-        *state.cen_args(),
-        cen_desc,
-        cen_size,
-        score_ws,
-        vis_ws,
-        num_rows,
-        c_per_program,
-        C=C,
-        H=num_heads,
-        BLOCK_R=tune.probe_rows,
-        BLOCK_C=tune.centroid_block,
-        IS_DECODE=is_decode,
-        num_warps=tune.probe_num_warps,
-        PDL=pdl,
-        launch_pdl=pdl,
-    )
-    ivf_probe_select_kernel[(num_rows,)](
-        query_pos,
-        row_batch,
-        *vis_args,
-        score_ws,
-        vis_ws,
-        sel,
-        ends,
-        counts,
-        totals,
-        topk_lens,
-        cand,
-        width,
-        probe_end,
-        probe_base,
-        config.num_probes,
-        max_count,
-        groups,
-        0 if is_decode else groups.numel(),
-        TOPK=topk,
-        C=C,
-        C_PAD=triton.next_power_of_2(C),
-        P_PAD=P_PAD,
-        PAGE=key.page,
-        IS_DECODE=is_decode,
-        BISECT=(
-            tune.select_bisect
-            and not is_decode
-            and triton.next_power_of_2(C) >= tune.select_bisect_clusters
-        ),
-        num_warps=(
-            (
-                tune.select_wide_num_warps
-                if is_decode
-                else tune.select_prefill_wide_num_warps
-            )
-            if triton.next_power_of_2(C) >= tune.select_wide_clusters
-            else (
-                tune.select_num_warps
-                if is_decode
-                else tune.select_prefill_num_warps
-            )
-        ),
-        PDL=pdl,
-        launch_pdl=pdl,
-    )
-    if is_decode:
-        _collect_by_scan(
-            state=state, row_batch=row_batch, seq_lens=seq_lens, sel=sel, cand=cand
+    fuse_append = append_seq_lens is not None and tune.decode_probe_fused
+    if append_seq_lens is not None and not fuse_append:
+        append_ivf_decode_keys(
+            key=key,
+            state=state,
+            seq_lens=append_seq_lens,
+            kpool=config.kpool,
+            pools_out=pools_out,
         )
+    if is_decode and tune.decode_probe_fused:
+        block_c = tune.fused_probe_block_c
+        ivf_decode_probe_kernel[(num_rows, triton.cdiv(C, block_c))](
+            q_fp8,
+            weights,
+            row_batch,
+            query_pos,
+            *state.cen_args(),
+            score_ws,
+            vis_ws,
+            _zeroed(device, "probe_done", num_rows, torch.int32),
+            sel,
+            counts,
+            topk_lens,
+            cand,
+            width,
+            config.num_probes,
+            max_count,
+            key.u8,
+            key.page_stride,
+            key.block_table,
+            key.block_table.stride(0),
+            *state.cid_args(),
+            query_pos if append_seq_lens is None else append_seq_lens,
+            _zeroed(device, "append_best", num_rows, torch.int64),
+            query_pos if pools_out is None else pools_out,
+            num_rows,
+            TOPK=topk,
+            C=C,
+            C_PAD=triton.next_power_of_2(C),
+            H=num_heads,
+            BLOCK_C=block_c,
+            PAGE=key.page,
+            KPOOL=config.kpool,
+            APPEND=fuse_append,
+            WRITE_POOLS=fuse_append and pools_out is not None,
+            num_warps=tune.fused_probe_num_warps,
+        )
+    else:
+        ivf_probe_score_kernel[probe_grid](
+            q_fp8,
+            weights,
+            row_batch,
+            query_pos,
+            *state.cen_args(),
+            cen_desc,
+            cen_size,
+            score_ws,
+            vis_ws,
+            num_rows,
+            c_per_program,
+            C=C,
+            H=num_heads,
+            BLOCK_R=tune.probe_rows,
+            BLOCK_C=tune.probe_decode_block_c if is_decode else tune.centroid_block,
+            IS_DECODE=is_decode,
+            num_warps=tune.probe_num_warps,
+            PDL=pdl,
+            launch_pdl=pdl,
+        )
+        ivf_probe_select_kernel[(num_rows,)](
+            query_pos,
+            row_batch,
+            *vis_args,
+            score_ws,
+            vis_ws,
+            sel,
+            ends,
+            counts,
+            totals,
+            topk_lens,
+            cand,
+            width,
+            probe_end,
+            probe_base,
+            config.num_probes,
+            max_count,
+            groups,
+            0 if is_decode else groups.numel(),
+            TOPK=topk,
+            C=C,
+            C_PAD=triton.next_power_of_2(C),
+            P_PAD=P_PAD,
+            PAGE=key.page,
+            IS_DECODE=is_decode,
+            BISECT=(
+                tune.select_bisect
+                and not is_decode
+                and triton.next_power_of_2(C) >= tune.select_bisect_clusters
+            ),
+            num_warps=(
+                (
+                    tune.select_wide_num_warps
+                    if is_decode
+                    else tune.select_prefill_wide_num_warps
+                )
+                if triton.next_power_of_2(C) >= tune.select_wide_clusters
+                else (
+                    tune.select_num_warps
+                    if is_decode
+                    else tune.select_prefill_num_warps
+                )
+            ),
+            PDL=pdl,
+            launch_pdl=pdl,
+        )
+    if is_decode:
         # Measuring lost attention sums score mass over the row, so zero the
         # unwritten tail columns; the production path leaves them uninitialized
         # since the kernels only read what they fill.
         scores = (torch.zeros if score_sum_out is not None else torch.empty)(
             (num_rows, width), dtype=torch.float32, device=device
         )
-        _score_per_row(
+        _scan_and_score(
             key=key,
+            state=state,
             q_fp8=q_fp8,
             weights=weights,
             row_batch=row_batch,
+            seq_lens=seq_lens,
+            sel=sel,
             cand=cand,
             counts=counts,
             scores=scores,
@@ -948,6 +1053,8 @@ def select_ivf_topk(
             topk=topk,
             topk_backend=topk_backend,
             score_sum_out=score_sum_out,
+            token_lens=token_lens,
+            kpool=config.kpool if token_lens is not None else 1,
         )
         return
 
@@ -1014,12 +1121,16 @@ def _topk_and_emit(
     cand: torch.Tensor | None = None,
     runs: _EmitRuns | None = None,
     score_sum_out: torch.Tensor | None = None,
+    token_lens: torch.Tensor | None = None,
+    kpool: int = 1,
 ) -> None:
     """Top-k slots of over-budget rows, then candidate positions into ``out``.
 
     Rows with at most top-k candidates have length 0 and keep all of them.
-    Decode reads positions from ``cand``; prefill maps the selected slots
-    through the run layout (``runs``), so it never materializes candidates.
+    Decode reads positions from ``cand`` (with ``token_lens``, expanded to
+    ``kpool`` tokens each plus the tail, as ``runs.token_lens`` does);
+    prefill maps the selected slots through the run layout (``runs``), so it
+    never materializes candidates.
 
     When ``score_sum_out`` is given, write each row's summed DSA score over its
     retained keys (the attention mass it keeps) -- used by the lost-attention
@@ -1108,52 +1219,15 @@ def _topk_and_emit(
         counts,
         selected,
         cand,
+        counts if token_lens is None else token_lens,
         out,
         out.stride(0),
         width,
         out.shape[1],
         TOPK=topk,
+        KPOOL=kpool,
         BLOCK=block,
-    )
-
-
-def _score_per_row(
-    *,
-    key: IvfKeyView,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    row_batch: torch.Tensor,
-    cand: torch.Tensor,
-    counts: torch.Tensor,
-    scores: torch.Tensor,
-    topk: int,
-) -> None:
-    tune = TUNING
-    num_rows = q_fp8.shape[0]
-    cap = cand.shape[1]
-    tiles = triton.cdiv(cap, tune.score_block_n)
-    target = tune.score_programs_per_sm * _num_sms(q_fp8.device.index or 0)
-    splits = max(1, min(tiles, triton.cdiv(target, num_rows)))
-    ivf_score_kernel[(num_rows, splits)](
-        q_fp8,
-        weights,
-        row_batch,
-        cand,
-        counts,
-        key.u8,
-        key.f32,
-        key.page_stride,
-        key.block_table,
-        key.block_table.stride(0),
-        scores,
-        cap,
-        TOPK=topk,
-        H=q_fp8.shape[1],
-        PAGE=key.page,
-        BLOCK_N=tune.score_block_n,
-        NUM_SPLITS=splits,
-        NUM_STAGES=tune.score_num_stages,
-        num_warps=tune.score_num_warps,
+        HAS_TAIL=token_lens is not None,
     )
 
 
@@ -1324,6 +1398,53 @@ def _score_grouped_gemm(
     )
 
 
+def _scan_and_score(
+    *,
+    key: IvfKeyView,
+    state: IvfStateView,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    row_batch: torch.Tensor,
+    seq_lens: torch.Tensor,
+    sel: torch.Tensor,
+    cand: torch.Tensor,
+    counts: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+) -> None:
+    """Decode: each row's probed positions into ``cand`` in ascending order,
+    and their scores into ``scores`` for rows over top-k candidates."""
+    tune = TUNING
+    num_rows = seq_lens.shape[0]
+    _collect_by_scan(
+        state=state, row_batch=row_batch, seq_lens=seq_lens, sel=sel, cand=cand
+    )
+    tiles = triton.cdiv(cand.shape[1], tune.score_block_n)
+    target = tune.score_programs_per_sm * _num_sms(q_fp8.device.index or 0)
+    splits = max(1, min(tiles, triton.cdiv(target, num_rows)))
+    ivf_score_kernel[(num_rows, splits)](
+        q_fp8,
+        weights,
+        row_batch,
+        cand,
+        counts,
+        key.u8,
+        key.f32,
+        key.page_stride,
+        key.block_table,
+        key.block_table.stride(0),
+        scores,
+        cand.shape[1],
+        TOPK=topk,
+        H=q_fp8.shape[1],
+        PAGE=key.page,
+        BLOCK_N=tune.score_block_n,
+        NUM_SPLITS=splits,
+        NUM_STAGES=tune.score_num_stages,
+        num_warps=tune.score_num_warps,
+    )
+
+
 def _collect_by_scan(
     *,
     state: IvfStateView,
@@ -1334,6 +1455,7 @@ def _collect_by_scan(
 ) -> None:
     num_rows = seq_lens.shape[0]
     block = TUNING.scan_block
+    warps = TUNING.scan_num_warps
     num_blocks = triton.cdiv(state.cid_bt.shape[1] * state.cid_bs, block)
     block_counts = torch.empty(
         (num_rows, num_blocks), dtype=torch.int32, device=cand.device
@@ -1347,6 +1469,7 @@ def _collect_by_scan(
         num_blocks,
         C=state.num_clusters,
         BLOCK=block,
+        num_warps=warps,
     )
     ivf_scan_write_kernel[(num_rows, num_blocks)](
         row_batch,
@@ -1360,6 +1483,7 @@ def _collect_by_scan(
         C=state.num_clusters,
         BLOCK=block,
         NUM_BLOCKS_PAD=triton.next_power_of_2(num_blocks),
+        num_warps=warps,
     )
 
 
@@ -1523,12 +1647,14 @@ def sparse_attn_indexer_ivf(
     built = [i for i, n in enumerate(num_pools_cpu) if n > 0]
     start = meta.num_decode_tokens
     end = start + meta.num_prefill_tokens
+    # The prefill emit writes its rows whole, and so does the decode select
+    # (the fidelity measure expands decode pools itself, after a fill).
+    first = 0 if measure else nd
     if built:
-        # The prefill emit writes its rows whole.
-        topk_indices_buffer[:start] = -1
+        topk_indices_buffer[first:start] = -1
         topk_indices_buffer[end : hidden_states.shape[0]] = -1
     else:
-        topk_indices_buffer[: hidden_states.shape[0]] = -1
+        topk_indices_buffer[first : hidden_states.shape[0]] = -1
 
     if nd > 0:
         assert meta.num_decode_tokens == nd, "IVF decode takes one token per request"
@@ -1546,28 +1672,34 @@ def sparse_attn_indexer_ivf(
             round_scale=True,
         )
         seq_lens = meta.seq_lens[:nd]
-        num_pools = seq_lens // kpool
-        # Only a step that completes a pool appends it.
-        completed = torch.where(seq_lens % kpool == 0, num_pools, 0)
-        append_ivf_decode_keys(key=key, state=state, seq_lens=completed)
-        pools = torch.empty((nd, config.topk), dtype=torch.int32, device=q_fp8.device)
-        real_mass = q_fp8.new_empty((nd,), dtype=torch.float32) if measure else None
+        # Pool counts and last pools, written by the append (the first select).
+        pool_lens = torch.empty((2, nd), dtype=torch.int32, device=q_fp8.device)
+        num_pools, last_pool = pool_lens[0], pool_lens[1]
+        pools = real_mass = None
+        if measure:
+            pools = torch.empty(
+                (nd, config.topk), dtype=torch.int32, device=q_fp8.device
+            )
+            real_mass = q_fp8.new_empty((nd,), dtype=torch.float32)
         select_ivf_topk(
             key=key,
             state=state,
             q_fp8=q_fp8[:nd],
             weights=weights[:nd],
             row_batch=meta.req_index[:nd],
-            query_pos=num_pools - 1,
+            query_pos=last_pool,
             config=config,
-            out=pools,
+            out=topk_indices_buffer[:nd] if pools is None else pools,
             topk_backend=topk_backend,
             seq_lens=num_pools,
+            token_lens=seq_lens if pools is None else None,
             score_sum_out=real_mass,
+            append_seq_lens=seq_lens,
+            pools_out=pool_lens,
         )
-        tokens = kpool_ops.expand_pools_and_append_tail(pools, seq_lens, kpool)
-        topk_indices_buffer[:nd, : tokens.shape[1]] = tokens
-        if measure:
+        if pools is not None:
+            tokens = kpool_ops.expand_pools_and_append_tail(pools, seq_lens, kpool)
+            topk_indices_buffer[:nd, : tokens.shape[1]] = tokens
             exact_pools = torch.full_like(pools, -1)
             exact_mass = q_fp8.new_empty((nd,), dtype=torch.float32)
             select_ivf_topk(
@@ -1576,7 +1708,7 @@ def sparse_attn_indexer_ivf(
                 q_fp8=q_fp8[:nd],
                 weights=weights[:nd],
                 row_batch=meta.req_index[:nd],
-                query_pos=num_pools - 1,
+                query_pos=last_pool,
                 config=exact_config,
                 out=exact_pools,
                 topk_backend=topk_backend,
