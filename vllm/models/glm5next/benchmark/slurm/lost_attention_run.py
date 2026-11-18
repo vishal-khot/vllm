@@ -313,6 +313,9 @@ def _summarize_timing(timing_dir: str) -> dict:
     totals: dict[str, float] = {}
     means: dict[str, dict[str, tuple[int, float]]] = {}
     hists: dict[str, dict[int, int]] = {}
+    # Attended-token counts (GLM5_ATTN_PROBE): every TP rank sees every row,
+    # so take one rank's counts per attempt and sum over attempts.
+    counts: dict[str, dict[str, tuple[int, int, int]]] = {}
     base = 0.0
     pattern = os.path.join(timing_dir, "**", "indexer_timing_pid*_r*.json")
     for fn in glob.glob(pattern, recursive=True):
@@ -335,6 +338,11 @@ def _summarize_timing(timing_dir: str) -> dict:
                 hist = hists.setdefault(key, {})
                 for b, count in s.get("hist", {}).items():
                     hist[int(b)] = hist.get(int(b), 0) + count
+                if "rows" in s:
+                    got = counts.setdefault(attempt, {}).get(key, (0, 0, 0))
+                    if s["rows"] >= got[0]:
+                        counts[attempt][key] = (
+                            s["rows"], s["valid_sum"], s["short_rows"])
             resident = max(resident, layer_resident)
             totals[attempt] = totals.get(attempt, 0.0) + layer_resident
     calls: dict[str, int] = {}
@@ -343,7 +351,18 @@ def _summarize_timing(timing_dir: str) -> dict:
         for key, (n, mean) in by_key.items():
             calls[key] = calls.get(key, 0) + n
             ms_sum[key] = ms_sum.get(key, 0.0) + n * mean
+    attended: dict[str, list[int]] = {}
+    for by_key in counts.values():
+        for key, c in by_key.items():
+            tot = attended.setdefault(key, [0, 0, 0])
+            for i in range(3):
+                tot[i] += c[i]
     return {
+        "attended_tokens": {
+            k: {"rows": r, "valid_mean": round(v / r, 2) if r else 0.0,
+                "short_frac": round(s / r, 6) if r else 0.0}
+            for k, (r, v, s) in sorted(attended.items())
+        },
         "peak_indexer_mib": round(peak, 2),
         "resident_state_mib": round(resident, 2),
         "resident_total_mib": round(max(totals.values(), default=0.0), 2),

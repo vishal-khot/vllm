@@ -27,6 +27,14 @@ Env:
                             global peak stats via reset; run as its own pass).
     GLM5_RESIDENT_PROBE=1   also record resident indexer-state MiB per layer
                             (k_cache + cluster-id + centroid caches).
+    GLM5_ATTN_PROBE=1       also time the sparse MLA attention that consumes the
+                            selection (phases ``attn_prefill`` / ``attn_decode``)
+                            and count the tokens each row attends: ``rows``,
+                            ``valid_sum`` and ``short_rows`` (rows attending
+                            fewer than ``index_topk`` tokens). Rows with under
+                            ``index_topk`` tokens of context are short on both
+                            arms; IVF rows short of the stock count show up as
+                            extra short rows and a lower ``valid_sum``.
 """
 
 import atexit
@@ -222,7 +230,63 @@ def _install():
             ivf.select_ivf_topk, "prefill_assign_score",
             lambda kw: kw.get("layout") is not None)
 
+    # attn_counts["layer|phase"] = device int64 [valid_sum, short_rows]
+    attn_counts: dict = {}
+    attn_rows: dict[str, int] = {}
+    attn_ctx: list = [None]  # (layer, phase, index_topk) inside forward_mqa
+    if os.environ.get("GLM5_ATTN_PROBE") == "1":
+        from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm90 as fis
+
+        orig_convert = fis.triton_convert_req_index_to_global_index
+
+        def counted_convert(*args, **kw):
+            out = orig_convert(*args, **kw)
+            ctx = attn_ctx[0]
+            if ctx is not None and isinstance(out, tuple) and len(out) == 2:
+                layer, phase, full = ctx
+                v = out[1]
+                key = f"{layer}|{phase}"
+                acc = attn_counts.get(key)
+                if acc is None:
+                    acc = attn_counts[key] = torch.zeros(
+                        2, dtype=torch.int64, device=v.device)
+                acc += torch.stack((v.sum(dtype=torch.int64),
+                                    (v < full).sum(dtype=torch.int64)))
+                attn_rows[key] = attn_rows.get(key, 0) + int(v.numel())
+            return out
+
+        fis.triton_convert_req_index_to_global_index = counted_convert
+        orig_mqa = fis.FlashInferMLASparseSM90Impl.forward_mqa
+
+        def timed_mqa(self, q, kv_cache, attn_metadata, layer, *args, **kw):
+            n_tok = int((q[1] if isinstance(q, tuple) else q).shape[0])
+            phase = "attn_decode" if n_tok <= 8 else "attn_prefill"
+            m = _LAYER_RE.search(str(getattr(layer, "layer_name", "")))
+            lay = int(m.group(1)) if m else -1
+            full = int(getattr(getattr(attn_metadata, "state", None),
+                               "index_topk", 0) or 0)
+            attn_ctx[0] = (lay, phase, full)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                out = orig_mqa(self, q, kv_cache, attn_metadata, layer, *args, **kw)
+            finally:
+                attn_ctx[0] = None
+            end.record()
+            pending.append((lay, phase, n_tok, start, end))
+            return out
+
+        fis.FlashInferMLASparseSM90Impl.forward_mqa = timed_mqa
+        patched.append("FlashInferMLASparseSM90Impl.forward_mqa")
+
     def _flush():
+        for key, acc in attn_counts.items():
+            layer, phase = key.split("|")
+            valid_sum, short_rows = acc.tolist()
+            s = _slot(int(layer), phase)
+            s["valid_sum"], s["short_rows"] = valid_sum, short_rows
+            s["rows"] = attn_rows.get(key, 0)
         try:
             rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", -1)))
         except ValueError:
@@ -246,6 +310,10 @@ def _install():
                     "resident_mib": round(s["resident_mib"], 2),
                     "hist": {str(b): c for b, c in s["hist"].items()},
                 }
+                if "rows" in s:
+                    report["layers"][str(layer)][phase].update(
+                        rows=s["rows"], valid_sum=s["valid_sum"],
+                        short_rows=s["short_rows"])
         fn = os.path.join(timing_dir, f"indexer_timing_pid{os.getpid()}_r{rank}.json")
         # Atomic: the runner copies this file while the serve is writing it.
         with open(f"{fn}.tmp", "w") as f:
